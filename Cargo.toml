@@ -4,3 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum = { version = "0.8", features = ["ws"] }
+chrono = "0.4"
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio-tungstenite = "0.29"
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
+alloy-primitives = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
