@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{B256, U256};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -7,6 +8,7 @@ use super::command::Command;
 use super::events::OrderEvent;
 use crate::logging::short_id;
 use crate::order::{Order, OrderId, OrderState, SolverId};
+use crate::storage::{OrderRepository, RepositoryError};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SolverProofDelivery {
@@ -27,7 +29,6 @@ pub struct Transition {
 #[derive(Default)]
 pub struct Orderbook {
     orders: HashMap<OrderId, Order>,
-    solver_proofs: HashMap<SolverId, Vec<SolverProofDelivery>>,
 }
 
 #[derive(Debug)]
@@ -171,47 +172,119 @@ pub fn handle(order: Option<&Order>, command: Command) -> Result<Transition, Ord
 }
 
 impl Orderbook {
-    pub fn process(&mut self, command: Command) -> Result<Vec<OrderEvent>, OrderError> {
+    fn from_orders(orders: impl IntoIterator<Item = Order>) -> Self {
+        Self {
+            orders: orders.into_iter().map(|order| (order.id, order)).collect(),
+        }
+    }
+
+    fn prepare(
+        &self,
+        command: Command,
+        stored_proof: Option<&[u8]>,
+    ) -> Result<Option<PreparedTransition>, OrderError> {
         let order_id = command.order_id();
-        let transition = handle(self.orders.get(&order_id), command)?;
+        let current = self.orders.get(&order_id);
+        if is_idempotent(current, &command, stored_proof) {
+            return Ok(None);
+        }
+        let expected_version = current.map(|order| order.version);
+        let delete_proof = matches!(&command, Command::SettlementObserved { .. });
+        let transition = handle(current, command)?;
+        let mut order = match current {
+            Some(order) => order.clone(),
+            None => match transition.events.first() {
+                Some(OrderEvent::OrderCreated { order_id, terms }) => Order::new(*order_id, *terms),
+                _ => return Err(OrderError::NotFound),
+            },
+        };
 
         for event in &transition.events {
-            self.apply_event(event);
+            order.apply(event);
         }
 
-        for delivery in transition.deliveries {
-            self.solver_proofs
-                .entry(delivery.solver_id)
-                .or_default()
-                .push(delivery.proof);
-        }
+        Ok(Some(PreparedTransition {
+            order,
+            expected_version,
+            transition,
+            delete_proof,
+        }))
+    }
 
-        Ok(transition.events)
+    fn commit(&mut self, prepared: &PreparedTransition) {
+        self.orders
+            .insert(prepared.order.id, prepared.order.clone());
+    }
+
+    pub fn process(&mut self, command: Command) -> Result<Vec<OrderEvent>, OrderError> {
+        let Some(prepared) = self.prepare(command, None)? else {
+            return Ok(vec![]);
+        };
+        let events = prepared.transition.events.clone();
+        self.commit(&prepared);
+        Ok(events)
     }
 
     pub fn orders(&self) -> &HashMap<OrderId, Order> {
         &self.orders
     }
+}
 
-    fn apply_event(&mut self, event: &OrderEvent) {
-        if let OrderEvent::OrderCreated { order_id, terms } = event {
-            self.orders.insert(*order_id, Order::new(*order_id, *terms));
-        }
+fn is_idempotent(order: Option<&Order>, command: &Command, stored_proof: Option<&[u8]>) -> bool {
+    let Some(order) = order else {
+        return false;
+    };
 
-        if let Some(order) = self.orders.get_mut(&event.order_id()) {
-            order.apply(event);
+    match command {
+        Command::SolverReserved {
+            solver_id,
+            noise_public_key,
+            ..
+        } => {
+            matches!(
+                order.state,
+                OrderState::AwaitingUserProof
+                    | OrderState::ProofRelayed
+                    | OrderState::Executing
+                    | OrderState::Filled
+            ) && order.solver == Some(*solver_id)
+                && order.solver_noise_public_key.as_deref() == Some(noise_public_key)
         }
+        Command::RelayEncryptedProof { ciphertext, .. } => {
+            matches!(
+                order.state,
+                OrderState::ProofRelayed | OrderState::Executing
+            ) && stored_proof == Some(ciphertext)
+        }
+        Command::ExecutionStarted {
+            solver_id, tx_hash, ..
+        } => {
+            matches!(order.state, OrderState::Executing | OrderState::Filled)
+                && order.solver == Some(*solver_id)
+                && order.tx_hash == Some(*tx_hash)
+        }
+        Command::SettlementObserved { tx_hash, .. } => {
+            order.state == OrderState::Filled && order.tx_hash == Some(*tx_hash)
+        }
+        Command::CreateOrder { .. } | Command::ExpireOrder { .. } => false,
     }
+}
+
+struct PreparedTransition {
+    order: Order,
+    expected_version: Option<u64>,
+    transition: Transition,
+    delete_proof: bool,
 }
 
 enum Request {
     Execute {
         command: Command,
-        reply: oneshot::Sender<Result<(), OrderError>>,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
     },
     GetOrder {
         order_id: OrderId,
-        reply: oneshot::Sender<Option<Order>>,
+        reply: oneshot::Sender<Result<Option<Order>, RepositoryError>>,
     },
     ReservingOrders {
         reply: oneshot::Sender<Vec<Order>>,
@@ -221,7 +294,7 @@ enum Request {
     },
     TakeSolverProofs {
         solver_id: SolverId,
-        reply: oneshot::Sender<Vec<SolverProofDelivery>>,
+        reply: oneshot::Sender<Result<Vec<SolverProofDelivery>, RepositoryError>>,
     },
 }
 
@@ -235,6 +308,7 @@ pub struct OrderbookHandle {
 pub enum ServiceError {
     Closed,
     Order(OrderError),
+    Repository(RepositoryError),
 }
 
 impl OrderbookHandle {
@@ -245,10 +319,7 @@ impl OrderbookHandle {
             .await
             .map_err(|_| ServiceError::Closed)?;
 
-        result
-            .await
-            .map_err(|_| ServiceError::Closed)?
-            .map_err(ServiceError::Order)
+        result.await.map_err(|_| ServiceError::Closed)?
     }
 
     pub async fn get_order(&self, order_id: OrderId) -> Result<Option<Order>, ServiceError> {
@@ -258,7 +329,10 @@ impl OrderbookHandle {
             .await
             .map_err(|_| ServiceError::Closed)?;
 
-        result.await.map_err(|_| ServiceError::Closed)
+        result
+            .await
+            .map_err(|_| ServiceError::Closed)?
+            .map_err(ServiceError::Repository)
     }
 
     pub async fn reserving_orders(&self) -> Result<Vec<Order>, ServiceError> {
@@ -291,7 +365,10 @@ impl OrderbookHandle {
             .await
             .map_err(|_| ServiceError::Closed)?;
 
-        result.await.map_err(|_| ServiceError::Closed)
+        result
+            .await
+            .map_err(|_| ServiceError::Closed)?
+            .map_err(ServiceError::Repository)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<OrderEvent> {
@@ -299,17 +376,32 @@ impl OrderbookHandle {
     }
 }
 
-pub fn start_orderbook() -> OrderbookHandle {
-    start_orderbook_with_capacity(256)
+pub async fn start_orderbook(database_url: &str) -> Result<OrderbookHandle, RepositoryError> {
+    start_orderbook_with_capacity(database_url, 256).await
 }
 
-pub fn start_orderbook_with_capacity(capacity: usize) -> OrderbookHandle {
+pub async fn start_orderbook_with_capacity(
+    database_url: &str,
+    capacity: usize,
+) -> Result<OrderbookHandle, RepositoryError> {
+    let repository = OrderRepository::connect(database_url).await?;
+    start_orderbook_with_repository(repository, capacity).await
+}
+
+pub async fn start_orderbook_with_repository(
+    repository: OrderRepository,
+    capacity: usize,
+) -> Result<OrderbookHandle, RepositoryError> {
+    let restored = repository.load_non_terminal_orders().await?;
+    let mut orderbook =
+        Orderbook::from_orders(restored.into_iter().map(|persisted| persisted.order));
+    let restored_count = orderbook.orders.len();
     let (request_tx, mut request_rx) = mpsc::channel(capacity);
     let (event_tx, _) = broadcast::channel(capacity);
     let events = event_tx.clone();
 
     tokio::spawn(async move {
-        let mut orderbook = Orderbook::default();
+        crate::service_log!("orderbook", "restored active_orders={restored_count}");
 
         while let Some(request) = request_rx.recv().await {
             match request {
@@ -321,17 +413,83 @@ pub fn start_orderbook_with_capacity(capacity: usize) -> OrderbookHandle {
                         "received command={command_name} order={}",
                         short_id(order_id)
                     );
-                    let result = orderbook.process(command).map(|produced| {
-                        for event in produced {
-                            crate::service_log!(
-                                "orderbook",
-                                "emitted event={} order={}",
-                                event.name(),
-                                short_id(event.order_id())
-                            );
-                            let _ = events.send(event);
+                    let result: Result<(), ServiceError> = async {
+                        let stored_order = if orderbook.orders.contains_key(&order_id) {
+                            None
+                        } else {
+                            repository
+                                .get_order(order_id)
+                                .await
+                                .map_err(ServiceError::Repository)?
+                                .map(|stored| stored.order)
+                        };
+                        if let Some(stored_order) = stored_order {
+                            orderbook.orders.entry(order_id).or_insert(stored_order);
                         }
-                    });
+
+                        let stored_proof =
+                            if matches!(&command, Command::RelayEncryptedProof { .. }) {
+                                repository
+                                    .get_proof(order_id)
+                                    .await
+                                    .map_err(ServiceError::Repository)?
+                                    .map(|proof| proof.ciphertext)
+                            } else {
+                                None
+                            };
+
+                        match orderbook
+                            .prepare(command, stored_proof.as_deref())
+                            .map_err(ServiceError::Order)?
+                        {
+                            Some(prepared) => {
+                                let timestamp_ms = now_ms();
+                                let persisted = if let Some(expected_version) =
+                                    prepared.expected_version
+                                {
+                                    let proof =
+                                        prepared.transition.deliveries.first().map(|delivery| {
+                                            (
+                                                delivery.solver_id,
+                                                delivery.proof.ciphertext.as_slice(),
+                                            )
+                                        });
+                                    repository
+                                        .persist_transition(
+                                            &prepared.order,
+                                            expected_version,
+                                            timestamp_ms,
+                                            proof,
+                                            prepared.delete_proof,
+                                        )
+                                        .await
+                                } else {
+                                    repository
+                                        .insert_order(&prepared.order, timestamp_ms, None)
+                                        .await
+                                };
+
+                                persisted.map_err(ServiceError::Repository)?;
+                                orderbook.commit(&prepared);
+                                for event in prepared.transition.events {
+                                    crate::service_log!(
+                                        "orderbook",
+                                        "emitted event={} order={}",
+                                        event.name(),
+                                        short_id(event.order_id())
+                                    );
+                                    let _ = events.send(event);
+                                }
+                            }
+                            None => crate::service_log!(
+                                "orderbook",
+                                "idempotent command={command_name} order={}",
+                                short_id(order_id)
+                            ),
+                        }
+                        Ok(())
+                    }
+                    .await;
                     if let Err(error) = &result {
                         crate::service_error!(
                             "orderbook",
@@ -342,7 +500,14 @@ pub fn start_orderbook_with_capacity(capacity: usize) -> OrderbookHandle {
                     let _ = reply.send(result);
                 }
                 Request::GetOrder { order_id, reply } => {
-                    let _ = reply.send(orderbook.orders.get(&order_id).cloned());
+                    let result = match orderbook.orders.get(&order_id).cloned() {
+                        Some(order) => Ok(Some(order)),
+                        None => repository
+                            .get_order(order_id)
+                            .await
+                            .map(|stored| stored.map(|stored| stored.order)),
+                    };
+                    let _ = reply.send(result);
                 }
                 Request::ReservingOrders { reply } => {
                     let orders = orderbook
@@ -363,20 +528,36 @@ pub fn start_orderbook_with_capacity(capacity: usize) -> OrderbookHandle {
                     let _ = reply.send(orders);
                 }
                 Request::TakeSolverProofs { solver_id, reply } => {
-                    let proofs = orderbook
-                        .solver_proofs
-                        .remove(&solver_id)
-                        .unwrap_or_default();
+                    let proofs = repository
+                        .load_solver_proofs(solver_id)
+                        .await
+                        .map(|proofs| {
+                            proofs
+                                .into_iter()
+                                .map(|proof| SolverProofDelivery {
+                                    order_id: proof.order_id,
+                                    ciphertext: proof.ciphertext,
+                                })
+                                .collect()
+                        });
                     let _ = reply.send(proofs);
                 }
             }
         }
     });
 
-    OrderbookHandle {
+    Ok(OrderbookHandle {
         requests: request_tx,
         events: event_tx,
-    }
+    })
+}
+
+fn now_ms() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
@@ -453,5 +634,33 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, OrderError::InvalidState));
+    }
+
+    #[tokio::test]
+    async fn persists_and_restores_an_active_order() {
+        let repository = OrderRepository::connect("sqlite::memory:").await.unwrap();
+        let orderbook = start_orderbook_with_repository(repository.clone(), 16)
+            .await
+            .unwrap();
+        let order_id = Uuid::new_v4();
+
+        orderbook
+            .execute(Command::CreateOrder {
+                order_id,
+                terms: terms(),
+            })
+            .await
+            .unwrap();
+
+        let stored = repository.get_order(order_id).await.unwrap().unwrap();
+        assert_eq!(stored.order.state, OrderState::Reserving);
+        drop(orderbook);
+
+        let restored = start_orderbook_with_repository(repository, 16)
+            .await
+            .unwrap();
+        let order = restored.get_order(order_id).await.unwrap().unwrap();
+        assert_eq!(order.state, OrderState::Reserving);
+        assert_eq!(order.version, 3);
     }
 }

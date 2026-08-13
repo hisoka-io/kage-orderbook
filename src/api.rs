@@ -227,7 +227,7 @@ async fn forward_events(
 
 fn status_for_error(error: ServiceError) -> StatusCode {
     match error {
-        ServiceError::Closed => StatusCode::SERVICE_UNAVAILABLE,
+        ServiceError::Closed | ServiceError::Repository(_) => StatusCode::SERVICE_UNAVAILABLE,
         ServiceError::Order(OrderError::InvalidTerms | OrderError::InvalidPayload) => {
             StatusCode::UNPROCESSABLE_ENTITY
         }

@@ -1,4 +1,6 @@
 mod chain;
+mod chaos;
+mod recovery;
 mod solver;
 mod support;
 mod user;
@@ -18,7 +20,7 @@ use tokio::task::JoinHandle;
 const USERS: u64 = 5;
 
 async fn server() -> (String, String, JoinHandle<()>) {
-    let orderbook = start_orderbook();
+    let orderbook = start_orderbook("sqlite::memory:").await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
@@ -79,7 +81,7 @@ async fn orders_wait_for_an_external_solver() {
 
 #[tokio::test]
 async fn external_services_drive_orders_to_filled() {
-    let orderbook = start_orderbook();
+    let orderbook = start_orderbook("sqlite::memory:").await.unwrap();
     let mut events = orderbook.subscribe();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
