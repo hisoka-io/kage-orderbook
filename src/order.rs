@@ -20,6 +20,7 @@ pub struct Order {
 
     pub amount_in: U256,
     pub amount_out: U256,
+    pub expires_at_ms: Option<i64>,
 
     pub solver: Option<SolverId>,
     pub solver_noise_public_key: Option<Vec<u8>>,
@@ -47,6 +48,16 @@ pub struct TradeTerms {
     pub token_out: TokenAddress,
     pub amount_in: U256,
     pub amount_out: U256,
+    pub expires_at_ms: i64,
+}
+
+impl OrderState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Filled | Self::Expired | Self::Cancelled | Self::Failed
+        )
+    }
 }
 
 impl Order {
@@ -59,10 +70,18 @@ impl Order {
             token_out: terms.token_out,
             amount_in: terms.amount_in,
             amount_out: terms.amount_out,
+            expires_at_ms: Some(terms.expires_at_ms),
             solver: None,
             solver_noise_public_key: None,
             tx_hash: None,
         }
+    }
+
+    pub fn is_expired_at(&self, timestamp_ms: i64) -> bool {
+        !self.state.is_terminal()
+            && self
+                .expires_at_ms
+                .is_some_and(|expires_at_ms| expires_at_ms <= timestamp_ms)
     }
 
     pub fn apply(&mut self, event: &OrderEvent) {

@@ -99,6 +99,7 @@ impl Generator {
             token_out: Address::repeat_byte(2),
             amount_in: U256::from(amount_in),
             amount_out: U256::from(amount_in * 2),
+            expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
         }
     }
 }

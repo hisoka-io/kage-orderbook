@@ -71,7 +71,6 @@ impl OrderRepository {
         &self,
         order: &Order,
         created_at_ms: i64,
-        expires_at_ms: Option<i64>,
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "INSERT INTO orders (
@@ -92,7 +91,7 @@ impl OrderRepository {
         .bind(order.tx_hash.map(|hash| hash.to_vec()))
         .bind(created_at_ms)
         .bind(created_at_ms)
-        .bind(expires_at_ms)
+        .bind(order.expires_at_ms)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -318,6 +317,7 @@ fn decode_order(row: SqliteRow) -> Result<PersistedOrder, RepositoryError> {
         .try_get::<Option<Vec<u8>>, _>("tx_hash")?
         .map(|value| parse_fixed::<32>("tx_hash", value).map(B256::from))
         .transpose()?;
+    let expires_at_ms = row.try_get("expires_at_ms")?;
 
     Ok(PersistedOrder {
         order: Order {
@@ -328,13 +328,14 @@ fn decode_order(row: SqliteRow) -> Result<PersistedOrder, RepositoryError> {
             token_out: Address::from(token_out),
             amount_in,
             amount_out,
+            expires_at_ms,
             solver,
             solver_noise_public_key: noise_public_key,
             tx_hash,
         },
         created_at_ms: row.try_get("created_at_ms")?,
         updated_at_ms: row.try_get("updated_at_ms")?,
-        expires_at_ms: row.try_get("expires_at_ms")?,
+        expires_at_ms,
     })
 }
 
@@ -429,6 +430,7 @@ mod tests {
             token_out: Address::repeat_byte(2),
             amount_in: U256::from(100),
             amount_out: U256::from(200),
+            expires_at_ms: Some(5000),
             solver: Some(Uuid::new_v4()),
             solver_noise_public_key: Some(vec![7; 32]),
             tx_hash: Some(B256::repeat_byte(9)),
@@ -443,10 +445,7 @@ mod tests {
     async fn stores_and_loads_an_order() {
         let repository = repository().await;
         let order = order(OrderState::Executing, 7);
-        repository
-            .insert_order(&order, 1000, Some(5000))
-            .await
-            .unwrap();
+        repository.insert_order(&order, 1000).await.unwrap();
 
         let stored = repository.get_order(order.id).await.unwrap().unwrap();
         assert_eq!(stored.order.id, order.id);
@@ -464,7 +463,7 @@ mod tests {
     async fn rejects_a_stale_order_update() {
         let repository = repository().await;
         let mut order = order(OrderState::Reserving, 3);
-        repository.insert_order(&order, 1000, None).await.unwrap();
+        repository.insert_order(&order, 1000).await.unwrap();
 
         order.state = OrderState::AwaitingUserProof;
         order.version = 4;
@@ -479,8 +478,8 @@ mod tests {
         let repository = repository().await;
         let active = order(OrderState::ProofRelayed, 5);
         let filled = order(OrderState::Filled, 8);
-        repository.insert_order(&active, 1000, None).await.unwrap();
-        repository.insert_order(&filled, 1001, None).await.unwrap();
+        repository.insert_order(&active, 1000).await.unwrap();
+        repository.insert_order(&filled, 1001).await.unwrap();
 
         let orders = repository.load_non_terminal_orders().await.unwrap();
         assert_eq!(orders.len(), 1);
@@ -492,7 +491,7 @@ mod tests {
         let repository = repository().await;
         let order = order(OrderState::ProofRelayed, 5);
         let solver_id = order.solver.unwrap();
-        repository.insert_order(&order, 1000, None).await.unwrap();
+        repository.insert_order(&order, 1000).await.unwrap();
         repository
             .store_proof(order.id, solver_id, &[1, 2, 3], 1100)
             .await

@@ -7,5 +7,6 @@ pub fn terms(n: u64) -> TradeTerms {
         token_out: Address::repeat_byte(1),
         amount_in: U256::from(n),
         amount_out: U256::from(n * 2),
+        expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
     }
 }

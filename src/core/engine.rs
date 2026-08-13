@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{B256, U256};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -182,14 +182,28 @@ impl Orderbook {
         &self,
         command: Command,
         stored_proof: Option<&[u8]>,
+        timestamp_ms: i64,
     ) -> Result<Option<PreparedTransition>, OrderError> {
+        if let Command::CreateOrder { terms, .. } = &command
+            && terms.expires_at_ms <= timestamp_ms
+        {
+            return Err(OrderError::InvalidTerms);
+        }
         let order_id = command.order_id();
         let current = self.orders.get(&order_id);
+        if current.is_some_and(|order| order.is_expired_at(timestamp_ms))
+            && !matches!(&command, Command::ExpireOrder { .. })
+        {
+            return Err(OrderError::InvalidState);
+        }
         if is_idempotent(current, &command, stored_proof) {
             return Ok(None);
         }
         let expected_version = current.map(|order| order.version);
-        let delete_proof = matches!(&command, Command::SettlementObserved { .. });
+        let delete_proof = matches!(
+            &command,
+            Command::SettlementObserved { .. } | Command::ExpireOrder { .. }
+        );
         let transition = handle(current, command)?;
         let mut order = match current {
             Some(order) => order.clone(),
@@ -217,7 +231,7 @@ impl Orderbook {
     }
 
     pub fn process(&mut self, command: Command) -> Result<Vec<OrderEvent>, OrderError> {
-        let Some(prepared) = self.prepare(command, None)? else {
+        let Some(prepared) = self.prepare(command, None, now_ms())? else {
             return Ok(vec![]);
         };
         let events = prepared.transition.events.clone();
@@ -402,101 +416,28 @@ pub async fn start_orderbook_with_repository(
 
     tokio::spawn(async move {
         crate::service_log!("orderbook", "restored active_orders={restored_count}");
+        let mut expiry_interval = tokio::time::interval(Duration::from_millis(100));
+        expiry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        while let Some(request) = request_rx.recv().await {
+        loop {
+            let request = tokio::select! {
+                _ = expiry_interval.tick() => {
+                    expire_due_orders(&mut orderbook, &repository, &events).await;
+                    continue;
+                }
+                request = request_rx.recv() => {
+                    let Some(request) = request else {
+                        break;
+                    };
+                    request
+                }
+            };
+
+            expire_due_orders(&mut orderbook, &repository, &events).await;
             match request {
                 Request::Execute { command, reply } => {
-                    let order_id = command.order_id();
-                    let command_name = command.name();
-                    crate::service_log!(
-                        "orderbook",
-                        "received command={command_name} order={}",
-                        short_id(order_id)
-                    );
-                    let result: Result<(), ServiceError> = async {
-                        let stored_order = if orderbook.orders.contains_key(&order_id) {
-                            None
-                        } else {
-                            repository
-                                .get_order(order_id)
-                                .await
-                                .map_err(ServiceError::Repository)?
-                                .map(|stored| stored.order)
-                        };
-                        if let Some(stored_order) = stored_order {
-                            orderbook.orders.entry(order_id).or_insert(stored_order);
-                        }
-
-                        let stored_proof =
-                            if matches!(&command, Command::RelayEncryptedProof { .. }) {
-                                repository
-                                    .get_proof(order_id)
-                                    .await
-                                    .map_err(ServiceError::Repository)?
-                                    .map(|proof| proof.ciphertext)
-                            } else {
-                                None
-                            };
-
-                        match orderbook
-                            .prepare(command, stored_proof.as_deref())
-                            .map_err(ServiceError::Order)?
-                        {
-                            Some(prepared) => {
-                                let timestamp_ms = now_ms();
-                                let persisted = if let Some(expected_version) =
-                                    prepared.expected_version
-                                {
-                                    let proof =
-                                        prepared.transition.deliveries.first().map(|delivery| {
-                                            (
-                                                delivery.solver_id,
-                                                delivery.proof.ciphertext.as_slice(),
-                                            )
-                                        });
-                                    repository
-                                        .persist_transition(
-                                            &prepared.order,
-                                            expected_version,
-                                            timestamp_ms,
-                                            proof,
-                                            prepared.delete_proof,
-                                        )
-                                        .await
-                                } else {
-                                    repository
-                                        .insert_order(&prepared.order, timestamp_ms, None)
-                                        .await
-                                };
-
-                                persisted.map_err(ServiceError::Repository)?;
-                                orderbook.commit(&prepared);
-                                for event in prepared.transition.events {
-                                    crate::service_log!(
-                                        "orderbook",
-                                        "emitted event={} order={}",
-                                        event.name(),
-                                        short_id(event.order_id())
-                                    );
-                                    let _ = events.send(event);
-                                }
-                            }
-                            None => crate::service_log!(
-                                "orderbook",
-                                "idempotent command={command_name} order={}",
-                                short_id(order_id)
-                            ),
-                        }
-                        Ok(())
-                    }
-                    .await;
-                    if let Err(error) = &result {
-                        crate::service_error!(
-                            "orderbook",
-                            "rejected command={command_name} order={} error={error:?}",
-                            short_id(order_id)
-                        );
-                    }
+                    let result =
+                        execute_command(&mut orderbook, &repository, &events, command).await;
                     let _ = reply.send(result);
                 }
                 Request::GetOrder { order_id, reply } => {
@@ -552,6 +493,124 @@ pub async fn start_orderbook_with_repository(
     })
 }
 
+async fn execute_command(
+    orderbook: &mut Orderbook,
+    repository: &OrderRepository,
+    events: &broadcast::Sender<OrderEvent>,
+    command: Command,
+) -> Result<(), ServiceError> {
+    let order_id = command.order_id();
+    let command_name = command.name();
+    crate::service_log!(
+        "orderbook",
+        "received command={command_name} order={}",
+        short_id(order_id)
+    );
+
+    let result: Result<(), ServiceError> = async {
+        let stored_order = if orderbook.orders.contains_key(&order_id) {
+            None
+        } else {
+            repository
+                .get_order(order_id)
+                .await
+                .map_err(ServiceError::Repository)?
+                .map(|stored| stored.order)
+        };
+        if let Some(stored_order) = stored_order {
+            orderbook.orders.entry(order_id).or_insert(stored_order);
+        }
+
+        let stored_proof = if matches!(&command, Command::RelayEncryptedProof { .. }) {
+            repository
+                .get_proof(order_id)
+                .await
+                .map_err(ServiceError::Repository)?
+                .map(|proof| proof.ciphertext)
+        } else {
+            None
+        };
+        let timestamp_ms = now_ms();
+
+        match orderbook
+            .prepare(command, stored_proof.as_deref(), timestamp_ms)
+            .map_err(ServiceError::Order)?
+        {
+            Some(prepared) => {
+                let persisted = if let Some(expected_version) = prepared.expected_version {
+                    let proof =
+                        prepared.transition.deliveries.first().map(|delivery| {
+                            (delivery.solver_id, delivery.proof.ciphertext.as_slice())
+                        });
+                    repository
+                        .persist_transition(
+                            &prepared.order,
+                            expected_version,
+                            timestamp_ms,
+                            proof,
+                            prepared.delete_proof,
+                        )
+                        .await
+                } else {
+                    repository.insert_order(&prepared.order, timestamp_ms).await
+                };
+
+                persisted.map_err(ServiceError::Repository)?;
+                orderbook.commit(&prepared);
+                for event in prepared.transition.events {
+                    crate::service_log!(
+                        "orderbook",
+                        "emitted event={} order={}",
+                        event.name(),
+                        short_id(event.order_id())
+                    );
+                    let _ = events.send(event);
+                }
+            }
+            None => crate::service_log!(
+                "orderbook",
+                "idempotent command={command_name} order={}",
+                short_id(order_id)
+            ),
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = &result {
+        crate::service_error!(
+            "orderbook",
+            "rejected command={command_name} order={} error={error:?}",
+            short_id(order_id)
+        );
+    }
+    result
+}
+
+async fn expire_due_orders(
+    orderbook: &mut Orderbook,
+    repository: &OrderRepository,
+    events: &broadcast::Sender<OrderEvent>,
+) {
+    let timestamp_ms = now_ms();
+    let due = orderbook
+        .orders
+        .values()
+        .filter(|order| order.is_expired_at(timestamp_ms))
+        .map(|order| order.id)
+        .collect::<Vec<_>>();
+
+    for order_id in due {
+        let _ = execute_command(
+            orderbook,
+            repository,
+            events,
+            Command::ExpireOrder { order_id },
+        )
+        .await;
+    }
+}
+
 fn now_ms() -> i64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -573,6 +632,7 @@ mod tests {
             token_out: Address::repeat_byte(1),
             amount_in: U256::from(1),
             amount_out: U256::from(2),
+            expires_at_ms: i64::MAX,
         }
     }
 

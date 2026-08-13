@@ -1,5 +1,6 @@
 mod chain;
 mod chaos;
+mod expiry;
 mod recovery;
 mod solver;
 mod support;
