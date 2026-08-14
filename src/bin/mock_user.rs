@@ -14,6 +14,7 @@ use kage_orderbook::logging::short_id;
 use kage_orderbook::order::{Order, OrderId, OrderState, TradeTerms};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
+use uuid::Uuid;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -105,14 +106,13 @@ impl Generator {
             expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
         }
     }
+}
 
-    fn commitment(&mut self) -> B256 {
-        let mut bytes = [0_u8; 32];
-        for chunk in bytes.chunks_exact_mut(8) {
-            chunk.copy_from_slice(&self.next().to_be_bytes());
-        }
-        B256::from(bytes)
-    }
+fn new_order_commitment() -> B256 {
+    let mut bytes = [0_u8; 32];
+    bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    B256::from(bytes)
 }
 
 #[tokio::main]
@@ -165,7 +165,7 @@ async fn main() -> Result<(), BoxError> {
     for index in 0..config.orders {
         let terms = generator.terms();
         let request = CreateOrderRequest {
-            order_commitment: generator.commitment(),
+            order_commitment: new_order_commitment(),
             terms,
         };
         let response = client
