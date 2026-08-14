@@ -9,7 +9,7 @@ use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::order::{Order, OrderId, OrderState, SolverId};
+use crate::order::{Order, OrderCommitment, OrderId, OrderState, SolverId};
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -19,6 +19,8 @@ pub enum RepositoryError {
     Migration(#[from] sqlx::migrate::MigrateError),
     #[error("order version conflict")]
     VersionConflict,
+    #[error("order commitment already exists")]
+    DuplicateOrderCommitment,
     #[error("invalid stored {field}: {value}")]
     InvalidData { field: &'static str, value: String },
 }
@@ -26,6 +28,7 @@ pub enum RepositoryError {
 #[derive(Debug, Clone)]
 pub struct PersistedOrder {
     pub order: Order,
+    pub order_commitment: Option<OrderCommitment>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub expires_at_ms: Option<i64>,
@@ -70,14 +73,15 @@ impl OrderRepository {
     pub async fn insert_order(
         &self,
         order: &Order,
+        order_commitment: OrderCommitment,
         created_at_ms: i64,
     ) -> Result<(), RepositoryError> {
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO orders (
                 id, state, version, token_in, token_out, amount_in, amount_out,
                 solver_id, solver_noise_public_key, tx_hash,
-                created_at_ms, updated_at_ms, expires_at_ms
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                created_at_ms, updated_at_ms, expires_at_ms, order_commitment
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(order.id.to_string())
         .bind(state_name(order.state))
@@ -92,8 +96,20 @@ impl OrderRepository {
         .bind(created_at_ms)
         .bind(created_at_ms)
         .bind(order.expires_at_ms)
+        .bind(order_commitment.as_slice())
         .execute(&self.pool)
-        .await?;
+        .await;
+
+        match result {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error))
+                if error.is_unique_violation()
+                    && error.message().contains("orders.order_commitment") =>
+            {
+                return Err(RepositoryError::DuplicateOrderCommitment);
+            }
+            Err(error) => return Err(RepositoryError::Database(error)),
+        }
         Ok(())
     }
 
@@ -318,6 +334,10 @@ fn decode_order(row: SqliteRow) -> Result<PersistedOrder, RepositoryError> {
         .map(|value| parse_fixed::<32>("tx_hash", value).map(B256::from))
         .transpose()?;
     let expires_at_ms = row.try_get("expires_at_ms")?;
+    let order_commitment = row
+        .try_get::<Option<Vec<u8>>, _>("order_commitment")?
+        .map(|value| parse_fixed::<32>("order_commitment", value).map(B256::from))
+        .transpose()?;
 
     Ok(PersistedOrder {
         order: Order {
@@ -333,6 +353,7 @@ fn decode_order(row: SqliteRow) -> Result<PersistedOrder, RepositoryError> {
             solver_noise_public_key: noise_public_key,
             tx_hash,
         },
+        order_commitment,
         created_at_ms: row.try_get("created_at_ms")?,
         updated_at_ms: row.try_get("updated_at_ms")?,
         expires_at_ms,
@@ -445,7 +466,11 @@ mod tests {
     async fn stores_and_loads_an_order() {
         let repository = repository().await;
         let order = order(OrderState::Executing, 7);
-        repository.insert_order(&order, 1000).await.unwrap();
+        let commitment = B256::repeat_byte(1);
+        repository
+            .insert_order(&order, commitment, 1000)
+            .await
+            .unwrap();
 
         let stored = repository.get_order(order.id).await.unwrap().unwrap();
         assert_eq!(stored.order.id, order.id);
@@ -454,6 +479,7 @@ mod tests {
         assert_eq!(stored.order.amount_in, order.amount_in);
         assert_eq!(stored.order.solver, order.solver);
         assert_eq!(stored.order.tx_hash, order.tx_hash);
+        assert_eq!(stored.order_commitment, Some(commitment));
         assert_eq!(stored.created_at_ms, 1000);
         assert_eq!(stored.updated_at_ms, 1000);
         assert_eq!(stored.expires_at_ms, Some(5000));
@@ -463,7 +489,10 @@ mod tests {
     async fn rejects_a_stale_order_update() {
         let repository = repository().await;
         let mut order = order(OrderState::Reserving, 3);
-        repository.insert_order(&order, 1000).await.unwrap();
+        repository
+            .insert_order(&order, B256::repeat_byte(1), 1000)
+            .await
+            .unwrap();
 
         order.state = OrderState::AwaitingUserProof;
         order.version = 4;
@@ -478,8 +507,14 @@ mod tests {
         let repository = repository().await;
         let active = order(OrderState::ProofRelayed, 5);
         let filled = order(OrderState::Filled, 8);
-        repository.insert_order(&active, 1000).await.unwrap();
-        repository.insert_order(&filled, 1001).await.unwrap();
+        repository
+            .insert_order(&active, B256::repeat_byte(1), 1000)
+            .await
+            .unwrap();
+        repository
+            .insert_order(&filled, B256::repeat_byte(2), 1001)
+            .await
+            .unwrap();
 
         let orders = repository.load_non_terminal_orders().await.unwrap();
         assert_eq!(orders.len(), 1);
@@ -491,7 +526,10 @@ mod tests {
         let repository = repository().await;
         let order = order(OrderState::ProofRelayed, 5);
         let solver_id = order.solver.unwrap();
-        repository.insert_order(&order, 1000).await.unwrap();
+        repository
+            .insert_order(&order, B256::repeat_byte(1), 1000)
+            .await
+            .unwrap();
         repository
             .store_proof(order.id, solver_id, &[1, 2, 3], 1100)
             .await

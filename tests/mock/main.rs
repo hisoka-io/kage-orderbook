@@ -9,11 +9,11 @@ mod user;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use kage_orderbook::api::{self, CreateOrderResponse};
+use kage_orderbook::api::{self, CreateOrderRequest, CreateOrderResponse};
 use kage_orderbook::core::engine::start_orderbook;
 use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::order::{Order, OrderId, OrderState};
-use support::terms;
+use support::{commitment, terms};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -36,9 +36,13 @@ async fn server() -> (String, String, JoinHandle<()>) {
 }
 
 async fn create_order(client: &reqwest::Client, http_url: &str, n: u64) -> OrderId {
+    let request = CreateOrderRequest {
+        order_commitment: commitment(n),
+        terms: terms(n),
+    };
     client
         .post(format!("{http_url}/orders"))
-        .json(&terms(n))
+        .json(&request)
         .send()
         .await
         .unwrap()
@@ -48,6 +52,34 @@ async fn create_order(client: &reqwest::Client, http_url: &str, n: u64) -> Order
         .await
         .unwrap()
         .order_id
+}
+
+#[tokio::test]
+async fn rejects_a_duplicate_order_commitment() {
+    let (http_url, _, server) = server().await;
+    let client = reqwest::Client::new();
+    let request = CreateOrderRequest {
+        order_commitment: commitment(1),
+        terms: terms(1),
+    };
+
+    let first = client
+        .post(format!("{http_url}/orders"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::CREATED);
+
+    let second = client
+        .post(format!("{http_url}/orders"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), reqwest::StatusCode::CONFLICT);
+
+    server.abort();
 }
 
 #[tokio::test]

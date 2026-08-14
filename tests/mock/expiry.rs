@@ -6,7 +6,7 @@ use kage_orderbook::core::engine::{OrderError, ServiceError, start_orderbook};
 use kage_orderbook::order::OrderState;
 use uuid::Uuid;
 
-use super::support::terms;
+use super::support::{commitment, terms};
 
 #[tokio::test]
 async fn rejects_an_order_that_is_already_expired() {
@@ -18,6 +18,7 @@ async fn rejects_an_order_that_is_already_expired() {
     let error = orderbook
         .execute(Command::CreateOrder {
             order_id,
+            order_commitment: commitment(1),
             terms: expired_terms,
         })
         .await
@@ -42,6 +43,7 @@ async fn expires_an_active_order_and_removes_its_proof() {
     orderbook
         .execute(Command::CreateOrder {
             order_id,
+            order_commitment: commitment(1),
             terms: expiring_terms,
         })
         .await
@@ -128,6 +130,7 @@ async fn expires_an_order_while_the_orderbook_is_offline() {
     first
         .execute(Command::CreateOrder {
             order_id,
+            order_commitment: commitment(1),
             terms: expiring_terms,
         })
         .await

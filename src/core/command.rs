@@ -1,8 +1,9 @@
-use crate::order::{OrderId, SolverId, TradeTerms, TxHash};
+use crate::order::{OrderCommitment, OrderId, SolverId, TradeTerms, TxHash};
 
 pub enum Command {
     CreateOrder {
         order_id: OrderId,
+        order_commitment: OrderCommitment,
         terms: TradeTerms,
     },
 

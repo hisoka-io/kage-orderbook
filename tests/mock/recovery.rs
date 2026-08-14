@@ -4,7 +4,7 @@ use kage_orderbook::core::engine::start_orderbook;
 use kage_orderbook::order::OrderState;
 use uuid::Uuid;
 
-use super::support::terms;
+use super::support::{commitment, terms};
 
 #[tokio::test]
 async fn proof_relayed_order_survives_restart_and_reaches_filled() {
@@ -23,6 +23,7 @@ async fn proof_relayed_order_survives_restart_and_reaches_filled() {
     first
         .execute(Command::CreateOrder {
             order_id,
+            order_commitment: commitment(1),
             terms: terms(1),
         })
         .await

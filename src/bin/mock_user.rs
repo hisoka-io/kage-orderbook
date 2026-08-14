@@ -3,9 +3,9 @@ use std::error::Error;
 use std::io;
 use std::time::Duration;
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use futures_util::StreamExt;
-use kage_orderbook::api::{CreateOrderResponse, EncryptedProofRequest};
+use kage_orderbook::api::{CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest};
 use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
 use kage_orderbook::order::{Order, OrderId, OrderState, TradeTerms};
@@ -102,6 +102,14 @@ impl Generator {
             expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
         }
     }
+
+    fn commitment(&mut self) -> B256 {
+        let mut bytes = [0_u8; 32];
+        for chunk in bytes.chunks_exact_mut(8) {
+            chunk.copy_from_slice(&self.next().to_be_bytes());
+        }
+        B256::from(bytes)
+    }
 }
 
 #[tokio::main]
@@ -136,9 +144,13 @@ async fn main() -> Result<(), BoxError> {
 
     for index in 0..config.orders {
         let terms = generator.terms();
+        let request = CreateOrderRequest {
+            order_commitment: generator.commitment(),
+            terms,
+        };
         let response = client
             .post(format!("{}/orders", config.http_url))
-            .json(&terms)
+            .json(&request)
             .send()
             .await?
             .error_for_status()?

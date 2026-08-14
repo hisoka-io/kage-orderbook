@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use super::command::Command;
 use super::events::OrderEvent;
 use crate::logging::short_id;
-use crate::order::{Order, OrderId, OrderState, SolverId};
+use crate::order::{Order, OrderCommitment, OrderId, OrderState, SolverId};
 use crate::storage::{OrderRepository, RepositoryError};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -42,9 +42,16 @@ pub enum OrderError {
 
 pub fn handle(order: Option<&Order>, command: Command) -> Result<Transition, OrderError> {
     match command {
-        Command::CreateOrder { order_id, terms } => {
+        Command::CreateOrder {
+            order_id,
+            order_commitment,
+            terms,
+        } => {
             if order.is_some() {
                 return Err(OrderError::AlreadyExists);
+            }
+            if order_commitment == B256::ZERO {
+                return Err(OrderError::InvalidPayload);
             }
             if terms.token_in == terms.token_out
                 || terms.amount_in == U256::ZERO
@@ -184,6 +191,12 @@ impl Orderbook {
         stored_proof: Option<&[u8]>,
         timestamp_ms: i64,
     ) -> Result<Option<PreparedTransition>, OrderError> {
+        let order_commitment = match &command {
+            Command::CreateOrder {
+                order_commitment, ..
+            } => Some(*order_commitment),
+            _ => None,
+        };
         if let Command::CreateOrder { terms, .. } = &command
             && terms.expires_at_ms <= timestamp_ms
         {
@@ -219,6 +232,7 @@ impl Orderbook {
 
         Ok(Some(PreparedTransition {
             order,
+            order_commitment,
             expected_version,
             transition,
             delete_proof,
@@ -286,6 +300,7 @@ fn is_idempotent(order: Option<&Order>, command: &Command, stored_proof: Option<
 
 struct PreparedTransition {
     order: Order,
+    order_commitment: Option<OrderCommitment>,
     expected_version: Option<u64>,
     transition: Transition,
     delete_proof: bool,
@@ -552,7 +567,19 @@ async fn execute_command(
                         )
                         .await
                 } else {
-                    repository.insert_order(&prepared.order, timestamp_ms).await
+                    repository
+                        .insert_order(
+                            &prepared.order,
+                            prepared
+                                .order_commitment
+                                .ok_or_else(|| RepositoryError::InvalidData {
+                                    field: "order_commitment",
+                                    value: "missing from create transition".to_owned(),
+                                })
+                                .map_err(ServiceError::Repository)?,
+                            timestamp_ms,
+                        )
+                        .await
                 };
 
                 persisted.map_err(ServiceError::Repository)?;
@@ -643,6 +670,7 @@ mod tests {
 
         book.process(Command::CreateOrder {
             order_id,
+            order_commitment: B256::repeat_byte(1),
             terms: terms(),
         })
         .unwrap();
@@ -682,6 +710,7 @@ mod tests {
 
         book.process(Command::CreateOrder {
             order_id,
+            order_commitment: B256::repeat_byte(1),
             terms: terms(),
         })
         .unwrap();
@@ -707,6 +736,7 @@ mod tests {
         orderbook
             .execute(Command::CreateOrder {
                 order_id,
+                order_commitment: B256::repeat_byte(1),
                 terms: terms(),
             })
             .await

@@ -10,7 +10,15 @@ use uuid::Uuid;
 use crate::core::command::Command;
 use crate::core::engine::{OrderError, OrderbookHandle, ServiceError, SolverProofDelivery};
 use crate::logging::short_id;
-use crate::order::{Order, OrderId, SolverId, TradeTerms, TxHash};
+use crate::order::{Order, OrderCommitment, OrderId, SolverId, TradeTerms, TxHash};
+use crate::storage::RepositoryError;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateOrderRequest {
+    pub order_commitment: OrderCommitment,
+    #[serde(flatten)]
+    pub terms: TradeTerms,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateOrderResponse {
@@ -62,9 +70,10 @@ pub fn router(orderbook: OrderbookHandle) -> Router {
 
 async fn create_order(
     State(orderbook): State<OrderbookHandle>,
-    Json(terms): Json<TradeTerms>,
+    Json(request): Json<CreateOrderRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let order_id = Uuid::new_v4();
+    let terms = request.terms;
     crate::service_log!(
         "orderbook",
         "create request order={} token_in={} token_out={} amount_in={} amount_out={}",
@@ -75,7 +84,11 @@ async fn create_order(
         terms.amount_out
     );
     orderbook
-        .execute(Command::CreateOrder { order_id, terms })
+        .execute(Command::CreateOrder {
+            order_id,
+            order_commitment: request.order_commitment,
+            terms,
+        })
         .await
         .map_err(status_for_error)?;
 
@@ -227,6 +240,7 @@ async fn forward_events(
 
 fn status_for_error(error: ServiceError) -> StatusCode {
     match error {
+        ServiceError::Repository(RepositoryError::DuplicateOrderCommitment) => StatusCode::CONFLICT,
         ServiceError::Closed | ServiceError::Repository(_) => StatusCode::SERVICE_UNAVAILABLE,
         ServiceError::Order(OrderError::InvalidTerms | OrderError::InvalidPayload) => {
             StatusCode::UNPROCESSABLE_ENTITY
