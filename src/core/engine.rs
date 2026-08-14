@@ -315,6 +315,16 @@ enum Request {
         order_id: OrderId,
         reply: oneshot::Sender<Result<Option<Order>, RepositoryError>>,
     },
+    GetOrderByCommitment {
+        order_id: OrderId,
+        order_commitment: OrderCommitment,
+        reply: oneshot::Sender<Result<Option<Order>, RepositoryError>>,
+    },
+    ExecuteAuthorized {
+        command: Command,
+        order_commitment: OrderCommitment,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
     ReservingOrders {
         reply: oneshot::Sender<Vec<Order>>,
     },
@@ -362,6 +372,49 @@ impl OrderbookHandle {
             .await
             .map_err(|_| ServiceError::Closed)?
             .map_err(ServiceError::Repository)
+    }
+
+    pub async fn get_order_by_commitment(
+        &self,
+        order_id: OrderId,
+        order_commitment: OrderCommitment,
+    ) -> Result<Option<Order>, ServiceError> {
+        let (reply, result) = oneshot::channel();
+        self.requests
+            .send(Request::GetOrderByCommitment {
+                order_id,
+                order_commitment,
+                reply,
+            })
+            .await
+            .map_err(|_| ServiceError::Closed)?;
+
+        result
+            .await
+            .map_err(|_| ServiceError::Closed)?
+            .map_err(ServiceError::Repository)
+    }
+
+    pub async fn relay_encrypted_proof(
+        &self,
+        order_id: OrderId,
+        order_commitment: OrderCommitment,
+        ciphertext: Vec<u8>,
+    ) -> Result<(), ServiceError> {
+        let (reply, result) = oneshot::channel();
+        self.requests
+            .send(Request::ExecuteAuthorized {
+                command: Command::RelayEncryptedProof {
+                    order_id,
+                    ciphertext,
+                },
+                order_commitment,
+                reply,
+            })
+            .await
+            .map_err(|_| ServiceError::Closed)?;
+
+        result.await.map_err(|_| ServiceError::Closed)?
     }
 
     pub async fn reserving_orders(&self) -> Result<Vec<Order>, ServiceError> {
@@ -462,6 +515,35 @@ pub async fn start_orderbook_with_repository(
                             .get_order(order_id)
                             .await
                             .map(|stored| stored.map(|stored| stored.order)),
+                    };
+                    let _ = reply.send(result);
+                }
+                Request::GetOrderByCommitment {
+                    order_id,
+                    order_commitment,
+                    reply,
+                } => {
+                    let result = repository
+                        .get_order_by_commitment(order_id, order_commitment)
+                        .await
+                        .map(|stored| stored.map(|stored| stored.order));
+                    let _ = reply.send(result);
+                }
+                Request::ExecuteAuthorized {
+                    command,
+                    order_commitment,
+                    reply,
+                } => {
+                    let order_id = command.order_id();
+                    let result = match repository
+                        .get_order_by_commitment(order_id, order_commitment)
+                        .await
+                    {
+                        Ok(Some(_)) => {
+                            execute_command(&mut orderbook, &repository, &events, command).await
+                        }
+                        Ok(None) => Err(ServiceError::Order(OrderError::NotFound)),
+                        Err(error) => Err(ServiceError::Repository(error)),
                     };
                     let _ = reply.send(result);
                 }

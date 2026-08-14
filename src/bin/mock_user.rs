@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
 use futures_util::StreamExt;
-use kage_orderbook::api::{CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest};
+use kage_orderbook::api::{
+    CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest, ORDER_COMMITMENT_HEADER,
+};
 use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
 use kage_orderbook::order::{Order, OrderId, OrderState, TradeTerms};
@@ -140,7 +142,7 @@ async fn main() -> Result<(), BoxError> {
     });
 
     let mut generator = Generator(config.seed);
-    let mut order_ids = HashSet::new();
+    let mut orders = HashMap::new();
 
     for index in 0..config.orders {
         let terms = generator.terms();
@@ -166,7 +168,7 @@ async fn main() -> Result<(), BoxError> {
             terms.amount_in,
             terms.amount_out
         );
-        order_ids.insert(response.order_id);
+        orders.insert(response.order_id, request.order_commitment);
 
         if index + 1 < config.orders {
             tokio::time::sleep(config.interval).await;
@@ -177,14 +179,15 @@ async fn main() -> Result<(), BoxError> {
         &client,
         &config.http_url,
         &mut event_rx,
-        &order_ids,
+        &orders,
         config.timeout,
     )
     .await?;
 
-    for order_id in &order_ids {
+    for (order_id, order_commitment) in &orders {
         let order = client
             .get(format!("{}/orders/{order_id}", config.http_url))
+            .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
             .send()
             .await?
             .error_for_status()?
@@ -212,7 +215,7 @@ async fn main() -> Result<(), BoxError> {
     kage_orderbook::service_log!(
         "user",
         "{}/{} orders reached Filled",
-        order_ids.len(),
+        orders.len(),
         config.orders
     );
 
@@ -224,7 +227,7 @@ async fn wait_for_filled(
     client: &reqwest::Client,
     http_url: &str,
     events: &mut mpsc::UnboundedReceiver<OrderEvent>,
-    order_ids: &HashSet<OrderId>,
+    orders: &HashMap<OrderId, B256>,
     timeout: Duration,
 ) -> Result<HashMap<OrderId, Vec<String>>, BoxError> {
     tokio::time::timeout(timeout, async {
@@ -232,15 +235,15 @@ async fn wait_for_filled(
         let mut proofs_sent = HashSet::new();
         let mut trails: HashMap<OrderId, Vec<String>> = HashMap::new();
 
-        while filled.len() < order_ids.len() {
+        while filled.len() < orders.len() {
             let event = events
                 .recv()
                 .await
                 .ok_or_else(|| invalid("event stream closed"))?;
             let order_id = event.order_id();
-            if !order_ids.contains(&order_id) {
+            let Some(order_commitment) = orders.get(&order_id) else {
                 continue;
-            }
+            };
 
             let label = match event {
                 OrderEvent::OrderCreated { .. } => "Created",
@@ -264,6 +267,7 @@ async fn wait_for_filled(
                         let ciphertext_bytes = ciphertext.len();
                         client
                             .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
+                            .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
                             .json(&EncryptedProofRequest { ciphertext })
                             .send()
                             .await

@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use alloy_primitives::B256;
 use futures_util::future::join_all;
 use kage_orderbook::api::{
-    EncryptedProofRequest, ExecutionStartedRequest, ReserveOrderRequest, SettlementRequest,
+    EncryptedProofRequest, ExecutionStartedRequest, ORDER_COMMITMENT_HEADER, ReserveOrderRequest,
+    SettlementRequest,
 };
 use kage_orderbook::core::engine::SolverProofDelivery;
 use kage_orderbook::logging::short_id;
@@ -11,7 +13,7 @@ use kage_orderbook::order::{Order, OrderId, OrderState, SolverId};
 use reqwest::{Client, Response, StatusCode};
 use uuid::Uuid;
 
-use super::{create_order, server};
+use super::{create_order_with_commitment, server};
 
 const ORDERS: u64 = 4;
 
@@ -29,12 +31,17 @@ async fn run() {
     let wrong_solver_id = Uuid::from_bytes([0x22; 16]);
     let noise_key = solver_id.as_bytes().to_vec();
 
-    let orders = join_all((1..=ORDERS).map(|number| {
+    let created = join_all((1..=ORDERS).map(|number| {
         let client = client.clone();
         let http_url = http_url.clone();
-        async move { create_order(&client, &http_url, number).await }
+        async move { create_order_with_commitment(&client, &http_url, number).await }
     }))
     .await;
+    let commitments = created.iter().copied().collect::<HashMap<_, _>>();
+    let orders = created
+        .into_iter()
+        .map(|(order_id, _)| order_id)
+        .collect::<Vec<_>>();
     harness_log(
         "user",
         format!("created {} concurrent orders", orders.len()),
@@ -44,6 +51,7 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/encrypted-proof"))
+            .header(ORDER_COMMITMENT_HEADER, commitments[&first].to_string())
             .json(&EncryptedProofRequest {
                 ciphertext: vec![1],
             })
@@ -129,11 +137,13 @@ async fn run() {
         let http_url = http_url.clone();
         let noise_key = noise_key.clone();
         let order_id = *order_id;
+        let order_commitment = commitments[&order_id];
         async move {
             tokio::time::sleep(delay(index, 15)).await;
             let ciphertext = xor(format!("proof:{order_id}").as_bytes(), &noise_key);
             let response = client
                 .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
+                .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
                 .json(&EncryptedProofRequest { ciphertext })
                 .send()
                 .await
@@ -152,6 +162,7 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/encrypted-proof"))
+            .header(ORDER_COMMITMENT_HEADER, commitments[&first].to_string())
             .json(&EncryptedProofRequest {
                 ciphertext: first_ciphertext,
             })
@@ -165,6 +176,7 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/encrypted-proof"))
+            .header(ORDER_COMMITMENT_HEADER, commitments[&first].to_string())
             .json(&EncryptedProofRequest {
                 ciphertext: vec![1],
             })
@@ -301,7 +313,7 @@ async fn run() {
     );
 
     for order_id in orders {
-        let order = get_order(&client, &http_url, order_id).await;
+        let order = get_order(&client, &http_url, order_id, commitments[&order_id]).await;
         assert_eq!(order.state, OrderState::Filled);
         assert_eq!(order.version, 8);
         harness_log(
@@ -326,8 +338,23 @@ async fn solver_proofs(
     get_json(client, format!("{http_url}/solver/{solver_id}/proofs")).await
 }
 
-async fn get_order(client: &Client, http_url: &str, order_id: OrderId) -> Order {
-    get_json(client, format!("{http_url}/orders/{order_id}")).await
+async fn get_order(
+    client: &Client,
+    http_url: &str,
+    order_id: OrderId,
+    order_commitment: B256,
+) -> Order {
+    client
+        .get(format!("{http_url}/orders/{order_id}"))
+        .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 async fn get_json<T: serde::de::DeserializeOwned>(client: &Client, url: String) -> T {

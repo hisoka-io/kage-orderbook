@@ -1,11 +1,19 @@
+use std::collections::HashMap;
+
 use futures_util::StreamExt;
-use kage_orderbook::api::EncryptedProofRequest;
+use kage_orderbook::api::{EncryptedProofRequest, ORDER_COMMITMENT_HEADER};
 use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
+use kage_orderbook::order::{OrderCommitment, OrderId};
 use tokio::sync::oneshot;
 use tokio_tungstenite::connect_async;
 
-pub async fn run(http_url: String, ws_url: String, ready: oneshot::Sender<()>) {
+pub async fn run(
+    http_url: String,
+    ws_url: String,
+    commitments: HashMap<OrderId, OrderCommitment>,
+    ready: oneshot::Sender<()>,
+) {
     let client = reqwest::Client::new();
     let (mut socket, _) = connect_async(&ws_url).await.unwrap();
     let _ = ready.send(());
@@ -23,11 +31,15 @@ pub async fn run(http_url: String, ws_url: String, ready: oneshot::Sender<()>) {
             ..
         } = event
         {
+            let Some(order_commitment) = commitments.get(&order_id) else {
+                continue;
+            };
             let proof = format!("proof:{order_id}").into_bytes();
             let ciphertext = xor(&proof, &noise_public_key);
 
             client
                 .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
+                .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
                 .json(&EncryptedProofRequest { ciphertext })
                 .send()
                 .await

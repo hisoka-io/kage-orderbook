@@ -1,6 +1,6 @@
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -12,6 +12,8 @@ use crate::core::engine::{OrderError, OrderbookHandle, ServiceError, SolverProof
 use crate::logging::short_id;
 use crate::order::{Order, OrderCommitment, OrderId, SolverId, TradeTerms, TxHash};
 use crate::storage::RepositoryError;
+
+pub const ORDER_COMMITMENT_HEADER: &str = "x-order-commitment";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateOrderRequest {
@@ -99,9 +101,11 @@ async fn create_order(
 async fn get_order(
     State(orderbook): State<OrderbookHandle>,
     Path(order_id): Path<OrderId>,
+    headers: HeaderMap,
 ) -> Result<Json<Order>, StatusCode> {
+    let order_commitment = commitment_from_headers(&headers)?;
     orderbook
-        .get_order(order_id)
+        .get_order_by_commitment(order_id, order_commitment)
         .await
         .map_err(status_for_error)?
         .map(Json)
@@ -158,16 +162,15 @@ async fn reserve_order(
 async fn relay_encrypted_proof(
     State(orderbook): State<OrderbookHandle>,
     Path(order_id): Path<OrderId>,
+    headers: HeaderMap,
     Json(request): Json<EncryptedProofRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    execute(
-        &orderbook,
-        Command::RelayEncryptedProof {
-            order_id,
-            ciphertext: request.ciphertext,
-        },
-    )
-    .await
+    let order_commitment = commitment_from_headers(&headers)?;
+    orderbook
+        .relay_encrypted_proof(order_id, order_commitment, request.ciphertext)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(status_for_error)
 }
 
 async fn execution_started(
@@ -236,6 +239,14 @@ async fn forward_events(
             return;
         }
     }
+}
+
+fn commitment_from_headers(headers: &HeaderMap) -> Result<OrderCommitment, StatusCode> {
+    headers
+        .get(ORDER_COMMITMENT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 fn status_for_error(error: ServiceError) -> StatusCode {
