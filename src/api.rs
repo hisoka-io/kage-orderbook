@@ -13,9 +13,9 @@ use uuid::Uuid;
 use crate::core::command::Command;
 use crate::core::engine::{OrderError, OrderbookHandle, ServiceError, SolverProofDelivery};
 use crate::core::events::OrderEvent;
-use crate::core::guards::{OrderPolicy, resolve_expiry_ms, validate_market};
+use crate::core::guards::{CreateOrderInput, OrderPolicy, validate_create_order};
 use crate::logging::short_id;
-use crate::order::{Order, OrderCommitment, OrderId, SolverId, TokenAddress, TradeTerms, TxHash};
+use crate::order::{Order, OrderCommitment, OrderId, SolverId, TokenAddress, TxHash};
 use crate::registry::SolverRegistry;
 use crate::storage::RepositoryError;
 
@@ -29,7 +29,7 @@ struct ApiState {
     order_policy: OrderPolicy,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateOrderRequest {
     pub order_commitment: OrderCommitment,
     pub chain_id: u64,
@@ -38,6 +38,20 @@ pub struct CreateOrderRequest {
     pub amount_in: U256,
     pub amount_out: U256,
     pub ttl_seconds: Option<u32>,
+}
+
+impl From<CreateOrderRequest> for CreateOrderInput {
+    fn from(request: CreateOrderRequest) -> Self {
+        Self {
+            order_commitment: request.order_commitment,
+            chain_id: request.chain_id,
+            token_in: request.token_in,
+            token_out: request.token_out,
+            amount_in: request.amount_in,
+            amount_out: request.amount_out,
+            ttl_seconds: request.ttl_seconds,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,29 +133,13 @@ async fn create_order(
 ) -> Result<impl IntoResponse, StatusCode> {
     let order_id = Uuid::new_v4();
 
-    validate_market(
-        request.chain_id,
-        request.token_in,
-        request.token_out,
-        &state.order_policy,
-    )
-    .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
-
-    let expires_at_ms = resolve_expiry_ms(
-        request.ttl_seconds,
+    let validated = validate_create_order(
+        request.into(),
         chrono::Utc::now().timestamp_millis(),
         &state.order_policy,
     )
     .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
-
-    let terms = TradeTerms {
-        chain_id: request.chain_id,
-        token_in: request.token_in,
-        token_out: request.token_out,
-        amount_in: request.amount_in,
-        amount_out: request.amount_out,
-        expires_at_ms,
-    };
+    let terms = validated.terms;
 
     crate::service_log!(
         "orderbook",
@@ -155,21 +153,31 @@ async fn create_order(
         terms.expires_at_ms
     );
 
-    state
+    let outcome = state
         .orderbook
-        .execute(Command::CreateOrder {
-            order_id,
-            order_commitment: request.order_commitment,
-            terms,
-        })
+        .create_order(order_id, validated.order_commitment, terms)
         .await
         .map_err(status_for_error)?;
+    let expires_at_ms = outcome
+        .order
+        .expires_at_ms
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let status = if outcome.created {
+        crate::service_log!("orderbook", "create accepted order={}", short_id(order_id));
+        StatusCode::CREATED
+    } else {
+        crate::service_log!(
+            "orderbook",
+            "create replayed order={}",
+            short_id(outcome.order.id)
+        );
+        StatusCode::OK
+    };
 
-    crate::service_log!("orderbook", "create accepted order={}", short_id(order_id));
     Ok((
-        StatusCode::CREATED,
+        status,
         Json(CreateOrderResponse {
-            order_id,
+            order_id: outcome.order.id,
             expires_at_ms,
         }),
     ))

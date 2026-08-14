@@ -229,6 +229,20 @@ impl OrderRepository {
         row.map(decode_order).transpose()
     }
 
+    pub async fn find_order_by_commitment(
+        &self,
+        order_commitment: OrderCommitment,
+    ) -> Result<Option<PersistedOrder>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT * FROM orders
+             WHERE order_commitment = ?",
+        )
+        .bind(order_commitment.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(decode_order).transpose()
+    }
+
     pub async fn get_order_by_commitment(
         &self,
         order_id: OrderId,

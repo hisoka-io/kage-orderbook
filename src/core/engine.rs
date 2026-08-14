@@ -7,13 +7,19 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use super::command::Command;
 use super::events::OrderEvent;
 use crate::logging::short_id;
-use crate::order::{Order, OrderCommitment, OrderId, OrderState, SolverId};
+use crate::order::{Order, OrderCommitment, OrderId, OrderState, SolverId, TradeTerms};
 use crate::storage::{OrderRepository, RepositoryError};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SolverProofDelivery {
     pub order_id: OrderId,
     pub ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateOrderOutcome {
+    pub order: Order,
+    pub created: bool,
 }
 
 pub struct SolverDelivery {
@@ -308,6 +314,12 @@ struct PreparedTransition {
 }
 
 enum Request {
+    CreateOrder {
+        order_id: OrderId,
+        order_commitment: OrderCommitment,
+        terms: TradeTerms,
+        reply: oneshot::Sender<Result<CreateOrderOutcome, ServiceError>>,
+    },
     Execute {
         command: Command,
         reply: oneshot::Sender<Result<(), ServiceError>>,
@@ -352,6 +364,26 @@ pub enum ServiceError {
 }
 
 impl OrderbookHandle {
+    pub async fn create_order(
+        &self,
+        order_id: OrderId,
+        order_commitment: OrderCommitment,
+        terms: TradeTerms,
+    ) -> Result<CreateOrderOutcome, ServiceError> {
+        let (reply, result) = oneshot::channel();
+        self.requests
+            .send(Request::CreateOrder {
+                order_id,
+                order_commitment,
+                terms,
+                reply,
+            })
+            .await
+            .map_err(|_| ServiceError::Closed)?;
+
+        result.await.map_err(|_| ServiceError::Closed)?
+    }
+
     pub async fn execute(&self, command: Command) -> Result<(), ServiceError> {
         let (reply, result) = oneshot::channel();
         self.requests
@@ -504,6 +536,23 @@ pub async fn start_orderbook_with_repository(
 
             expire_due_orders(&mut orderbook, &repository, &events).await;
             match request {
+                Request::CreateOrder {
+                    order_id,
+                    order_commitment,
+                    terms,
+                    reply,
+                } => {
+                    let result = create_order_idempotently(
+                        &mut orderbook,
+                        &repository,
+                        &events,
+                        order_id,
+                        order_commitment,
+                        terms,
+                    )
+                    .await;
+                    let _ = reply.send(result);
+                }
                 Request::Execute { command, reply } => {
                     let result =
                         execute_command(&mut orderbook, &repository, &events, command).await;
@@ -589,6 +638,71 @@ pub async fn start_orderbook_with_repository(
         requests: request_tx,
         events: event_tx,
     })
+}
+
+async fn create_order_idempotently(
+    orderbook: &mut Orderbook,
+    repository: &OrderRepository,
+    events: &broadcast::Sender<OrderEvent>,
+    order_id: OrderId,
+    order_commitment: OrderCommitment,
+    terms: TradeTerms,
+) -> Result<CreateOrderOutcome, ServiceError> {
+    if let Some(existing) = repository
+        .find_order_by_commitment(order_commitment)
+        .await
+        .map_err(ServiceError::Repository)?
+    {
+        if !same_create_terms(&existing.order, &terms) {
+            crate::service_error!(
+                "orderbook",
+                "rejected command=CreateOrder order={} existing_order={} error=ConflictingCommitment",
+                short_id(order_id),
+                short_id(existing.order.id)
+            );
+            return Err(ServiceError::Order(OrderError::AlreadyExists));
+        }
+
+        crate::service_log!(
+            "orderbook",
+            "idempotent command=CreateOrder order={}",
+            short_id(existing.order.id)
+        );
+        return Ok(CreateOrderOutcome {
+            order: existing.order,
+            created: false,
+        });
+    }
+
+    execute_command(
+        orderbook,
+        repository,
+        events,
+        Command::CreateOrder {
+            order_id,
+            order_commitment,
+            terms,
+        },
+    )
+    .await?;
+
+    let order = orderbook
+        .orders
+        .get(&order_id)
+        .cloned()
+        .ok_or(ServiceError::Order(OrderError::NotFound))?;
+    Ok(CreateOrderOutcome {
+        order,
+        created: true,
+    })
+}
+
+fn same_create_terms(order: &Order, terms: &TradeTerms) -> bool {
+    order.chain_id == terms.chain_id
+        && order.token_in == terms.token_in
+        && order.token_out == terms.token_out
+        && order.amount_in == terms.amount_in
+        && order.amount_out == terms.amount_out
 }
 
 async fn execute_command(

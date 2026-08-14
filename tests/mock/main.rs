@@ -29,7 +29,11 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 const USERS: u64 = 5;
 
 async fn server() -> (String, String, JoinHandle<()>) {
-    let orderbook = start_orderbook("sqlite::memory:").await.unwrap();
+    server_with_database("sqlite::memory:").await
+}
+
+async fn server_with_database(database_url: &str) -> (String, String, JoinHandle<()>) {
+    let orderbook = start_orderbook(database_url).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
@@ -103,28 +107,215 @@ async fn subscribe_user_events(
 }
 
 #[tokio::test]
-async fn rejects_a_duplicate_order_commitment() {
+async fn retries_return_the_existing_order() {
     let (http_url, _, server) = server().await;
     let client = reqwest::Client::new();
     let request = create_order_request(1, None);
 
-    let first = client
+    let first_response = client
         .post(format!("{http_url}/orders"))
         .json(&request)
         .send()
         .await
         .unwrap();
-    assert_eq!(first.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(first_response.status(), reqwest::StatusCode::CREATED);
+    let first = first_response.json::<CreateOrderResponse>().await.unwrap();
 
-    let second = client
+    let retry_response = client
         .post(format!("{http_url}/orders"))
         .json(&request)
         .send()
         .await
         .unwrap();
-    assert_eq!(second.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(retry_response.status(), reqwest::StatusCode::OK);
+    let retry = retry_response.json::<CreateOrderResponse>().await.unwrap();
+
+    assert_eq!(retry.order_id, first.order_id);
+    assert_eq!(retry.expires_at_ms, first.expires_at_ms);
+
+    let jobs = client
+        .get(format!("{http_url}/solver/jobs"))
+        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Vec<Order>>()
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
 
     server.abort();
+}
+
+#[tokio::test]
+async fn retry_with_a_different_ttl_keeps_the_original_expiry() {
+    let (http_url, _, server) = server().await;
+    let client = reqwest::Client::new();
+    let request = create_order_request(1, Some(30));
+
+    let first_response = client
+        .post(format!("{http_url}/orders"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), reqwest::StatusCode::CREATED);
+    let first = first_response.json::<CreateOrderResponse>().await.unwrap();
+
+    let mut retry_request = request.clone();
+    retry_request.ttl_seconds = Some(120);
+    let retry_response = client
+        .post(format!("{http_url}/orders"))
+        .json(&retry_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retry_response.status(), reqwest::StatusCode::OK);
+    let retry = retry_response.json::<CreateOrderResponse>().await.unwrap();
+
+    assert_eq!(retry.order_id, first.order_id);
+    assert_eq!(retry.expires_at_ms, first.expires_at_ms);
+
+    let stored = client
+        .get(format!("{http_url}/orders/{}", first.order_id))
+        .header(
+            ORDER_COMMITMENT_HEADER,
+            request.order_commitment.to_string(),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Order>()
+        .await
+        .unwrap();
+    assert_eq!(stored.expires_at_ms, Some(first.expires_at_ms));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn rejects_a_commitment_reused_for_different_terms() {
+    let (http_url, _, server) = server().await;
+    let client = reqwest::Client::new();
+    let request = create_order_request(1, None);
+    client
+        .post(format!("{http_url}/orders"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let mut conflicting = request;
+    conflicting.amount_out = alloy_primitives::U256::from(999);
+    let response = client
+        .post(format!("{http_url}/orders"))
+        .json(&conflicting)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn concurrent_retries_create_only_one_order() {
+    let (http_url, _, server) = server().await;
+    let client = reqwest::Client::new();
+    let request = create_order_request(1, None);
+    let responses = futures_util::future::join_all((0..8).map(|_| {
+        let client = client.clone();
+        let url = format!("{http_url}/orders");
+        let request = request.clone();
+        async move { client.post(url).json(&request).send().await.unwrap() }
+    }))
+    .await;
+
+    let mut created = 0;
+    let mut order_id = None;
+    for response in responses {
+        match response.status() {
+            reqwest::StatusCode::CREATED => created += 1,
+            reqwest::StatusCode::OK => {}
+            status => panic!("unexpected retry status: {status}"),
+        }
+        let body = response.json::<CreateOrderResponse>().await.unwrap();
+        assert!(order_id.is_none_or(|id| id == body.order_id));
+        order_id = Some(body.order_id);
+    }
+    assert_eq!(created, 1);
+
+    let jobs = client
+        .get(format!("{http_url}/solver/jobs"))
+        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Vec<Order>>()
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn retry_after_restart_returns_the_original_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        directory.path().join("orderbook.db").display()
+    );
+    let client = reqwest::Client::new();
+    let request = create_order_request(1, None);
+
+    let (http_url, _, first_server) = server_with_database(&database_url).await;
+    let first_response = client
+        .post(format!("{http_url}/orders"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), reqwest::StatusCode::CREATED);
+    let first = first_response.json::<CreateOrderResponse>().await.unwrap();
+    first_server.abort();
+    let _ = first_server.await;
+    tokio::task::yield_now().await;
+
+    let (http_url, _, restarted_server) = server_with_database(&database_url).await;
+    let retry_response = client
+        .post(format!("{http_url}/orders"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retry_response.status(), reqwest::StatusCode::OK);
+    let retry = retry_response.json::<CreateOrderResponse>().await.unwrap();
+    assert_eq!(retry.order_id, first.order_id);
+    assert_eq!(retry.expires_at_ms, first.expires_at_ms);
+
+    let jobs = client
+        .get(format!("{http_url}/solver/jobs"))
+        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Vec<Order>>()
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+
+    restarted_server.abort();
 }
 
 #[tokio::test]
