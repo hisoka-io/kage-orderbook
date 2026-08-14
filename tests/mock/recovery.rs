@@ -1,6 +1,7 @@
 use alloy_primitives::B256;
 use kage_orderbook::core::command::Command;
 use kage_orderbook::core::engine::start_orderbook;
+use kage_orderbook::core::guards::MOCK_CHAIN_ID;
 use kage_orderbook::order::OrderState;
 use uuid::Uuid;
 
@@ -52,6 +53,7 @@ async fn proof_relayed_order_survives_restart_and_reaches_filled() {
 
     let restarted = start_orderbook(&database_url).await.unwrap();
     let restored = restarted.get_order(order_id).await.unwrap().unwrap();
+    assert_eq!(restored.chain_id, MOCK_CHAIN_ID);
     assert_eq!(restored.state, OrderState::ProofRelayed);
     assert_eq!(restored.version, 6);
 

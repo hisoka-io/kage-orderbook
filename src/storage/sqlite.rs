@@ -78,13 +78,14 @@ impl OrderRepository {
     ) -> Result<(), RepositoryError> {
         let result = sqlx::query(
             "INSERT INTO orders (
-                id, state, version, token_in, token_out, amount_in, amount_out,
+                id, chain_id, state, version, token_in, token_out, amount_in, amount_out,
                 solver_id, solver_noise_public_key, tx_hash,
                 created_at_ms, updated_at_ms, expires_at_ms, order_commitment,
                 solver_address
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(order.id.to_string())
+        .bind(u64_to_i64("chain_id", order.chain_id)?)
         .bind(state_name(order.state))
         .bind(version_to_i64(order.version)?)
         .bind(order.token_in.as_slice())
@@ -341,6 +342,7 @@ impl OrderRepository {
 
 fn decode_order(row: SqliteRow) -> Result<PersistedOrder, RepositoryError> {
     let id = parse_uuid("id", row.try_get::<String, _>("id")?)?;
+    let chain_id = i64_to_u64("chain_id", row.try_get("chain_id")?)?;
     let state_value = row.try_get::<String, _>("state")?;
     let state = parse_state(&state_value)?;
     let version = i64_to_u64("version", row.try_get("version")?)?;
@@ -366,6 +368,7 @@ fn decode_order(row: SqliteRow) -> Result<PersistedOrder, RepositoryError> {
     Ok(PersistedOrder {
         order: Order {
             id,
+            chain_id,
             state,
             version,
             token_in: Address::from(token_in),
@@ -448,7 +451,11 @@ fn parse_fixed<const N: usize>(
 }
 
 fn version_to_i64(version: u64) -> Result<i64, RepositoryError> {
-    i64::try_from(version).map_err(|_| invalid("version", version.to_string()))
+    u64_to_i64("version", version)
+}
+
+fn u64_to_i64(field: &'static str, value: u64) -> Result<i64, RepositoryError> {
+    i64::try_from(value).map_err(|_| invalid(field, value.to_string()))
 }
 
 fn i64_to_u64(field: &'static str, value: i64) -> Result<u64, RepositoryError> {
@@ -472,6 +479,7 @@ mod tests {
     fn order(state: OrderState, version: u64) -> Order {
         Order {
             id: Uuid::new_v4(),
+            chain_id: 31_337,
             state,
             version,
             token_in: Address::repeat_byte(1),
@@ -501,6 +509,7 @@ mod tests {
 
         let stored = repository.get_order(order.id).await.unwrap().unwrap();
         assert_eq!(stored.order.id, order.id);
+        assert_eq!(stored.order.chain_id, order.chain_id);
         assert_eq!(stored.order.state, OrderState::Executing);
         assert_eq!(stored.order.version, 7);
         assert_eq!(stored.order.amount_in, order.amount_in);

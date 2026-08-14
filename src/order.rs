@@ -15,6 +15,7 @@ pub struct Order {
     pub id: OrderId,
     pub state: OrderState,
     pub version: u64,
+    pub chain_id: u64,
 
     pub token_in: TokenAddress,
     pub token_out: TokenAddress,
@@ -45,6 +46,7 @@ pub enum OrderState {
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TradeTerms {
+    pub chain_id: u64,
     pub token_in: TokenAddress,
     pub token_out: TokenAddress,
     pub amount_in: U256,
@@ -67,6 +69,7 @@ impl Order {
             id,
             state: OrderState::Created,
             version: 0,
+            chain_id: terms.chain_id,
             token_in: terms.token_in,
             token_out: terms.token_out,
             amount_in: terms.amount_in,

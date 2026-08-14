@@ -1,4 +1,5 @@
 use alloy_primitives::{Address, B256, U256};
+use kage_orderbook::core::guards::MOCK_CHAIN_ID;
 use kage_orderbook::order::TradeTerms;
 use kage_orderbook::registry::{SolverProfile, SolverRegistry};
 
@@ -37,8 +38,9 @@ pub fn commitment(n: u64) -> B256 {
 
 pub fn terms(n: u64) -> TradeTerms {
     TradeTerms {
-        token_in: Address::ZERO,
-        token_out: Address::repeat_byte(1),
+        chain_id: MOCK_CHAIN_ID,
+        token_in: Address::repeat_byte(1),
+        token_out: Address::repeat_byte(2),
         amount_in: U256::from(n),
         amount_out: U256::from(n * 2),
         expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,

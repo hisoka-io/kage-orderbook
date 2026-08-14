@@ -17,7 +17,7 @@ use kage_orderbook::api::{
 use kage_orderbook::core::engine::start_orderbook;
 use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::core::guards::{
-    DEFAULT_ORDER_TTL_SECONDS, MAX_ORDER_TTL_SECONDS, MIN_ORDER_TTL_SECONDS,
+    DEFAULT_ORDER_TTL_SECONDS, MAX_ORDER_TTL_SECONDS, MIN_ORDER_TTL_SECONDS, MOCK_CHAIN_ID,
 };
 use kage_orderbook::order::{Order, OrderCommitment, OrderId, OrderState};
 use support::{commitment, noise_key, registry, solver_address, terms};
@@ -49,6 +49,7 @@ fn create_order_request(n: u64, ttl_seconds: Option<u32>) -> CreateOrderRequest 
     let terms = terms(n);
     CreateOrderRequest {
         order_commitment: commitment(n),
+        chain_id: terms.chain_id,
         token_in: terms.token_in,
         token_out: terms.token_out,
         amount_in: terms.amount_in,
@@ -161,6 +162,35 @@ async fn applies_default_ttl_and_rejects_out_of_range_ttl() {
         assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn rejects_unsupported_chains_and_token_markets() {
+    let (http_url, _, server) = server().await;
+    let client = reqwest::Client::new();
+
+    let mut unsupported_chain = create_order_request(1, None);
+    unsupported_chain.chain_id = 1;
+    let response = client
+        .post(format!("{http_url}/orders"))
+        .json(&unsupported_chain)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+    let mut unsupported_market = create_order_request(2, None);
+    unsupported_market.token_out = alloy_primitives::Address::repeat_byte(3);
+    let response = client
+        .post(format!("{http_url}/orders"))
+        .json(&unsupported_market)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+    assert_eq!(create_order_request(3, None).chain_id, MOCK_CHAIN_ID);
     server.abort();
 }
 

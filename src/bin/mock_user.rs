@@ -10,6 +10,7 @@ use kage_orderbook::api::{
     UserEventClientMessage, UserEventServerMessage,
 };
 use kage_orderbook::core::events::OrderEvent;
+use kage_orderbook::core::guards::MOCK_CHAIN_ID;
 use kage_orderbook::logging::short_id;
 use kage_orderbook::order::{Order, OrderId, OrderState, TradeTerms};
 use tokio::sync::mpsc;
@@ -99,6 +100,7 @@ impl Generator {
     fn terms(&mut self) -> TradeTerms {
         let amount_in = self.next() % 1_000 + 1;
         TradeTerms {
+            chain_id: MOCK_CHAIN_ID,
             token_in: Address::repeat_byte(1),
             token_out: Address::repeat_byte(2),
             amount_in: U256::from(amount_in),
@@ -166,6 +168,7 @@ async fn main() -> Result<(), BoxError> {
         let terms = generator.terms();
         let request = CreateOrderRequest {
             order_commitment: new_order_commitment(),
+            chain_id: terms.chain_id,
             token_in: terms.token_in,
             token_out: terms.token_out,
             amount_in: terms.amount_in,

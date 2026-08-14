@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::core::command::Command;
 use crate::core::engine::{OrderError, OrderbookHandle, ServiceError, SolverProofDelivery};
 use crate::core::events::OrderEvent;
-use crate::core::guards::{OrderPolicy, resolve_expiry_ms};
+use crate::core::guards::{OrderPolicy, resolve_expiry_ms, validate_market};
 use crate::logging::short_id;
 use crate::order::{Order, OrderCommitment, OrderId, SolverId, TokenAddress, TradeTerms, TxHash};
 use crate::registry::SolverRegistry;
@@ -32,6 +32,7 @@ struct ApiState {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateOrderRequest {
     pub order_commitment: OrderCommitment,
+    pub chain_id: u64,
     pub token_in: TokenAddress,
     pub token_out: TokenAddress,
     pub amount_in: U256,
@@ -117,29 +118,43 @@ async fn create_order(
     Json(request): Json<CreateOrderRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let order_id = Uuid::new_v4();
+
+    validate_market(
+        request.chain_id,
+        request.token_in,
+        request.token_out,
+        &state.order_policy,
+    )
+    .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+
     let expires_at_ms = resolve_expiry_ms(
         request.ttl_seconds,
         chrono::Utc::now().timestamp_millis(),
-        state.order_policy,
+        &state.order_policy,
     )
     .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+
     let terms = TradeTerms {
+        chain_id: request.chain_id,
         token_in: request.token_in,
         token_out: request.token_out,
         amount_in: request.amount_in,
         amount_out: request.amount_out,
         expires_at_ms,
     };
+
     crate::service_log!(
         "orderbook",
-        "create request order={} token_in={} token_out={} amount_in={} amount_out={} expires_at_ms={}",
+        "create request order={} chain_id={} token_in={} token_out={} amount_in={} amount_out={} expires_at_ms={}",
         short_id(order_id),
+        terms.chain_id,
         terms.token_in,
         terms.token_out,
         terms.amount_in,
         terms.amount_out,
         terms.expires_at_ms
     );
+
     state
         .orderbook
         .execute(Command::CreateOrder {

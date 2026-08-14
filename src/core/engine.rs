@@ -53,7 +53,8 @@ pub fn handle(order: Option<&Order>, command: Command) -> Result<Transition, Ord
             if order_commitment == B256::ZERO {
                 return Err(OrderError::InvalidPayload);
             }
-            if terms.token_in == terms.token_out
+            if terms.chain_id == 0
+                || terms.token_in == terms.token_out
                 || terms.amount_in == U256::ZERO
                 || terms.amount_out == U256::ZERO
             {
@@ -737,6 +738,7 @@ mod tests {
 
     fn terms() -> TradeTerms {
         TradeTerms {
+            chain_id: 31_337,
             token_in: Address::ZERO,
             token_out: Address::repeat_byte(1),
             amount_in: U256::from(1),
