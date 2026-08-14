@@ -6,7 +6,7 @@ use kage_orderbook::core::engine::{OrderError, ServiceError, start_orderbook};
 use kage_orderbook::order::OrderState;
 use uuid::Uuid;
 
-use super::support::{commitment, terms};
+use super::support::{commitment, solver_address, terms};
 
 #[tokio::test]
 async fn rejects_an_order_that_is_already_expired() {
@@ -35,7 +35,7 @@ async fn rejects_an_order_that_is_already_expired() {
 async fn expires_an_active_order_and_removes_its_proof() {
     let orderbook = start_orderbook("sqlite::memory:").await.unwrap();
     let order_id = Uuid::new_v4();
-    let solver_id = Uuid::new_v4();
+    let solver_id = solver_address(0x11);
     let tx_hash = B256::repeat_byte(9);
     let mut expiring_terms = terms(1);
     expiring_terms.expires_at_ms = now_ms() + 150;

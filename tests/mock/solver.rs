@@ -1,22 +1,33 @@
 use alloy_primitives::B256;
 use futures_util::StreamExt;
-use kage_orderbook::api::{ExecutionStartedRequest, ReserveOrderRequest};
+use kage_orderbook::api::{ExecutionStartedRequest, SOLVER_ADDRESS_HEADER};
 use kage_orderbook::core::engine::SolverProofDelivery;
 use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
 use kage_orderbook::order::{Order, OrderId, SolverId};
 use tokio::sync::oneshot;
 use tokio_tungstenite::connect_async;
-use uuid::Uuid;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 
-pub async fn run(http_url: String, ws_url: String, ready: oneshot::Sender<()>) {
+pub async fn run(
+    http_url: String,
+    ws_url: String,
+    solver_id: SolverId,
+    noise_key: Vec<u8>,
+    ready: oneshot::Sender<()>,
+) {
     let client = reqwest::Client::new();
-    let solver_id = Uuid::new_v4();
-    let noise_key = solver_id.as_bytes().to_vec();
-    let (mut socket, _) = connect_async(&ws_url).await.unwrap();
+    let mut request = ws_url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        SOLVER_ADDRESS_HEADER,
+        HeaderValue::from_str(&solver_id.to_string()).unwrap(),
+    );
+    let (mut socket, _) = connect_async(request).await.unwrap();
 
     let jobs: Vec<Order> = client
         .get(format!("{http_url}/solver/jobs"))
+        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
         .send()
         .await
         .unwrap()
@@ -25,7 +36,7 @@ pub async fn run(http_url: String, ws_url: String, ready: oneshot::Sender<()>) {
         .unwrap();
 
     for order in jobs {
-        reserve(&client, &http_url, order.id, solver_id, &noise_key).await;
+        reserve(&client, &http_url, order.id, solver_id).await;
     }
 
     let _ = ready.send(());
@@ -39,7 +50,7 @@ pub async fn run(http_url: String, ws_url: String, ready: oneshot::Sender<()>) {
         let event: OrderEvent = serde_json::from_str(message.to_text().unwrap()).unwrap();
         match event {
             OrderEvent::SolverReservationRequested { order_id } => {
-                reserve(&client, &http_url, order_id, solver_id, &noise_key).await;
+                reserve(&client, &http_url, order_id, solver_id).await;
             }
             OrderEvent::ProofRelayed {
                 solver_id: assigned_solver,
@@ -52,19 +63,10 @@ pub async fn run(http_url: String, ws_url: String, ready: oneshot::Sender<()>) {
     }
 }
 
-async fn reserve(
-    client: &reqwest::Client,
-    http_url: &str,
-    order_id: OrderId,
-    solver_id: SolverId,
-    noise_key: &[u8],
-) {
+async fn reserve(client: &reqwest::Client, http_url: &str, order_id: OrderId, solver_id: SolverId) {
     let response = client
         .post(format!("{http_url}/orders/{order_id}/reserve"))
-        .json(&ReserveOrderRequest {
-            solver_id,
-            noise_public_key: noise_key.to_vec(),
-        })
+        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
         .send()
         .await
         .unwrap();
@@ -85,7 +87,8 @@ async fn execute_proofs(
     noise_key: &[u8],
 ) {
     let deliveries: Vec<SolverProofDelivery> = client
-        .get(format!("{http_url}/solver/{solver_id}/proofs"))
+        .get(format!("{http_url}/solver/proofs"))
+        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
         .send()
         .await
         .unwrap()
@@ -107,8 +110,8 @@ async fn execute_proofs(
                 "{http_url}/orders/{}/execution-started",
                 delivery.order_id
             ))
+            .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
             .json(&ExecutionStartedRequest {
-                solver_id,
                 tx_hash: tx_hash(delivery.order_id),
             })
             .send()

@@ -758,7 +758,7 @@ mod tests {
         .unwrap();
         assert_eq!(book.orders[&order_id].state, OrderState::Reserving);
 
-        let solver_id = Uuid::new_v4();
+        let solver_id = Address::repeat_byte(3);
         book.process(Command::SolverReserved {
             order_id,
             solver_id,

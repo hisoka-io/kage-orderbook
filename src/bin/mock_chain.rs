@@ -1,15 +1,28 @@
 use std::error::Error;
 use std::time::Duration;
 
+use alloy_primitives::{Address, B256};
+use axum::extract::{Path, State};
+use axum::http::StatusCode as AxumStatusCode;
+use axum::routing::get;
+use axum::{Json, Router};
 use futures_util::StreamExt;
 use kage_orderbook::api::SettlementRequest;
 use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
 use kage_orderbook::order::{Order, OrderId, TxHash};
+use kage_orderbook::registry::SolverProfile;
 use reqwest::StatusCode;
+use tokio::net::TcpListener;
 use tokio_tungstenite::connect_async;
 
 type BoxError = Box<dyn Error + Send + Sync>;
+
+#[derive(Clone)]
+struct MockRegistry {
+    solver_id: Address,
+    profile: SolverProfile,
+}
 
 #[tokio::main]
 async fn main() {
@@ -22,6 +35,30 @@ async fn main() {
         .and_then(|value| value.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_millis(500));
+    let solver_id = std::env::var("SOLVER_ADDRESS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| Address::repeat_byte(0x11));
+    let noise_key = std::env::var("SOLVER_NOISE_KEY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| B256::repeat_byte(0x33));
+    let registry_address =
+        std::env::var("MOCK_REGISTRY_ADDRESS").unwrap_or_else(|_| "127.0.0.1:4000".to_owned());
+    let registry = Router::new()
+        .route("/solvers/{solver_id}", get(solver_profile))
+        .with_state(MockRegistry {
+            solver_id,
+            profile: SolverProfile {
+                noise_key,
+                active: true,
+            },
+        });
+    let listener = TcpListener::bind(&registry_address).await.unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, registry).await.unwrap();
+    });
+    kage_orderbook::service_log!("chain", "registry listening address={registry_address}");
 
     loop {
         if let Err(error) = run(&http_url, &ws_url, delay).await {
@@ -29,6 +66,16 @@ async fn main() {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+async fn solver_profile(
+    State(registry): State<MockRegistry>,
+    Path(solver_id): Path<Address>,
+) -> Result<Json<SolverProfile>, AxumStatusCode> {
+    if solver_id != registry.solver_id {
+        return Err(AxumStatusCode::NOT_FOUND);
+    }
+    Ok(Json(registry.profile))
 }
 
 async fn run(http_url: &str, ws_url: &str, delay: Duration) -> Result<(), BoxError> {

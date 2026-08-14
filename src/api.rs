@@ -14,9 +14,17 @@ use crate::core::engine::{OrderError, OrderbookHandle, ServiceError, SolverProof
 use crate::core::events::OrderEvent;
 use crate::logging::short_id;
 use crate::order::{Order, OrderCommitment, OrderId, SolverId, TradeTerms, TxHash};
+use crate::registry::SolverRegistry;
 use crate::storage::RepositoryError;
 
 pub const ORDER_COMMITMENT_HEADER: &str = "x-order-commitment";
+pub const SOLVER_ADDRESS_HEADER: &str = "x-solver-address";
+
+#[derive(Clone)]
+struct ApiState {
+    orderbook: OrderbookHandle,
+    registry: SolverRegistry,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateOrderRequest {
@@ -31,19 +39,12 @@ pub struct CreateOrderResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ReserveOrderRequest {
-    pub solver_id: SolverId,
-    pub noise_public_key: Vec<u8>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct EncryptedProofRequest {
     pub ciphertext: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecutionStartedRequest {
-    pub solver_id: SolverId,
     pub tx_hash: TxHash,
 }
 
@@ -69,12 +70,12 @@ pub enum UserEventServerMessage {
     Event { event: OrderEvent },
 }
 
-pub fn router(orderbook: OrderbookHandle) -> Router {
+pub fn router(orderbook: OrderbookHandle, registry: SolverRegistry) -> Router {
     Router::new()
         .route("/orders", post(create_order))
         .route("/orders/{order_id}", get(get_order))
         .route("/solver/jobs", get(reserving_orders))
-        .route("/solver/{solver_id}/proofs", get(take_solver_proofs))
+        .route("/solver/proofs", get(take_solver_proofs))
         .route("/chain/jobs", get(executing_orders))
         .route("/orders/{order_id}/reserve", post(reserve_order))
         .route(
@@ -89,11 +90,14 @@ pub fn router(orderbook: OrderbookHandle) -> Router {
         .route("/events/user/ws", get(user_events_ws))
         .route("/events/solver/ws", get(solver_events_ws))
         .route("/events/chain/ws", get(chain_events_ws))
-        .with_state(orderbook)
+        .with_state(ApiState {
+            orderbook,
+            registry,
+        })
 }
 
 async fn create_order(
-    State(orderbook): State<OrderbookHandle>,
+    State(state): State<ApiState>,
     Json(request): Json<CreateOrderRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let order_id = Uuid::new_v4();
@@ -107,7 +111,8 @@ async fn create_order(
         terms.amount_in,
         terms.amount_out
     );
-    orderbook
+    state
+        .orderbook
         .execute(Command::CreateOrder {
             order_id,
             order_commitment: request.order_commitment,
@@ -121,12 +126,13 @@ async fn create_order(
 }
 
 async fn get_order(
-    State(orderbook): State<OrderbookHandle>,
+    State(state): State<ApiState>,
     Path(order_id): Path<OrderId>,
     headers: HeaderMap,
 ) -> Result<Json<Order>, StatusCode> {
     let order_commitment = commitment_from_headers(&headers)?;
-    orderbook
+    state
+        .orderbook
         .get_order_by_commitment(order_id, order_commitment)
         .await
         .map_err(status_for_error)?
@@ -135,19 +141,21 @@ async fn get_order(
 }
 
 async fn reserving_orders(
-    State(orderbook): State<OrderbookHandle>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<Order>>, StatusCode> {
-    orderbook
+    solver_id_from_headers(&headers)?;
+    state
+        .orderbook
         .reserving_orders()
         .await
         .map(Json)
         .map_err(status_for_error)
 }
 
-async fn executing_orders(
-    State(orderbook): State<OrderbookHandle>,
-) -> Result<Json<Vec<Order>>, StatusCode> {
-    orderbook
+async fn executing_orders(State(state): State<ApiState>) -> Result<Json<Vec<Order>>, StatusCode> {
+    state
+        .orderbook
         .executing_orders()
         .await
         .map(Json)
@@ -155,10 +163,12 @@ async fn executing_orders(
 }
 
 async fn take_solver_proofs(
-    State(orderbook): State<OrderbookHandle>,
-    Path(solver_id): Path<SolverId>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<SolverProofDelivery>>, StatusCode> {
-    orderbook
+    let solver_id = solver_id_from_headers(&headers)?;
+    state
+        .orderbook
         .take_solver_proofs(solver_id)
         .await
         .map(Json)
@@ -166,29 +176,41 @@ async fn take_solver_proofs(
 }
 
 async fn reserve_order(
-    State(orderbook): State<OrderbookHandle>,
+    State(state): State<ApiState>,
     Path(order_id): Path<OrderId>,
-    Json(request): Json<ReserveOrderRequest>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, StatusCode> {
+    let solver_id = solver_id_from_headers(&headers)?;
+    let profile = state
+        .registry
+        .get(solver_id)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .filter(|profile| profile.active)
+        .ok_or(StatusCode::FORBIDDEN)?;
+    if profile.noise_key == alloy_primitives::B256::ZERO {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     execute(
-        &orderbook,
+        &state.orderbook,
         Command::SolverReserved {
             order_id,
-            solver_id: request.solver_id,
-            noise_public_key: request.noise_public_key,
+            solver_id,
+            noise_public_key: profile.noise_key.to_vec(),
         },
     )
     .await
 }
 
 async fn relay_encrypted_proof(
-    State(orderbook): State<OrderbookHandle>,
+    State(state): State<ApiState>,
     Path(order_id): Path<OrderId>,
     headers: HeaderMap,
     Json(request): Json<EncryptedProofRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let order_commitment = commitment_from_headers(&headers)?;
-    orderbook
+    state
+        .orderbook
         .relay_encrypted_proof(order_id, order_commitment, request.ciphertext)
         .await
         .map(|_| StatusCode::NO_CONTENT)
@@ -196,15 +218,17 @@ async fn relay_encrypted_proof(
 }
 
 async fn execution_started(
-    State(orderbook): State<OrderbookHandle>,
+    State(state): State<ApiState>,
     Path(order_id): Path<OrderId>,
+    headers: HeaderMap,
     Json(request): Json<ExecutionStartedRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    let solver_id = solver_id_from_headers(&headers)?;
     execute(
-        &orderbook,
+        &state.orderbook,
         Command::ExecutionStarted {
             order_id,
-            solver_id: request.solver_id,
+            solver_id,
             tx_hash: request.tx_hash,
         },
     )
@@ -212,12 +236,12 @@ async fn execution_started(
 }
 
 async fn settlement(
-    State(orderbook): State<OrderbookHandle>,
+    State(state): State<ApiState>,
     Path(order_id): Path<OrderId>,
     Json(request): Json<SettlementRequest>,
 ) -> Result<StatusCode, StatusCode> {
     execute(
-        &orderbook,
+        &state.orderbook,
         Command::SettlementObserved {
             order_id,
             tx_hash: request.tx_hash,
@@ -234,27 +258,25 @@ async fn execute(orderbook: &OrderbookHandle, command: Command) -> Result<Status
         .map_err(status_for_error)
 }
 
-async fn user_events_ws(
-    ws: WebSocketUpgrade,
-    State(orderbook): State<OrderbookHandle>,
-) -> impl IntoResponse {
-    let events = orderbook.subscribe();
-    ws.on_upgrade(move |socket| forward_user_events(socket, events, orderbook))
+async fn user_events_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) -> impl IntoResponse {
+    let events = state.orderbook.subscribe();
+    ws.on_upgrade(move |socket| forward_user_events(socket, events, state.orderbook))
 }
 
 async fn solver_events_ws(
     ws: WebSocketUpgrade,
-    State(orderbook): State<OrderbookHandle>,
-) -> impl IntoResponse {
-    let events = orderbook.subscribe();
-    ws.on_upgrade(move |socket| forward_service_events(socket, events, ServiceStream::Solver))
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    let solver_id = solver_id_from_headers(&headers)?;
+    let events = state.orderbook.subscribe();
+    Ok(ws.on_upgrade(move |socket| {
+        forward_service_events(socket, events, ServiceStream::Solver(solver_id))
+    }))
 }
 
-async fn chain_events_ws(
-    ws: WebSocketUpgrade,
-    State(orderbook): State<OrderbookHandle>,
-) -> impl IntoResponse {
-    let events = orderbook.subscribe();
+async fn chain_events_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) -> impl IntoResponse {
+    let events = state.orderbook.subscribe();
     ws.on_upgrade(move |socket| forward_service_events(socket, events, ServiceStream::Chain))
 }
 
@@ -322,7 +344,7 @@ async fn forward_user_events(
 
 #[derive(Clone, Copy)]
 enum ServiceStream {
-    Solver,
+    Solver(SolverId),
     Chain,
 }
 
@@ -339,10 +361,14 @@ async fn forward_service_events(
         };
 
         let relevant = match stream {
-            ServiceStream::Solver => matches!(
-                event,
-                OrderEvent::SolverReservationRequested { .. } | OrderEvent::ProofRelayed { .. }
-            ),
+            ServiceStream::Solver(solver_id) => match &event {
+                OrderEvent::SolverReservationRequested { .. } => true,
+                OrderEvent::ProofRelayed {
+                    solver_id: assigned,
+                    ..
+                } => *assigned == solver_id,
+                _ => false,
+            },
             ServiceStream::Chain => matches!(event, OrderEvent::ExecutionStarted { .. }),
         };
         if !relevant {
@@ -369,6 +395,14 @@ fn commitment_from_headers(headers: &HeaderMap) -> Result<OrderCommitment, Statu
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok())
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+fn solver_id_from_headers(headers: &HeaderMap) -> Result<SolverId, StatusCode> {
+    headers
+        .get(SOLVER_ADDRESS_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)
 }
 
 fn status_for_error(error: ServiceError) -> StatusCode {

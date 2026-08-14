@@ -12,12 +12,12 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use kage_orderbook::api::{
     self, CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest, ORDER_COMMITMENT_HEADER,
-    ReserveOrderRequest, UserEventClientMessage, UserEventServerMessage,
+    SOLVER_ADDRESS_HEADER, UserEventClientMessage, UserEventServerMessage,
 };
 use kage_orderbook::core::engine::start_orderbook;
 use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::order::{Order, OrderCommitment, OrderId, OrderState};
-use support::{commitment, terms};
+use support::{commitment, noise_key, registry, solver_address, terms};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -30,7 +30,9 @@ async fn server() -> (String, String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
-        axum::serve(listener, api::router(orderbook)).await.unwrap();
+        axum::serve(listener, api::router(orderbook, registry()))
+            .await
+            .unwrap();
     });
 
     (
@@ -188,10 +190,7 @@ async fn user_event_stream_is_private_and_reconnectable() {
 
     client
         .post(format!("{http_url}/orders/{second_id}/reserve"))
-        .json(&ReserveOrderRequest {
-            solver_id: uuid::Uuid::new_v4(),
-            noise_public_key: vec![2; 32],
-        })
+        .header(SOLVER_ADDRESS_HEADER, solver_address(0x22).to_string())
         .send()
         .await
         .unwrap()
@@ -205,10 +204,7 @@ async fn user_event_stream_is_private_and_reconnectable() {
 
     client
         .post(format!("{http_url}/orders/{first_id}/reserve"))
-        .json(&ReserveOrderRequest {
-            solver_id: uuid::Uuid::new_v4(),
-            noise_public_key: vec![1; 32],
-        })
+        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
         .send()
         .await
         .unwrap()
@@ -256,6 +252,7 @@ async fn orders_wait_for_an_external_solver() {
 
     let orders: Vec<Order> = client
         .get(format!("{http_url}/solver/jobs"))
+        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
         .send()
         .await
         .unwrap()
@@ -286,7 +283,9 @@ async fn external_services_drive_orders_to_filled() {
     let solver_ws_url = format!("ws://{address}/events/solver/ws");
     let chain_ws_url = format!("ws://{address}/events/chain/ws");
     let server = tokio::spawn(async move {
-        axum::serve(listener, api::router(orderbook)).await.unwrap();
+        axum::serve(listener, api::router(orderbook, registry()))
+            .await
+            .unwrap();
     });
 
     let (chain_ready_tx, chain_ready_rx) = oneshot::channel();
@@ -311,7 +310,13 @@ async fn external_services_drive_orders_to_filled() {
     user_ready_rx.await.unwrap();
 
     let (solver_ready_tx, solver_ready_rx) = oneshot::channel();
-    let solver = tokio::spawn(solver::run(http_url, solver_ws_url, solver_ready_tx));
+    let solver = tokio::spawn(solver::run(
+        http_url,
+        solver_ws_url,
+        solver_address(0x11),
+        noise_key(0x33).to_vec(),
+        solver_ready_tx,
+    ));
     solver_ready_rx.await.unwrap();
 
     let mut seen: HashMap<OrderId, Vec<&'static str>> = HashMap::new();

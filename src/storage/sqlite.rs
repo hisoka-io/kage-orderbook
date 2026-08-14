@@ -80,8 +80,9 @@ impl OrderRepository {
             "INSERT INTO orders (
                 id, state, version, token_in, token_out, amount_in, amount_out,
                 solver_id, solver_noise_public_key, tx_hash,
-                created_at_ms, updated_at_ms, expires_at_ms, order_commitment
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                created_at_ms, updated_at_ms, expires_at_ms, order_commitment,
+                solver_address
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(order.id.to_string())
         .bind(state_name(order.state))
@@ -90,13 +91,14 @@ impl OrderRepository {
         .bind(order.token_out.as_slice())
         .bind(order.amount_in.to_string())
         .bind(order.amount_out.to_string())
-        .bind(order.solver.map(|id| id.to_string()))
+        .bind(Option::<String>::None)
         .bind(order.solver_noise_public_key.as_deref())
         .bind(order.tx_hash.map(|hash| hash.to_vec()))
         .bind(created_at_ms)
         .bind(created_at_ms)
         .bind(order.expires_at_ms)
         .bind(order_commitment.as_slice())
+        .bind(order.solver.map(|address| address.to_vec()))
         .execute(&self.pool)
         .await;
 
@@ -122,7 +124,7 @@ impl OrderRepository {
         let result = sqlx::query(
             "UPDATE orders SET
                 state = ?, version = ?, token_in = ?, token_out = ?,
-                amount_in = ?, amount_out = ?, solver_id = ?,
+                amount_in = ?, amount_out = ?, solver_address = ?,
                 solver_noise_public_key = ?, tx_hash = ?, updated_at_ms = ?
              WHERE id = ? AND version = ?",
         )
@@ -132,7 +134,7 @@ impl OrderRepository {
         .bind(order.token_out.as_slice())
         .bind(order.amount_in.to_string())
         .bind(order.amount_out.to_string())
-        .bind(order.solver.map(|id| id.to_string()))
+        .bind(order.solver.map(|address| address.to_vec()))
         .bind(order.solver_noise_public_key.as_deref())
         .bind(order.tx_hash.map(|hash| hash.to_vec()))
         .bind(updated_at_ms)
@@ -159,7 +161,7 @@ impl OrderRepository {
         let result = sqlx::query(
             "UPDATE orders SET
                 state = ?, version = ?, token_in = ?, token_out = ?,
-                amount_in = ?, amount_out = ?, solver_id = ?,
+                amount_in = ?, amount_out = ?, solver_address = ?,
                 solver_noise_public_key = ?, tx_hash = ?, updated_at_ms = ?
              WHERE id = ? AND version = ?",
         )
@@ -169,7 +171,7 @@ impl OrderRepository {
         .bind(order.token_out.as_slice())
         .bind(order.amount_in.to_string())
         .bind(order.amount_out.to_string())
-        .bind(order.solver.map(|id| id.to_string()))
+        .bind(order.solver.map(|address| address.to_vec()))
         .bind(order.solver_noise_public_key.as_deref())
         .bind(order.tx_hash.map(|hash| hash.to_vec()))
         .bind(timestamp_ms)
@@ -185,16 +187,19 @@ impl OrderRepository {
         if let Some((solver_id, ciphertext)) = proof {
             sqlx::query(
                 "INSERT INTO proof_payloads (
-                    order_id, solver_id, ciphertext, created_at_ms, delivered_at_ms
-                 ) VALUES (?, ?, ?, ?, NULL)
+                    order_id, solver_id, solver_address, ciphertext,
+                    created_at_ms, delivered_at_ms
+                 ) VALUES (?, ?, ?, ?, ?, NULL)
                  ON CONFLICT(order_id) DO UPDATE SET
                     solver_id = excluded.solver_id,
+                    solver_address = excluded.solver_address,
                     ciphertext = excluded.ciphertext,
                     created_at_ms = excluded.created_at_ms,
                     delivered_at_ms = NULL",
             )
             .bind(order.id.to_string())
             .bind(solver_id.to_string())
+            .bind(solver_id.as_slice())
             .bind(ciphertext)
             .bind(timestamp_ms)
             .execute(&mut *transaction)
@@ -244,7 +249,7 @@ impl OrderRepository {
         order_id: OrderId,
     ) -> Result<Option<ProofPayload>, RepositoryError> {
         let row = sqlx::query(
-            "SELECT order_id, solver_id, ciphertext, created_at_ms, delivered_at_ms
+            "SELECT order_id, solver_address, ciphertext, created_at_ms, delivered_at_ms
              FROM proof_payloads WHERE order_id = ?",
         )
         .bind(order_id.to_string())
@@ -273,16 +278,19 @@ impl OrderRepository {
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "INSERT INTO proof_payloads (
-                order_id, solver_id, ciphertext, created_at_ms, delivered_at_ms
-             ) VALUES (?, ?, ?, ?, NULL)
+                order_id, solver_id, solver_address, ciphertext,
+                created_at_ms, delivered_at_ms
+             ) VALUES (?, ?, ?, ?, ?, NULL)
              ON CONFLICT(order_id) DO UPDATE SET
                 solver_id = excluded.solver_id,
+                solver_address = excluded.solver_address,
                 ciphertext = excluded.ciphertext,
                 created_at_ms = excluded.created_at_ms,
                 delivered_at_ms = NULL",
         )
         .bind(order_id.to_string())
         .bind(solver_id.to_string())
+        .bind(solver_id.as_slice())
         .bind(ciphertext)
         .bind(created_at_ms)
         .execute(&self.pool)
@@ -295,15 +303,15 @@ impl OrderRepository {
         solver_id: SolverId,
     ) -> Result<Vec<ProofPayload>, RepositoryError> {
         let rows = sqlx::query(
-            "SELECT proof_payloads.order_id, proof_payloads.solver_id,
+            "SELECT proof_payloads.order_id, proof_payloads.solver_address,
                     proof_payloads.ciphertext, proof_payloads.created_at_ms,
                     proof_payloads.delivered_at_ms
              FROM proof_payloads
              JOIN orders ON orders.id = proof_payloads.order_id
-             WHERE proof_payloads.solver_id = ? AND orders.state = 'proof_relayed'
+             WHERE proof_payloads.solver_address = ? AND orders.state = 'proof_relayed'
              ORDER BY proof_payloads.created_at_ms, proof_payloads.order_id",
         )
-        .bind(solver_id.to_string())
+        .bind(solver_id.as_slice())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(decode_proof).collect()
@@ -341,8 +349,8 @@ fn decode_order(row: SqliteRow) -> Result<PersistedOrder, RepositoryError> {
     let amount_in = parse_u256("amount_in", row.try_get("amount_in")?)?;
     let amount_out = parse_u256("amount_out", row.try_get("amount_out")?)?;
     let solver = row
-        .try_get::<Option<String>, _>("solver_id")?
-        .map(|value| parse_uuid("solver_id", value))
+        .try_get::<Option<Vec<u8>>, _>("solver_address")?
+        .map(|value| parse_fixed::<20>("solver_address", value).map(Address::from))
         .transpose()?;
     let noise_public_key = row.try_get("solver_noise_public_key")?;
     let tx_hash = row
@@ -379,7 +387,10 @@ fn decode_order(row: SqliteRow) -> Result<PersistedOrder, RepositoryError> {
 fn decode_proof(row: SqliteRow) -> Result<ProofPayload, RepositoryError> {
     Ok(ProofPayload {
         order_id: parse_uuid("order_id", row.try_get("order_id")?)?,
-        solver_id: parse_uuid("solver_id", row.try_get("solver_id")?)?,
+        solver_id: Address::from(parse_fixed::<20>(
+            "solver_address",
+            row.try_get("solver_address")?,
+        )?),
         ciphertext: row.try_get("ciphertext")?,
         created_at_ms: row.try_get("created_at_ms")?,
         delivered_at_ms: row.try_get("delivered_at_ms")?,
@@ -468,7 +479,7 @@ mod tests {
             amount_in: U256::from(100),
             amount_out: U256::from(200),
             expires_at_ms: Some(5000),
-            solver: Some(Uuid::new_v4()),
+            solver: Some(Address::repeat_byte(3)),
             solver_noise_public_key: Some(vec![7; 32]),
             tx_hash: Some(B256::repeat_byte(9)),
         }

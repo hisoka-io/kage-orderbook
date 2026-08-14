@@ -1,16 +1,17 @@
 use std::error::Error;
 use std::time::Duration;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use futures_util::StreamExt;
-use kage_orderbook::api::{ExecutionStartedRequest, ReserveOrderRequest};
+use kage_orderbook::api::{ExecutionStartedRequest, SOLVER_ADDRESS_HEADER};
 use kage_orderbook::core::engine::SolverProofDelivery;
 use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
 use kage_orderbook::order::{Order, OrderId, SolverId};
 use reqwest::StatusCode;
 use tokio_tungstenite::connect_async;
-use uuid::Uuid;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -20,11 +21,15 @@ async fn main() {
         std::env::var("ORDERBOOK_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned());
     let ws_url = std::env::var("ORDERBOOK_WS_URL")
         .unwrap_or_else(|_| "ws://127.0.0.1:3000/events/solver/ws".to_owned());
-    let solver_id = std::env::var("SOLVER_ID")
+    let solver_id = std::env::var("SOLVER_ADDRESS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or_else(Uuid::new_v4);
-    let noise_key = solver_id.as_bytes().to_vec();
+        .unwrap_or_else(|| Address::repeat_byte(0x11));
+    let noise_key = std::env::var("SOLVER_NOISE_KEY")
+        .ok()
+        .and_then(|value| value.parse::<B256>().ok())
+        .unwrap_or_else(|| B256::repeat_byte(0x33))
+        .to_vec();
 
     kage_orderbook::service_log!("solver", "started solver={solver_id}");
 
@@ -43,9 +48,15 @@ async fn run(
     noise_key: &[u8],
 ) -> Result<(), BoxError> {
     let client = reqwest::Client::new();
-    let (mut socket, _) = connect_async(ws_url).await?;
+    let mut ws_request = ws_url.into_client_request()?;
+    ws_request.headers_mut().insert(
+        SOLVER_ADDRESS_HEADER,
+        HeaderValue::from_str(&solver_id.to_string())?,
+    );
+    let (mut socket, _) = connect_async(ws_request).await?;
     let jobs = client
         .get(format!("{http_url}/solver/jobs"))
+        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
         .send()
         .await?
         .error_for_status()?
@@ -53,7 +64,7 @@ async fn run(
         .await?;
 
     for order in jobs {
-        reserve(&client, http_url, order.id, solver_id, noise_key).await?;
+        reserve(&client, http_url, order.id, solver_id).await?;
     }
     execute_proofs(&client, http_url, solver_id, noise_key).await?;
 
@@ -67,7 +78,7 @@ async fn run(
         match event {
             OrderEvent::SolverReservationRequested { order_id } => {
                 kage_orderbook::service_log!("solver", "available order={}", short_id(order_id));
-                reserve(&client, http_url, order_id, solver_id, noise_key).await?;
+                reserve(&client, http_url, order_id, solver_id).await?;
             }
             OrderEvent::ProofRelayed {
                 solver_id: assigned_solver,
@@ -91,14 +102,10 @@ async fn reserve(
     http_url: &str,
     order_id: OrderId,
     solver_id: SolverId,
-    noise_key: &[u8],
 ) -> Result<(), BoxError> {
     let response = client
         .post(format!("{http_url}/orders/{order_id}/reserve"))
-        .json(&ReserveOrderRequest {
-            solver_id,
-            noise_public_key: noise_key.to_vec(),
-        })
+        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
         .send()
         .await?;
 
@@ -106,9 +113,8 @@ async fn reserve(
         response.error_for_status()?;
         kage_orderbook::service_log!(
             "solver",
-            "reserved order={} solver={solver_id} noise_key_bytes={}",
-            short_id(order_id),
-            noise_key.len()
+            "reserved order={} solver={solver_id}",
+            short_id(order_id)
         );
     } else {
         kage_orderbook::service_log!(
@@ -127,7 +133,8 @@ async fn execute_proofs(
     noise_key: &[u8],
 ) -> Result<(), BoxError> {
     let proofs = client
-        .get(format!("{http_url}/solver/{solver_id}/proofs"))
+        .get(format!("{http_url}/solver/proofs"))
+        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
         .send()
         .await?
         .error_for_status()?
@@ -162,7 +169,8 @@ async fn execute_proofs(
                 "{http_url}/orders/{}/execution-started",
                 delivery.order_id
             ))
-            .json(&ExecutionStartedRequest { solver_id, tx_hash })
+            .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+            .json(&ExecutionStartedRequest { tx_hash })
             .send()
             .await?
             .error_for_status()?;

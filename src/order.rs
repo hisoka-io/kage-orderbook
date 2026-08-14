@@ -7,7 +7,7 @@ use crate::core::events::OrderEvent;
 pub type OrderId = Uuid;
 pub type TokenAddress = Address;
 pub type TxHash = B256;
-pub type SolverId = Uuid;
+pub type SolverId = Address;
 pub type OrderCommitment = B256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

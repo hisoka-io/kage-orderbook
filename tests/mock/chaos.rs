@@ -4,15 +4,15 @@ use std::time::Duration;
 use alloy_primitives::B256;
 use futures_util::future::join_all;
 use kage_orderbook::api::{
-    EncryptedProofRequest, ExecutionStartedRequest, ORDER_COMMITMENT_HEADER, ReserveOrderRequest,
+    EncryptedProofRequest, ExecutionStartedRequest, ORDER_COMMITMENT_HEADER, SOLVER_ADDRESS_HEADER,
     SettlementRequest,
 };
 use kage_orderbook::core::engine::SolverProofDelivery;
 use kage_orderbook::logging::short_id;
 use kage_orderbook::order::{Order, OrderId, OrderState, SolverId};
 use reqwest::{Client, Response, StatusCode};
-use uuid::Uuid;
 
+use super::support::{noise_key, solver_address};
 use super::{create_order_with_commitment, server};
 
 const ORDERS: u64 = 4;
@@ -27,9 +27,9 @@ async fn delayed_services_accept_retries_and_reject_conflicts() {
 async fn run() {
     let (http_url, _, server) = server().await;
     let client = Client::new();
-    let solver_id = Uuid::from_bytes([0x11; 16]);
-    let wrong_solver_id = Uuid::from_bytes([0x22; 16]);
-    let noise_key = solver_id.as_bytes().to_vec();
+    let solver_id = solver_address(0x11);
+    let wrong_solver_id = solver_address(0x22);
+    let noise_key = noise_key(0x33).to_vec();
 
     let created = join_all((1..=ORDERS).map(|number| {
         let client = client.clone();
@@ -65,8 +65,8 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/execution-started"))
+            .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
             .json(&ExecutionStartedRequest {
-                solver_id,
                 tx_hash: tx_hash(first),
             })
             .send()
@@ -80,16 +80,12 @@ async fn run() {
     join_all(orders.iter().enumerate().map(|(index, order_id)| {
         let client = client.clone();
         let http_url = http_url.clone();
-        let noise_key = noise_key.clone();
         let order_id = *order_id;
         async move {
             tokio::time::sleep(delay(index, 20)).await;
             let response = client
                 .post(format!("{http_url}/orders/{order_id}/reserve"))
-                .json(&ReserveOrderRequest {
-                    solver_id,
-                    noise_public_key: noise_key,
-                })
+                .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
                 .send()
                 .await
                 .unwrap();
@@ -106,10 +102,7 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/reserve"))
-            .json(&ReserveOrderRequest {
-                solver_id,
-                noise_public_key: noise_key.clone(),
-            })
+            .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
             .send()
             .await
             .unwrap(),
@@ -120,10 +113,7 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/reserve"))
-            .json(&ReserveOrderRequest {
-                solver_id: wrong_solver_id,
-                noise_public_key: noise_key.clone(),
-            })
+            .header(SOLVER_ADDRESS_HEADER, wrong_solver_id.to_string())
             .send()
             .await
             .unwrap(),
@@ -190,8 +180,8 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/execution-started"))
+            .header(SOLVER_ADDRESS_HEADER, wrong_solver_id.to_string())
             .json(&ExecutionStartedRequest {
-                solver_id: wrong_solver_id,
                 tx_hash: tx_hash(first),
             })
             .send()
@@ -223,8 +213,8 @@ async fn run() {
                     "{http_url}/orders/{}/execution-started",
                     delivery.order_id
                 ))
+                .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
                 .json(&ExecutionStartedRequest {
-                    solver_id,
                     tx_hash: tx_hash(delivery.order_id),
                 })
                 .send()
@@ -243,8 +233,8 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/execution-started"))
+            .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
             .json(&ExecutionStartedRequest {
-                solver_id,
                 tx_hash: tx_hash(first),
             })
             .send()
@@ -322,7 +312,17 @@ async fn run() {
         );
     }
 
-    let solver_jobs: Vec<Order> = get_json(&client, format!("{http_url}/solver/jobs")).await;
+    let solver_jobs: Vec<Order> = client
+        .get(format!("{http_url}/solver/jobs"))
+        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let chain_jobs: Vec<Order> = get_json(&client, format!("{http_url}/chain/jobs")).await;
     assert!(solver_jobs.is_empty());
     assert!(chain_jobs.is_empty());
@@ -335,7 +335,17 @@ async fn solver_proofs(
     http_url: &str,
     solver_id: SolverId,
 ) -> Vec<SolverProofDelivery> {
-    get_json(client, format!("{http_url}/solver/{solver_id}/proofs")).await
+    client
+        .get(format!("{http_url}/solver/proofs"))
+        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 async fn get_order(

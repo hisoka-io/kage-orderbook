@@ -4,7 +4,7 @@ use kage_orderbook::core::engine::start_orderbook;
 use kage_orderbook::order::OrderState;
 use uuid::Uuid;
 
-use super::support::{commitment, terms};
+use super::support::{commitment, noise_key, solver_address, terms};
 
 #[tokio::test]
 async fn proof_relayed_order_survives_restart_and_reaches_filled() {
@@ -14,8 +14,8 @@ async fn proof_relayed_order_survives_restart_and_reaches_filled() {
         directory.path().join("orderbook.db").display()
     );
     let order_id = Uuid::new_v4();
-    let solver_id = Uuid::new_v4();
-    let noise_key = solver_id.as_bytes().to_vec();
+    let solver_id = solver_address(0x11);
+    let noise_key = noise_key(0x33).to_vec();
     let ciphertext = vec![1, 2, 3, 4];
     let tx_hash = B256::repeat_byte(9);
 
