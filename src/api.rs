@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
@@ -9,6 +11,7 @@ use uuid::Uuid;
 
 use crate::core::command::Command;
 use crate::core::engine::{OrderError, OrderbookHandle, ServiceError, SolverProofDelivery};
+use crate::core::events::OrderEvent;
 use crate::logging::short_id;
 use crate::order::{Order, OrderCommitment, OrderId, SolverId, TradeTerms, TxHash};
 use crate::storage::RepositoryError;
@@ -49,6 +52,23 @@ pub struct SettlementRequest {
     pub tx_hash: TxHash,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UserEventClientMessage {
+    Subscribe {
+        order_id: OrderId,
+        order_commitment: OrderCommitment,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UserEventServerMessage {
+    Subscribed { order_id: OrderId },
+    Rejected { order_id: OrderId },
+    Event { event: OrderEvent },
+}
+
 pub fn router(orderbook: OrderbookHandle) -> Router {
     Router::new()
         .route("/orders", post(create_order))
@@ -66,7 +86,9 @@ pub fn router(orderbook: OrderbookHandle) -> Router {
             post(execution_started),
         )
         .route("/orders/{order_id}/settlement", post(settlement))
-        .route("/events/ws", get(events_ws))
+        .route("/events/user/ws", get(user_events_ws))
+        .route("/events/solver/ws", get(solver_events_ws))
+        .route("/events/chain/ws", get(chain_events_ws))
         .with_state(orderbook)
 }
 
@@ -212,17 +234,102 @@ async fn execute(orderbook: &OrderbookHandle, command: Command) -> Result<Status
         .map_err(status_for_error)
 }
 
-async fn events_ws(
+async fn user_events_ws(
     ws: WebSocketUpgrade,
     State(orderbook): State<OrderbookHandle>,
 ) -> impl IntoResponse {
     let events = orderbook.subscribe();
-    ws.on_upgrade(move |socket| forward_events(socket, events))
+    ws.on_upgrade(move |socket| forward_user_events(socket, events, orderbook))
 }
 
-async fn forward_events(
+async fn solver_events_ws(
+    ws: WebSocketUpgrade,
+    State(orderbook): State<OrderbookHandle>,
+) -> impl IntoResponse {
+    let events = orderbook.subscribe();
+    ws.on_upgrade(move |socket| forward_service_events(socket, events, ServiceStream::Solver))
+}
+
+async fn chain_events_ws(
+    ws: WebSocketUpgrade,
+    State(orderbook): State<OrderbookHandle>,
+) -> impl IntoResponse {
+    let events = orderbook.subscribe();
+    ws.on_upgrade(move |socket| forward_service_events(socket, events, ServiceStream::Chain))
+}
+
+async fn forward_user_events(
     mut socket: WebSocket,
-    mut events: tokio::sync::broadcast::Receiver<crate::core::events::OrderEvent>,
+    mut events: tokio::sync::broadcast::Receiver<OrderEvent>,
+    orderbook: OrderbookHandle,
+) {
+    let mut subscriptions = HashSet::new();
+
+    loop {
+        tokio::select! {
+            message = socket.recv() => {
+                let Some(Ok(message)) = message else {
+                    return;
+                };
+                let Message::Text(text) = message else {
+                    if matches!(message, Message::Close(_)) {
+                        return;
+                    }
+                    continue;
+                };
+                let Ok(UserEventClientMessage::Subscribe {
+                    order_id,
+                    order_commitment,
+                }) = serde_json::from_str(&text) else {
+                    continue;
+                };
+
+                let authorized = match orderbook
+                    .get_order_by_commitment(order_id, order_commitment)
+                    .await
+                {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(_) => return,
+                };
+                let response = if authorized {
+                    subscriptions.insert(order_id);
+                    UserEventServerMessage::Subscribed { order_id }
+                } else {
+                    UserEventServerMessage::Rejected { order_id }
+                };
+                if send_json(&mut socket, &response).await.is_err() {
+                    return;
+                }
+            }
+            event = events.recv(), if !subscriptions.is_empty() => {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                };
+                if subscriptions.contains(&event.order_id())
+                    && send_json(&mut socket, &UserEventServerMessage::Event { event })
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ServiceStream {
+    Solver,
+    Chain,
+}
+
+async fn forward_service_events(
+    mut socket: WebSocket,
+    mut events: tokio::sync::broadcast::Receiver<OrderEvent>,
+    stream: ServiceStream,
 ) {
     loop {
         let event = match events.recv().await {
@@ -231,14 +338,29 @@ async fn forward_events(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         };
 
-        let Ok(json) = serde_json::to_string(&event) else {
-            continue;
+        let relevant = match stream {
+            ServiceStream::Solver => matches!(
+                event,
+                OrderEvent::SolverReservationRequested { .. } | OrderEvent::ProofRelayed { .. }
+            ),
+            ServiceStream::Chain => matches!(event, OrderEvent::ExecutionStarted { .. }),
         };
+        if !relevant {
+            continue;
+        }
 
-        if socket.send(Message::Text(json.into())).await.is_err() {
+        if send_json(&mut socket, &event).await.is_err() {
             return;
         }
     }
+}
+
+async fn send_json(socket: &mut WebSocket, value: &impl Serialize) -> Result<(), ()> {
+    let json = serde_json::to_string(value).map_err(|_| ())?;
+    socket
+        .send(Message::Text(json.into()))
+        .await
+        .map_err(|_| ())
 }
 
 fn commitment_from_headers(headers: &HeaderMap) -> Result<OrderCommitment, StatusCode> {

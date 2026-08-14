@@ -16,7 +16,7 @@ async fn main() {
     let http_url =
         std::env::var("ORDERBOOK_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned());
     let ws_url = std::env::var("ORDERBOOK_WS_URL")
-        .unwrap_or_else(|_| "ws://127.0.0.1:3000/events/ws".to_owned());
+        .unwrap_or_else(|_| "ws://127.0.0.1:3000/events/chain/ws".to_owned());
     let delay = std::env::var("CHAIN_DELAY_MS")
         .ok()
         .and_then(|value| value.parse().ok())

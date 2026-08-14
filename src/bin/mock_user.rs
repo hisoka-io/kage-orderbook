@@ -4,9 +4,10 @@ use std::io;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use kage_orderbook::api::{
     CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest, ORDER_COMMITMENT_HEADER,
+    UserEventClientMessage, UserEventServerMessage,
 };
 use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
@@ -35,7 +36,7 @@ impl Config {
             http_url: std::env::var("ORDERBOOK_HTTP_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned()),
             ws_url: std::env::var("ORDERBOOK_WS_URL")
-                .unwrap_or_else(|_| "ws://127.0.0.1:3000/events/ws".to_owned()),
+                .unwrap_or_else(|_| "ws://127.0.0.1:3000/events/user/ws".to_owned()),
         };
 
         let mut args = std::env::args().skip(1);
@@ -118,11 +119,13 @@ impl Generator {
 async fn main() -> Result<(), BoxError> {
     let config = Config::from_args()?;
     let client = reqwest::Client::new();
-    let (mut socket, _) = connect_async(&config.ws_url).await?;
+    let (socket, _) = connect_async(&config.ws_url).await?;
+    let (mut socket_tx, mut socket_rx) = socket.split();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (subscription_tx, mut subscription_rx) = mpsc::unbounded_channel();
 
     let reader = tokio::spawn(async move {
-        while let Some(message) = socket.next().await {
+        while let Some(message) = socket_rx.next().await {
             let message = match message {
                 Ok(message) => message,
                 Err(_) => return,
@@ -131,12 +134,27 @@ async fn main() -> Result<(), BoxError> {
                 continue;
             }
 
-            let Ok(event) = serde_json::from_str::<OrderEvent>(message.to_text().unwrap_or(""))
+            let Ok(message) =
+                serde_json::from_str::<UserEventServerMessage>(message.to_text().unwrap_or(""))
             else {
                 continue;
             };
-            if event_tx.send(event).is_err() {
-                return;
+            match message {
+                UserEventServerMessage::Subscribed { order_id } => {
+                    if subscription_tx.send((order_id, true)).is_err() {
+                        return;
+                    }
+                }
+                UserEventServerMessage::Rejected { order_id } => {
+                    if subscription_tx.send((order_id, false)).is_err() {
+                        return;
+                    }
+                }
+                UserEventServerMessage::Event { event } => {
+                    if event_tx.send(event).is_err() {
+                        return;
+                    }
+                }
             }
         }
     });
@@ -158,6 +176,23 @@ async fn main() -> Result<(), BoxError> {
             .error_for_status()?
             .json::<CreateOrderResponse>()
             .await?;
+
+        let subscription = UserEventClientMessage::Subscribe {
+            order_id: response.order_id,
+            order_commitment: request.order_commitment,
+        };
+        socket_tx
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&subscription)?.into(),
+            ))
+            .await?;
+        let (subscribed_order, accepted) = subscription_rx
+            .recv()
+            .await
+            .ok_or_else(|| invalid("user event stream closed"))?;
+        if subscribed_order != response.order_id || !accepted {
+            return Err(invalid("order event subscription rejected").into());
+        }
 
         kage_orderbook::service_log!(
             "user",
