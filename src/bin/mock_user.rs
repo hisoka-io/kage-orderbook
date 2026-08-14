@@ -166,7 +166,11 @@ async fn main() -> Result<(), BoxError> {
         let terms = generator.terms();
         let request = CreateOrderRequest {
             order_commitment: new_order_commitment(),
-            terms,
+            token_in: terms.token_in,
+            token_out: terms.token_out,
+            amount_in: terms.amount_in,
+            amount_out: terms.amount_out,
+            ttl_seconds: None,
         };
         let response = client
             .post(format!("{}/orders", config.http_url))
@@ -196,12 +200,13 @@ async fn main() -> Result<(), BoxError> {
 
         kage_orderbook::service_log!(
             "user",
-            "created order={} token_in={} token_out={} amount_in={} amount_out={}",
+            "created order={} token_in={} token_out={} amount_in={} amount_out={} expires_at_ms={}",
             short_id(response.order_id),
             terms.token_in,
             terms.token_out,
             terms.amount_in,
-            terms.amount_out
+            terms.amount_out,
+            response.expires_at_ms
         );
         orders.insert(response.order_id, request.order_commitment);
 

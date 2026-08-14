@@ -16,6 +16,9 @@ use kage_orderbook::api::{
 };
 use kage_orderbook::core::engine::start_orderbook;
 use kage_orderbook::core::events::OrderEvent;
+use kage_orderbook::core::guards::{
+    DEFAULT_ORDER_TTL_SECONDS, MAX_ORDER_TTL_SECONDS, MIN_ORDER_TTL_SECONDS,
+};
 use kage_orderbook::order::{Order, OrderCommitment, OrderId, OrderState};
 use support::{commitment, noise_key, registry, solver_address, terms};
 use tokio::net::TcpListener;
@@ -42,6 +45,18 @@ async fn server() -> (String, String, JoinHandle<()>) {
     )
 }
 
+fn create_order_request(n: u64, ttl_seconds: Option<u32>) -> CreateOrderRequest {
+    let terms = terms(n);
+    CreateOrderRequest {
+        order_commitment: commitment(n),
+        token_in: terms.token_in,
+        token_out: terms.token_out,
+        amount_in: terms.amount_in,
+        amount_out: terms.amount_out,
+        ttl_seconds,
+    }
+}
+
 async fn create_order(client: &reqwest::Client, http_url: &str, n: u64) -> OrderId {
     create_order_with_commitment(client, http_url, n).await.0
 }
@@ -51,10 +66,7 @@ async fn create_order_with_commitment(
     http_url: &str,
     n: u64,
 ) -> (OrderId, alloy_primitives::B256) {
-    let request = CreateOrderRequest {
-        order_commitment: commitment(n),
-        terms: terms(n),
-    };
+    let request = create_order_request(n, None);
     let order_id = client
         .post(format!("{http_url}/orders"))
         .json(&request)
@@ -93,10 +105,7 @@ async fn subscribe_user_events(
 async fn rejects_a_duplicate_order_commitment() {
     let (http_url, _, server) = server().await;
     let client = reqwest::Client::new();
-    let request = CreateOrderRequest {
-        order_commitment: commitment(1),
-        terms: terms(1),
-    };
+    let request = create_order_request(1, None);
 
     let first = client
         .post(format!("{http_url}/orders"))
@@ -113,6 +122,44 @@ async fn rejects_a_duplicate_order_commitment() {
         .await
         .unwrap();
     assert_eq!(second.status(), reqwest::StatusCode::CONFLICT);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn applies_default_ttl_and_rejects_out_of_range_ttl() {
+    let (http_url, _, server) = server().await;
+    let client = reqwest::Client::new();
+    let before = chrono::Utc::now().timestamp_millis();
+    let created = client
+        .post(format!("{http_url}/orders"))
+        .json(&create_order_request(1, None))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<CreateOrderResponse>()
+        .await
+        .unwrap();
+    let after = chrono::Utc::now().timestamp_millis();
+    let default_ttl_ms = i64::from(DEFAULT_ORDER_TTL_SECONDS) * 1_000;
+
+    assert!(created.expires_at_ms >= before + default_ttl_ms);
+    assert!(created.expires_at_ms <= after + default_ttl_ms);
+
+    for (n, ttl_seconds) in [
+        (2, MIN_ORDER_TTL_SECONDS - 1),
+        (3, MAX_ORDER_TTL_SECONDS + 1),
+    ] {
+        let response = client
+            .post(format!("{http_url}/orders"))
+            .json(&create_order_request(n, Some(ttl_seconds)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    }
 
     server.abort();
 }

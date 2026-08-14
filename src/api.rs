@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use alloy_primitives::U256;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
@@ -12,8 +13,9 @@ use uuid::Uuid;
 use crate::core::command::Command;
 use crate::core::engine::{OrderError, OrderbookHandle, ServiceError, SolverProofDelivery};
 use crate::core::events::OrderEvent;
+use crate::core::guards::{OrderPolicy, resolve_expiry_ms};
 use crate::logging::short_id;
-use crate::order::{Order, OrderCommitment, OrderId, SolverId, TradeTerms, TxHash};
+use crate::order::{Order, OrderCommitment, OrderId, SolverId, TokenAddress, TradeTerms, TxHash};
 use crate::registry::SolverRegistry;
 use crate::storage::RepositoryError;
 
@@ -24,18 +26,23 @@ pub const SOLVER_ADDRESS_HEADER: &str = "x-solver-address";
 struct ApiState {
     orderbook: OrderbookHandle,
     registry: SolverRegistry,
+    order_policy: OrderPolicy,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateOrderRequest {
     pub order_commitment: OrderCommitment,
-    #[serde(flatten)]
-    pub terms: TradeTerms,
+    pub token_in: TokenAddress,
+    pub token_out: TokenAddress,
+    pub amount_in: U256,
+    pub amount_out: U256,
+    pub ttl_seconds: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateOrderResponse {
     pub order_id: OrderId,
+    pub expires_at_ms: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,6 +78,14 @@ pub enum UserEventServerMessage {
 }
 
 pub fn router(orderbook: OrderbookHandle, registry: SolverRegistry) -> Router {
+    router_with_policy(orderbook, registry, OrderPolicy::default())
+}
+
+pub fn router_with_policy(
+    orderbook: OrderbookHandle,
+    registry: SolverRegistry,
+    order_policy: OrderPolicy,
+) -> Router {
     Router::new()
         .route("/orders", post(create_order))
         .route("/orders/{order_id}", get(get_order))
@@ -93,6 +108,7 @@ pub fn router(orderbook: OrderbookHandle, registry: SolverRegistry) -> Router {
         .with_state(ApiState {
             orderbook,
             registry,
+            order_policy,
         })
 }
 
@@ -101,15 +117,28 @@ async fn create_order(
     Json(request): Json<CreateOrderRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let order_id = Uuid::new_v4();
-    let terms = request.terms;
+    let expires_at_ms = resolve_expiry_ms(
+        request.ttl_seconds,
+        chrono::Utc::now().timestamp_millis(),
+        state.order_policy,
+    )
+    .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    let terms = TradeTerms {
+        token_in: request.token_in,
+        token_out: request.token_out,
+        amount_in: request.amount_in,
+        amount_out: request.amount_out,
+        expires_at_ms,
+    };
     crate::service_log!(
         "orderbook",
-        "create request order={} token_in={} token_out={} amount_in={} amount_out={}",
+        "create request order={} token_in={} token_out={} amount_in={} amount_out={} expires_at_ms={}",
         short_id(order_id),
         terms.token_in,
         terms.token_out,
         terms.amount_in,
-        terms.amount_out
+        terms.amount_out,
+        terms.expires_at_ms
     );
     state
         .orderbook
@@ -122,7 +151,13 @@ async fn create_order(
         .map_err(status_for_error)?;
 
     crate::service_log!("orderbook", "create accepted order={}", short_id(order_id));
-    Ok((StatusCode::CREATED, Json(CreateOrderResponse { order_id })))
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateOrderResponse {
+            order_id,
+            expires_at_ms,
+        }),
+    ))
 }
 
 async fn get_order(
