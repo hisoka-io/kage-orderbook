@@ -16,6 +16,7 @@ use crate::core::events::OrderEvent;
 use crate::core::guards::{CreateOrderInput, OrderPolicy, validate_create_order};
 use crate::logging::short_id;
 use crate::order::{Order, OrderCommitment, OrderId, SolverId, TokenAddress, TxHash};
+use crate::pricing::{PriceValidationError, PricingValidator};
 use crate::registry::SolverRegistry;
 use crate::storage::RepositoryError;
 
@@ -27,6 +28,7 @@ struct ApiState {
     orderbook: OrderbookHandle,
     registry: SolverRegistry,
     order_policy: OrderPolicy,
+    pricing_validator: Option<PricingValidator>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +103,24 @@ pub fn router_with_policy(
     registry: SolverRegistry,
     order_policy: OrderPolicy,
 ) -> Router {
+    router_with_state(orderbook, registry, order_policy, None)
+}
+
+pub fn router_with_pricing(
+    orderbook: OrderbookHandle,
+    registry: SolverRegistry,
+    order_policy: OrderPolicy,
+    pricing_validator: PricingValidator,
+) -> Router {
+    router_with_state(orderbook, registry, order_policy, Some(pricing_validator))
+}
+
+fn router_with_state(
+    orderbook: OrderbookHandle,
+    registry: SolverRegistry,
+    order_policy: OrderPolicy,
+    pricing_validator: Option<PricingValidator>,
+) -> Router {
     Router::new()
         .route("/orders", post(create_order))
         .route("/orders/{order_id}", get(get_order))
@@ -124,6 +144,7 @@ pub fn router_with_policy(
             orderbook,
             registry,
             order_policy,
+            pricing_validator,
         })
 }
 
@@ -140,6 +161,30 @@ async fn create_order(
     )
     .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
     let terms = validated.terms;
+
+    let existing = state
+        .orderbook
+        .find_order_by_commitment(validated.order_commitment)
+        .await
+        .map_err(status_for_error)?;
+    if existing.is_none()
+        && let Some(validator) = &state.pricing_validator
+        && let Err(error) = validator.validate(&terms)
+    {
+        let status = status_for_price_validation(&error);
+        crate::service_error!(
+            "orderbook",
+            "create rejected request={} chain_id={} token_in={} token_out={} amount_in={} amount_out={} status={} reason={error}",
+            short_id(order_id),
+            terms.chain_id,
+            terms.token_in,
+            terms.token_out,
+            terms.amount_in,
+            terms.amount_out,
+            status.as_u16()
+        );
+        return Err(status);
+    }
 
     crate::service_log!(
         "orderbook",
@@ -328,14 +373,20 @@ async fn solver_events_ws(
 ) -> Result<impl IntoResponse, StatusCode> {
     let solver_id = solver_id_from_headers(&headers)?;
     let events = state.orderbook.subscribe();
-    Ok(ws.on_upgrade(move |socket| {
-        forward_service_events(socket, events, ServiceStream::Solver(solver_id))
+    Ok(ws.on_upgrade(move |socket| async move {
+        crate::service_log!("orderbook", "solver connected solver={solver_id}");
+        forward_service_events(socket, events, ServiceStream::Solver(solver_id)).await;
+        crate::service_log!("orderbook", "solver disconnected solver={solver_id}");
     }))
 }
 
 async fn chain_events_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) -> impl IntoResponse {
     let events = state.orderbook.subscribe();
-    ws.on_upgrade(move |socket| forward_service_events(socket, events, ServiceStream::Chain))
+    ws.on_upgrade(move |socket| async move {
+        crate::service_log!("orderbook", "chain connected");
+        forward_service_events(socket, events, ServiceStream::Chain).await;
+        crate::service_log!("orderbook", "chain disconnected");
+    })
 }
 
 async fn forward_user_events(
@@ -474,5 +525,14 @@ fn status_for_error(error: ServiceError) -> StatusCode {
         ServiceError::Order(OrderError::AlreadyExists | OrderError::InvalidState) => {
             StatusCode::CONFLICT
         }
+    }
+}
+
+fn status_for_price_validation(error: &PriceValidationError) -> StatusCode {
+    match error {
+        PriceValidationError::Pricing(_) => StatusCode::SERVICE_UNAVAILABLE,
+        PriceValidationError::UnsupportedMarket
+        | PriceValidationError::Arithmetic
+        | PriceValidationError::DeviationExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }

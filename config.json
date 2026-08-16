@@ -1,0 +1,62 @@
+{
+  "order": {
+    "default_ttl_seconds": 60,
+    "min_ttl_seconds": 5,
+    "max_ttl_seconds": 300
+  },
+  "database": {
+    "max_connections": 1,
+    "busy_timeout_ms": 5000
+  },
+  "runtime": {
+    "command_capacity": 256
+  },
+  "pricing": {
+    "max_age_ms": 5000,
+    "reconnect_delay_ms": 1000,
+    "idle_timeout_ms": 30000
+  },
+  "chains": [
+    {
+      "chain_id": 31337,
+      "name": "local",
+      "tokens": [
+        {
+          "symbol": "ETH",
+          "address": "0x0101010101010101010101010101010101010101",
+          "decimals": 18,
+          "pricing_asset": "ETH",
+          "max_price_deviation_bps": 50
+        },
+        {
+          "symbol": "USDC",
+          "address": "0x0202020202020202020202020202020202020202",
+          "decimals": 6,
+          "pricing_asset": "USDC",
+          "max_price_deviation_bps": 20
+        },
+        {
+          "symbol": "USDT",
+          "address": "0x0303030303030303030303030303030303030303",
+          "decimals": 6,
+          "pricing_asset": "USDT",
+          "max_price_deviation_bps": 20
+        },
+        {
+          "symbol": "LINK",
+          "address": "0x0404040404040404040404040404040404040404",
+          "decimals": 18,
+          "pricing_asset": "LINK",
+          "max_price_deviation_bps": 50
+        }
+      ],
+      "markets": [
+        {
+          "token_in": "ETH",
+          "token_out": "USDC",
+          "max_price_deviation_bps": 20
+        }
+      ]
+    }
+  ]
+}

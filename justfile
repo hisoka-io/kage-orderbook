@@ -12,6 +12,12 @@ lint:
 test:
     cargo test
 
+mock-order:
+    ./scripts/mock-order.sh
+
+wrong-quote:
+    ./scripts/wrong-quote.sh
+
 ci:
     cargo fmt --check
     cargo clippy --all-targets -- -D warnings

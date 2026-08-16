@@ -19,3 +19,7 @@ orderbook.db-wal
 
 
 /mem
+
+.env
+.env.*
+!.env.example

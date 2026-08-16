@@ -50,14 +50,22 @@ pub struct OrderRepository {
 
 impl OrderRepository {
     pub async fn connect(database_url: &str) -> Result<Self, RepositoryError> {
+        Self::connect_with_options(database_url, Duration::from_secs(5), 1).await
+    }
+
+    pub async fn connect_with_options(
+        database_url: &str,
+        busy_timeout: Duration,
+        max_connections: u32,
+    ) -> Result<Self, RepositoryError> {
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full)
             .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(busy_timeout);
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(max_connections)
             .connect_with(options)
             .await?;
         let repository = Self { pool };

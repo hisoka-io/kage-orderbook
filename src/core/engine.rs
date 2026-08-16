@@ -333,6 +333,10 @@ enum Request {
         order_commitment: OrderCommitment,
         reply: oneshot::Sender<Result<Option<Order>, RepositoryError>>,
     },
+    FindOrderByCommitment {
+        order_commitment: OrderCommitment,
+        reply: oneshot::Sender<Result<Option<Order>, RepositoryError>>,
+    },
     ExecuteAuthorized {
         command: Command,
         order_commitment: OrderCommitment,
@@ -416,6 +420,25 @@ impl OrderbookHandle {
         self.requests
             .send(Request::GetOrderByCommitment {
                 order_id,
+                order_commitment,
+                reply,
+            })
+            .await
+            .map_err(|_| ServiceError::Closed)?;
+
+        result
+            .await
+            .map_err(|_| ServiceError::Closed)?
+            .map_err(ServiceError::Repository)
+    }
+
+    pub async fn find_order_by_commitment(
+        &self,
+        order_commitment: OrderCommitment,
+    ) -> Result<Option<Order>, ServiceError> {
+        let (reply, result) = oneshot::channel();
+        self.requests
+            .send(Request::FindOrderByCommitment {
                 order_commitment,
                 reply,
             })
@@ -575,6 +598,16 @@ pub async fn start_orderbook_with_repository(
                 } => {
                     let result = repository
                         .get_order_by_commitment(order_id, order_commitment)
+                        .await
+                        .map(|stored| stored.map(|stored| stored.order));
+                    let _ = reply.send(result);
+                }
+                Request::FindOrderByCommitment {
+                    order_commitment,
+                    reply,
+                } => {
+                    let result = repository
+                        .find_order_by_commitment(order_commitment)
                         .await
                         .map(|stored| stored.map(|stored| stored.order));
                     let _ = reply.send(result);
