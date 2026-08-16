@@ -63,4 +63,18 @@ impl SolverRegistry {
             }
         }
     }
+
+    pub async fn health(&self) -> Result<(), RegistryError> {
+        match self.backend.as_ref() {
+            RegistryBackend::Static(_) => Ok(()),
+            RegistryBackend::Http { client, base_url } => {
+                client
+                    .get(format!("{base_url}/health"))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                Ok(())
+            }
+        }
+    }
 }

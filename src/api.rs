@@ -17,6 +17,7 @@ use crate::core::guards::{CreateOrderInput, OrderPolicy, validate_create_order};
 use crate::logging::short_id;
 use crate::order::{Order, OrderCommitment, OrderId, SolverId, TokenAddress, TxHash};
 use crate::pricing::{PriceValidationError, PricingValidator};
+use crate::readiness::{ReadinessSnapshot, ServiceReadiness};
 use crate::registry::SolverRegistry;
 use crate::storage::RepositoryError;
 
@@ -29,6 +30,7 @@ struct ApiState {
     registry: SolverRegistry,
     order_policy: OrderPolicy,
     pricing_validator: Option<PricingValidator>,
+    readiness: ServiceReadiness,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +63,16 @@ pub struct CreateOrderResponse {
     pub order_id: OrderId,
     pub expires_at_ms: i64,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ApiErrorResponse {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<String>,
+}
+
+type ApiError = (StatusCode, Json<ApiErrorResponse>);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EncryptedProofRequest {
@@ -103,7 +115,13 @@ pub fn router_with_policy(
     registry: SolverRegistry,
     order_policy: OrderPolicy,
 ) -> Router {
-    router_with_state(orderbook, registry, order_policy, None)
+    router_with_state(
+        orderbook,
+        registry,
+        order_policy,
+        None,
+        ServiceReadiness::always_ready(),
+    )
 }
 
 pub fn router_with_pricing(
@@ -112,7 +130,29 @@ pub fn router_with_pricing(
     order_policy: OrderPolicy,
     pricing_validator: PricingValidator,
 ) -> Router {
-    router_with_state(orderbook, registry, order_policy, Some(pricing_validator))
+    router_with_state(
+        orderbook,
+        registry,
+        order_policy,
+        Some(pricing_validator),
+        ServiceReadiness::always_ready(),
+    )
+}
+
+pub fn router_with_readiness(
+    orderbook: OrderbookHandle,
+    registry: SolverRegistry,
+    order_policy: OrderPolicy,
+    pricing_validator: PricingValidator,
+    readiness: ServiceReadiness,
+) -> Router {
+    router_with_state(
+        orderbook,
+        registry,
+        order_policy,
+        Some(pricing_validator),
+        readiness,
+    )
 }
 
 fn router_with_state(
@@ -120,8 +160,11 @@ fn router_with_state(
     registry: SolverRegistry,
     order_policy: OrderPolicy,
     pricing_validator: Option<PricingValidator>,
+    readiness: ServiceReadiness,
 ) -> Router {
     Router::new()
+        .route("/health/live", get(liveness))
+        .route("/health/ready", get(readiness_health))
         .route("/orders", post(create_order))
         .route("/orders/{order_id}", get(get_order))
         .route("/solver/jobs", get(reserving_orders))
@@ -145,13 +188,28 @@ fn router_with_state(
             registry,
             order_policy,
             pricing_validator,
+            readiness,
         })
+}
+
+async fn liveness() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn readiness_health(State(state): State<ApiState>) -> (StatusCode, Json<ReadinessSnapshot>) {
+    let snapshot = state.readiness.snapshot();
+    let status = if snapshot.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(snapshot))
 }
 
 async fn create_order(
     State(state): State<ApiState>,
     Json(request): Json<CreateOrderRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, ApiError> {
     let order_id = Uuid::new_v4();
 
     let validated = validate_create_order(
@@ -159,31 +217,59 @@ async fn create_order(
         chrono::Utc::now().timestamp_millis(),
         &state.order_policy,
     )
-    .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    .map_err(|error| {
+        api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_order",
+            error.to_string(),
+            Vec::new(),
+        )
+    })?;
     let terms = validated.terms;
 
     let existing = state
         .orderbook
         .find_order_by_commitment(validated.order_commitment)
         .await
-        .map_err(status_for_error)?;
-    if existing.is_none()
-        && let Some(validator) = &state.pricing_validator
-        && let Err(error) = validator.validate(&terms)
-    {
-        let status = status_for_price_validation(&error);
-        crate::service_error!(
-            "orderbook",
-            "create rejected request={} chain_id={} token_in={} token_out={} amount_in={} amount_out={} status={} reason={error}",
-            short_id(order_id),
-            terms.chain_id,
-            terms.token_in,
-            terms.token_out,
-            terms.amount_in,
-            terms.amount_out,
-            status.as_u16()
-        );
-        return Err(status);
+        .map_err(api_error_for_service)?;
+    if existing.is_none() {
+        let readiness = state.readiness.snapshot();
+        if !readiness.ready {
+            crate::service_error!(
+                "orderbook",
+                "create rejected request={} status=503 reason=service_not_ready missing={}",
+                short_id(order_id),
+                readiness.missing.join(",")
+            );
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_not_ready",
+                "orderbook is not accepting new orders",
+                readiness.missing,
+            ));
+        }
+        if let Some(validator) = &state.pricing_validator
+            && let Err(error) = validator.validate(&terms)
+        {
+            let status = status_for_price_validation(&error);
+            crate::service_error!(
+                "orderbook",
+                "create rejected request={} chain_id={} token_in={} token_out={} amount_in={} amount_out={} status={} reason={error}",
+                short_id(order_id),
+                terms.chain_id,
+                terms.token_in,
+                terms.token_out,
+                terms.amount_in,
+                terms.amount_out,
+                status.as_u16()
+            );
+            let code = if matches!(error, PriceValidationError::Pricing(_)) {
+                "pricing_unavailable"
+            } else {
+                "invalid_quote"
+            };
+            return Err(api_error(status, code, error.to_string(), Vec::new()));
+        }
     }
 
     crate::service_log!(
@@ -202,11 +288,15 @@ async fn create_order(
         .orderbook
         .create_order(order_id, validated.order_commitment, terms)
         .await
-        .map_err(status_for_error)?;
-    let expires_at_ms = outcome
-        .order
-        .expires_at_ms
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(api_error_for_service)?;
+    let expires_at_ms = outcome.order.expires_at_ms.ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_order_state",
+            "created order is missing its expiry",
+            Vec::new(),
+        )
+    })?;
     let status = if outcome.created {
         crate::service_log!("orderbook", "create accepted order={}", short_id(order_id));
         StatusCode::CREATED
@@ -372,19 +462,35 @@ async fn solver_events_ws(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
     let solver_id = solver_id_from_headers(&headers)?;
+    let profile = state
+        .registry
+        .get(solver_id)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .filter(|profile| profile.active)
+        .ok_or(StatusCode::FORBIDDEN)?;
+    if profile.noise_key == alloy_primitives::B256::ZERO {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let events = state.orderbook.subscribe();
+    let readiness = state.readiness.clone();
     Ok(ws.on_upgrade(move |socket| async move {
+        let connection = readiness.solver_connection();
         crate::service_log!("orderbook", "solver connected solver={solver_id}");
         forward_service_events(socket, events, ServiceStream::Solver(solver_id)).await;
+        drop(connection);
         crate::service_log!("orderbook", "solver disconnected solver={solver_id}");
     }))
 }
 
 async fn chain_events_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) -> impl IntoResponse {
     let events = state.orderbook.subscribe();
+    let readiness = state.readiness.clone();
     ws.on_upgrade(move |socket| async move {
+        let connection = readiness.chain_connection();
         crate::service_log!("orderbook", "chain connected");
         forward_service_events(socket, events, ServiceStream::Chain).await;
+        drop(connection);
         crate::service_log!("orderbook", "chain disconnected");
     })
 }
@@ -463,29 +569,38 @@ async fn forward_service_events(
     stream: ServiceStream,
 ) {
     loop {
-        let event = match events.recv().await {
-            Ok(event) => event,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-        };
-
-        let relevant = match stream {
-            ServiceStream::Solver(solver_id) => match &event {
-                OrderEvent::SolverReservationRequested { .. } => true,
-                OrderEvent::ProofRelayed {
-                    solver_id: assigned,
-                    ..
-                } => *assigned == solver_id,
-                _ => false,
+        tokio::select! {
+            message = socket.recv() => match message {
+                Some(Ok(Message::Ping(payload))) => {
+                    if socket.send(Message::Pong(payload)).await.is_err() {
+                        return;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                Some(Ok(_)) => {}
             },
-            ServiceStream::Chain => matches!(event, OrderEvent::ExecutionStarted { .. }),
-        };
-        if !relevant {
-            continue;
-        }
+            event = events.recv() => {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                };
 
-        if send_json(&mut socket, &event).await.is_err() {
-            return;
+                let relevant = match stream {
+                    ServiceStream::Solver(solver_id) => match &event {
+                        OrderEvent::SolverReservationRequested { .. } => true,
+                        OrderEvent::ProofRelayed {
+                            solver_id: assigned,
+                            ..
+                        } => *assigned == solver_id,
+                        _ => false,
+                    },
+                    ServiceStream::Chain => matches!(event, OrderEvent::ExecutionStarted { .. }),
+                };
+                if relevant && send_json(&mut socket, &event).await.is_err() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -534,5 +649,177 @@ fn status_for_price_validation(error: &PriceValidationError) -> StatusCode {
         PriceValidationError::UnsupportedMarket
         | PriceValidationError::Arithmetic
         | PriceValidationError::DeviationExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+    }
+}
+
+fn api_error(
+    status: StatusCode,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    missing: Vec<String>,
+) -> ApiError {
+    (
+        status,
+        Json(ApiErrorResponse {
+            code: code.into(),
+            message: message.into(),
+            missing,
+        }),
+    )
+}
+
+fn api_error_for_service(error: ServiceError) -> ApiError {
+    let status = status_for_error(error);
+    let message = match status {
+        StatusCode::SERVICE_UNAVAILABLE => "order service is unavailable",
+        StatusCode::UNPROCESSABLE_ENTITY => "order failed lifecycle validation",
+        StatusCode::NOT_FOUND => "order was not found",
+        StatusCode::CONFLICT => "order conflicts with its current state",
+        _ => "order request failed",
+    };
+    api_error(status, "order_service_error", message, Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{Address, B256, U256};
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::{core::engine::start_orderbook, readiness::ServiceReadiness};
+
+    fn request(commitment: u8) -> CreateOrderRequest {
+        CreateOrderRequest {
+            order_commitment: B256::repeat_byte(commitment),
+            chain_id: crate::core::guards::MOCK_CHAIN_ID,
+            token_in: Address::repeat_byte(1),
+            token_out: Address::repeat_byte(2),
+            amount_in: U256::from(1_u8),
+            amount_out: U256::from(2_u8),
+            ttl_seconds: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_gates_only_new_order_admission() {
+        let readiness = ServiceReadiness::new();
+        let orderbook = start_orderbook("sqlite::memory:").await.unwrap();
+        let inspection = orderbook.clone();
+        let app = router_with_state(
+            orderbook,
+            SolverRegistry::from_profiles([]),
+            OrderPolicy::default(),
+            None,
+            readiness.clone(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}");
+
+        assert_eq!(
+            client
+                .get(format!("{url}/health/live"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(format!("{url}/health/ready"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        readiness.set_pricing(true);
+        readiness.set_registry(true);
+        readiness.set_actor(true);
+        let solver = readiness.solver_connection();
+        let chain = readiness.chain_connection();
+        assert_eq!(
+            client
+                .get(format!("{url}/health/ready"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let accepted = request(1);
+        assert_eq!(
+            client
+                .post(format!("{url}/orders"))
+                .json(&accepted)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+
+        drop(chain);
+        let rejected = request(2);
+        let response = client
+            .post(format!("{url}/orders"))
+            .json(&rejected)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let error = response.json::<ApiErrorResponse>().await.unwrap();
+        assert_eq!(error.code, "service_not_ready");
+        assert_eq!(error.missing, vec!["chain"]);
+        assert!(
+            inspection
+                .find_order_by_commitment(rejected.order_commitment)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let _chain = readiness.chain_connection();
+        assert_eq!(
+            client
+                .post(format!("{url}/orders"))
+                .json(&rejected)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+
+        drop(solver);
+        assert_eq!(
+            client
+                .post(format!("{url}/orders"))
+                .json(&accepted)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{url}/orders"))
+                .json(&request(3))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        server.abort();
     }
 }

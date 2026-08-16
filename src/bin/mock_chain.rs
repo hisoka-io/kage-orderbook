@@ -47,6 +47,7 @@ async fn main() {
         std::env::var("MOCK_REGISTRY_ADDRESS").unwrap_or_else(|_| "127.0.0.1:4000".to_owned());
     let registry = Router::new()
         .route("/solvers/{solver_id}", get(solver_profile))
+        .route("/health", get(health))
         .with_state(MockRegistry {
             solver_id,
             profile: SolverProfile {
@@ -66,6 +67,10 @@ async fn main() {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+async fn health() -> AxumStatusCode {
+    AxumStatusCode::NO_CONTENT
 }
 
 async fn solver_profile(

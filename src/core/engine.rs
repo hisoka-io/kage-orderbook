@@ -368,6 +368,10 @@ pub enum ServiceError {
 }
 
 impl OrderbookHandle {
+    pub fn is_available(&self) -> bool {
+        !self.requests.is_closed()
+    }
+
     pub async fn create_order(
         &self,
         order_id: OrderId,

@@ -8,6 +8,7 @@ use kage_orderbook::core::engine::SolverProofDelivery;
 use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
 use kage_orderbook::order::{Order, OrderId, SolverId};
+use kage_orderbook::readiness::ReadinessSnapshot;
 use reqwest::StatusCode;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -33,9 +34,29 @@ async fn main() {
 
     kage_orderbook::service_log!("solver", "started solver={solver_id}");
 
+    let mut waiting_for = None;
     loop {
-        if let Err(error) = run(&http_url, &ws_url, solver_id, &noise_key).await {
-            kage_orderbook::service_error!("solver", "disconnected error={error}");
+        let mut connected = false;
+        let result = run(&http_url, &ws_url, solver_id, &noise_key, &mut connected).await;
+        if connected {
+            waiting_for = None;
+        }
+        if let Err(error) = result {
+            if is_service_unavailable(&error) {
+                let missing = missing_dependencies(&http_url)
+                    .await
+                    .unwrap_or_else(|| "unknown".to_owned());
+                if waiting_for.as_deref() != Some(missing.as_str()) {
+                    kage_orderbook::service_log!(
+                        "solver",
+                        "waiting reason=orderbook_not_ready missing={missing} retry_in_ms=1000"
+                    );
+                    waiting_for = Some(missing);
+                }
+            } else {
+                waiting_for = None;
+                kage_orderbook::service_error!("solver", "connection failed error={error}");
+            }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -46,6 +67,7 @@ async fn run(
     ws_url: &str,
     solver_id: SolverId,
     noise_key: &[u8],
+    connected: &mut bool,
 ) -> Result<(), BoxError> {
     let client = reqwest::Client::new();
     let mut ws_request = ws_url.into_client_request()?;
@@ -54,6 +76,8 @@ async fn run(
         HeaderValue::from_str(&solver_id.to_string())?,
     );
     let (mut socket, _) = connect_async(ws_request).await?;
+    *connected = true;
+    kage_orderbook::service_log!("solver", "connected orderbook={http_url}");
     let jobs = client
         .get(format!("{http_url}/solver/jobs"))
         .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
@@ -95,6 +119,38 @@ async fn run(
     }
 
     Ok(())
+}
+
+fn is_service_unavailable(error: &BoxError) -> bool {
+    if error
+        .downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status)
+        .is_some_and(|status| status == StatusCode::SERVICE_UNAVAILABLE)
+    {
+        return true;
+    }
+
+    matches!(
+        error.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+        Some(tokio_tungstenite::tungstenite::Error::Http(response))
+            if response.status()
+                == tokio_tungstenite::tungstenite::http::StatusCode::SERVICE_UNAVAILABLE
+    )
+}
+
+async fn missing_dependencies(http_url: &str) -> Option<String> {
+    let snapshot = reqwest::get(format!("{http_url}/health/ready"))
+        .await
+        .ok()?
+        .json::<ReadinessSnapshot>()
+        .await
+        .ok()?;
+    let missing = snapshot
+        .missing
+        .into_iter()
+        .filter(|dependency| dependency != "solver")
+        .collect::<Vec<_>>();
+    (!missing.is_empty()).then(|| missing.join(","))
 }
 
 async fn reserve(

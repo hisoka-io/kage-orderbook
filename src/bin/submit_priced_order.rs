@@ -2,7 +2,7 @@ use std::{error::Error, io, time::Duration};
 
 use alloy_primitives::{B256, U256, U512};
 use kage_orderbook::{
-    api::{CreateOrderRequest, CreateOrderResponse},
+    api::{ApiErrorResponse, CreateOrderRequest, CreateOrderResponse},
     config::AppConfig,
     pricing::{self, PricingConfig},
 };
@@ -12,7 +12,14 @@ use uuid::Uuid;
 type BoxError = Box<dyn Error + Send + Sync>;
 
 #[tokio::main]
-async fn main() -> Result<(), BoxError> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("submit-priced-order failed: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), BoxError> {
     dotenvy::dotenv().ok();
     let wrong_quote = parse_args()?;
     let config = AppConfig::load()?;
@@ -98,7 +105,9 @@ async fn main() -> Result<(), BoxError> {
     let status = response.status();
     if wrong_quote {
         if status != StatusCode::UNPROCESSABLE_ENTITY {
-            return Err(invalid(format!("expected 422, received {status}")).into());
+            return Err(response_error(response, "expected quote rejection")
+                .await
+                .into());
         }
         println!(
             "wrong quote rejected: status={status} market={}→{} amount_in={} fair_amount_out={} submitted_amount_out={} limit_bps={} submitted_deviation_bps={}",
@@ -112,7 +121,9 @@ async fn main() -> Result<(), BoxError> {
         );
     } else {
         if status != StatusCode::CREATED && status != StatusCode::OK {
-            return Err(invalid(format!("expected 201/200, received {status}")).into());
+            return Err(response_error(response, "order was not accepted")
+                .await
+                .into());
         }
         let created = response.json::<CreateOrderResponse>().await?;
         println!(
@@ -121,6 +132,23 @@ async fn main() -> Result<(), BoxError> {
         );
     }
     Ok(())
+}
+
+async fn response_error(response: reqwest::Response, fallback: &str) -> io::Error {
+    let status = response.status();
+    match response.json::<ApiErrorResponse>().await {
+        Ok(error) if error.code == "service_not_ready" && !error.missing.is_empty() => {
+            io::Error::other(format!(
+                "orderbook is not ready; missing dependencies: {} ({status})",
+                error.missing.join(", ")
+            ))
+        }
+        Ok(error) => io::Error::other(format!(
+            "{fallback}: {} [{}] ({status})",
+            error.message, error.code
+        )),
+        Err(_) => io::Error::other(format!("{fallback} ({status})")),
+    }
 }
 
 fn parse_args() -> Result<bool, io::Error> {

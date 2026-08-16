@@ -4,6 +4,7 @@ use kage_orderbook::api;
 use kage_orderbook::config::AppConfig;
 use kage_orderbook::core::engine::start_orderbook_with_repository;
 use kage_orderbook::pricing::{self, PricingConfig, PricingValidator};
+use kage_orderbook::readiness::ServiceReadiness;
 use kage_orderbook::registry::SolverRegistry;
 use kage_orderbook::storage::OrderRepository;
 use tokio::net::TcpListener;
@@ -26,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reconnect_delay: Duration::from_millis(config.pricing.reconnect_delay_ms),
         idle_timeout: Duration::from_millis(config.pricing.idle_timeout_ms),
     });
-    let pricing_validator = PricingValidator::new(pricing, &config);
+    let pricing_validator = PricingValidator::new(pricing.clone(), &config);
     let repository = OrderRepository::connect_with_options(
         &database_url,
         Duration::from_millis(config.database.busy_timeout_ms),
@@ -35,11 +36,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let orderbook =
         start_orderbook_with_repository(repository, config.runtime.command_capacity).await?;
-    let app = api::router_with_pricing(
+    let registry = SolverRegistry::http(registry_url);
+    let readiness = ServiceReadiness::new();
+    readiness.monitor_pricing(pricing, Duration::from_millis(250));
+    readiness.monitor_registry(registry.clone(), Duration::from_secs(1));
+    readiness.monitor_actor(orderbook.clone(), Duration::from_millis(250));
+    let app = api::router_with_readiness(
         orderbook,
-        SolverRegistry::http(registry_url),
+        registry,
         config.order_policy(),
         pricing_validator,
+        readiness,
     );
     let listener = TcpListener::bind(&listen_address).await?;
 
