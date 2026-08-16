@@ -3,16 +3,17 @@ use std::error::Error;
 use std::io;
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{B256, U256, U512};
 use futures_util::{SinkExt, StreamExt};
 use kage_orderbook::api::{
     CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest, ORDER_COMMITMENT_HEADER,
     UserEventClientMessage, UserEventServerMessage,
 };
+use kage_orderbook::config::AppConfig;
 use kage_orderbook::core::events::OrderEvent;
-use kage_orderbook::core::guards::MOCK_CHAIN_ID;
 use kage_orderbook::logging::short_id;
-use kage_orderbook::order::{Order, OrderId, OrderState, TradeTerms};
+use kage_orderbook::order::{Order, OrderId, OrderState};
+use kage_orderbook::pricing::{self, PricePoint, PricingConfig, PricingHandle};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use uuid::Uuid;
@@ -97,16 +98,11 @@ impl Generator {
         self.0
     }
 
-    fn terms(&mut self) -> TradeTerms {
-        let amount_in = self.next() % 1_000 + 1;
-        TradeTerms {
-            chain_id: MOCK_CHAIN_ID,
-            token_in: Address::repeat_byte(1),
-            token_out: Address::repeat_byte(2),
-            amount_in: U256::from(amount_in),
-            amount_out: U256::from(amount_in * 2),
-            expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
-        }
+    fn amount_in(&mut self, decimals: u8) -> Result<U256, io::Error> {
+        let whole_tokens = self.next() % 10 + 1;
+        pow10(decimals)?
+            .checked_mul(U256::from(whole_tokens))
+            .ok_or_else(|| invalid("mock amount overflow"))
     }
 }
 
@@ -119,9 +115,37 @@ fn new_order_commitment() -> B256 {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let config = Config::from_args()?;
+    dotenvy::dotenv().ok();
+    let options = Config::from_args()?;
+    let app_config = AppConfig::load()?;
+    let chain = app_config
+        .chains
+        .first()
+        .ok_or_else(|| invalid("no configured chain"))?;
+    let market = chain
+        .markets
+        .first()
+        .ok_or_else(|| invalid("no configured market"))?;
+    let token_in = chain
+        .tokens
+        .iter()
+        .find(|token| token.symbol == market.token_in)
+        .ok_or_else(|| invalid("market input token is missing"))?;
+    let token_out = chain
+        .tokens
+        .iter()
+        .find(|token| token.symbol == market.token_out)
+        .ok_or_else(|| invalid("market output token is missing"))?;
+    let mut pricing = pricing::spawn(PricingConfig {
+        feed_url: std::env::var("KAGE_PRICING_FEED_URL")?,
+        token: std::env::var("KAGE_PRICING_FEED_TOKEN")?,
+        assets: app_config.pricing_assets(),
+        max_age: Duration::from_millis(app_config.pricing.max_age_ms),
+        reconnect_delay: Duration::from_millis(app_config.pricing.reconnect_delay_ms),
+        idle_timeout: Duration::from_millis(app_config.pricing.idle_timeout_ms),
+    });
     let client = reqwest::Client::new();
-    let (socket, _) = connect_async(&config.ws_url).await?;
+    let (socket, _) = connect_async(&options.ws_url).await?;
     let (mut socket_tx, mut socket_rx) = socket.split();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (subscription_tx, mut subscription_rx) = mpsc::unbounded_channel();
@@ -161,22 +185,35 @@ async fn main() -> Result<(), BoxError> {
         }
     });
 
-    let mut generator = Generator(config.seed);
+    let mut generator = Generator(options.seed);
     let mut orders = HashMap::new();
 
-    for index in 0..config.orders {
-        let terms = generator.terms();
+    for index in 0..options.orders {
+        let (price_in, price_out) = wait_for_prices(
+            &mut pricing,
+            &token_in.pricing_asset,
+            &token_out.pricing_asset,
+        )
+        .await?;
+        let amount_in = generator.amount_in(token_in.decimals)?;
+        let amount_out = fair_output(
+            amount_in,
+            price_in.price_e18,
+            price_out.price_e18,
+            token_in.decimals,
+            token_out.decimals,
+        )?;
         let request = CreateOrderRequest {
             order_commitment: new_order_commitment(),
-            chain_id: terms.chain_id,
-            token_in: terms.token_in,
-            token_out: terms.token_out,
-            amount_in: terms.amount_in,
-            amount_out: terms.amount_out,
+            chain_id: chain.chain_id,
+            token_in: token_in.address,
+            token_out: token_out.address,
+            amount_in,
+            amount_out,
             ttl_seconds: None,
         };
         let response = client
-            .post(format!("{}/orders", config.http_url))
+            .post(format!("{}/orders", options.http_url))
             .json(&request)
             .send()
             .await?
@@ -205,31 +242,31 @@ async fn main() -> Result<(), BoxError> {
             "user",
             "created order={} token_in={} token_out={} amount_in={} amount_out={} expires_at_ms={}",
             short_id(response.order_id),
-            terms.token_in,
-            terms.token_out,
-            terms.amount_in,
-            terms.amount_out,
+            request.token_in,
+            request.token_out,
+            request.amount_in,
+            request.amount_out,
             response.expires_at_ms
         );
         orders.insert(response.order_id, request.order_commitment);
 
-        if index + 1 < config.orders {
-            tokio::time::sleep(config.interval).await;
+        if index + 1 < options.orders {
+            tokio::time::sleep(options.interval).await;
         }
     }
 
     let trails = wait_for_filled(
         &client,
-        &config.http_url,
+        &options.http_url,
         &mut event_rx,
         &orders,
-        config.timeout,
+        options.timeout,
     )
     .await?;
 
     for (order_id, order_commitment) in &orders {
         let order = client
-            .get(format!("{}/orders/{order_id}", config.http_url))
+            .get(format!("{}/orders/{order_id}", options.http_url))
             .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
             .send()
             .await?
@@ -259,7 +296,7 @@ async fn main() -> Result<(), BoxError> {
         "user",
         "{}/{} orders reached Filled",
         orders.len(),
-        config.orders
+        options.orders
     );
 
     reader.abort();
@@ -277,6 +314,33 @@ async fn wait_for_filled(
         let mut filled = HashSet::new();
         let mut proofs_sent = HashSet::new();
         let mut trails: HashMap<OrderId, Vec<String>> = HashMap::new();
+
+        for (order_id, order_commitment) in orders {
+            let order = client
+                .get(format!("{http_url}/orders/{order_id}"))
+                .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
+                .send()
+                .await
+                .map_err(|error| invalid(error.to_string()))?
+                .error_for_status()
+                .map_err(|error| invalid(error.to_string()))?
+                .json::<Order>()
+                .await
+                .map_err(|error| invalid(error.to_string()))?;
+            if order.state == OrderState::AwaitingUserProof
+                && let Some(noise_public_key) = order.solver_noise_public_key
+            {
+                send_proof(
+                    client,
+                    http_url,
+                    *order_id,
+                    *order_commitment,
+                    &noise_public_key,
+                )
+                .await?;
+                proofs_sent.insert(*order_id);
+            }
+        }
 
         while filled.len() < orders.len() {
             let event = events
@@ -305,23 +369,14 @@ async fn wait_for_filled(
                         noise_public_key.len()
                     );
                     if proofs_sent.insert(order_id) {
-                        let proof = format!("proof:{order_id}").into_bytes();
-                        let ciphertext = xor(&proof, &noise_public_key);
-                        let ciphertext_bytes = ciphertext.len();
-                        client
-                            .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
-                            .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
-                            .json(&EncryptedProofRequest { ciphertext })
-                            .send()
-                            .await
-                            .map_err(|error| invalid(error.to_string()))?
-                            .error_for_status()
-                            .map_err(|error| invalid(error.to_string()))?;
-                        kage_orderbook::service_log!(
-                            "user",
-                            "encrypted proof sent order={} bytes={ciphertext_bytes}",
-                            short_id(order_id)
-                        );
+                        send_proof(
+                            client,
+                            http_url,
+                            order_id,
+                            *order_commitment,
+                            &noise_public_key,
+                        )
+                        .await?;
                     }
                     "AwaitingUserProof"
                 }
@@ -341,6 +396,76 @@ async fn wait_for_filled(
     .await
     .map_err(|_| invalid("timed out waiting for orders to reach Filled"))?
     .map_err(Into::into)
+}
+
+async fn wait_for_prices(
+    pricing: &mut PricingHandle,
+    asset_in: &str,
+    asset_out: &str,
+) -> Result<(PricePoint, PricePoint), BoxError> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(pair) = pricing.fresh_pair(asset_in, asset_out) {
+                return Ok::<_, io::Error>(pair);
+            }
+            pricing.changed().await.map_err(io::Error::other)?;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "pricing feed did not become ready"))?
+    .map_err(Into::into)
+}
+
+fn pow10(decimals: u8) -> Result<U256, io::Error> {
+    U256::from(10_u8)
+        .checked_pow(U256::from(decimals))
+        .ok_or_else(|| invalid("token decimal scale overflow"))
+}
+
+fn fair_output(
+    amount_in: U256,
+    price_in: U256,
+    price_out: U256,
+    decimals_in: u8,
+    decimals_out: u8,
+) -> Result<U256, io::Error> {
+    let numerator = U512::from(amount_in)
+        .checked_mul(U512::from(price_in))
+        .and_then(|value| value.checked_mul(U512::from(pow10(decimals_out).ok()?)))
+        .ok_or_else(|| invalid("quote numerator overflow"))?;
+    let denominator = U512::from(price_out)
+        .checked_mul(U512::from(pow10(decimals_in)?))
+        .ok_or_else(|| invalid("quote denominator overflow"))?;
+    let output = numerator / denominator;
+    U256::checked_from_limbs_slice(output.as_limbs())
+        .ok_or_else(|| invalid("quote does not fit U256"))
+}
+
+async fn send_proof(
+    client: &reqwest::Client,
+    http_url: &str,
+    order_id: OrderId,
+    order_commitment: B256,
+    noise_public_key: &[u8],
+) -> Result<(), io::Error> {
+    let proof = format!("proof:{order_id}").into_bytes();
+    let ciphertext = xor(&proof, noise_public_key);
+    let ciphertext_bytes = ciphertext.len();
+    client
+        .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
+        .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
+        .json(&EncryptedProofRequest { ciphertext })
+        .send()
+        .await
+        .map_err(|error| invalid(error.to_string()))?
+        .error_for_status()
+        .map_err(|error| invalid(error.to_string()))?;
+    kage_orderbook::service_log!(
+        "user",
+        "encrypted proof sent order={} bytes={ciphertext_bytes}",
+        short_id(order_id)
+    );
+    Ok(())
 }
 
 fn xor(bytes: &[u8], key: &[u8]) -> Vec<u8> {

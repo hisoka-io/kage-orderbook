@@ -129,7 +129,7 @@ fn parse_args() -> Result<bool, io::Error> {
         match arg.as_str() {
             "--wrong-quote" => wrong_quote = true,
             "--help" | "-h" => {
-                println!("mock_order [--wrong-quote]");
+                println!("submit_priced_order [--wrong-quote]");
                 std::process::exit(0);
             }
             _ => return Err(invalid(format!("unknown argument: {arg}"))),

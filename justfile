@@ -12,8 +12,8 @@ lint:
 test:
     cargo test
 
-mock-order:
-    ./scripts/mock-order.sh
+submit-priced-order:
+    ./scripts/submit-priced-order.sh
 
 wrong-quote:
     ./scripts/wrong-quote.sh
