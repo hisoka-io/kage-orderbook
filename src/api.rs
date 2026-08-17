@@ -381,7 +381,7 @@ async fn reserve_order(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
         .filter(|profile| profile.active)
         .ok_or(StatusCode::FORBIDDEN)?;
-    if profile.noise_key == alloy_primitives::B256::ZERO {
+    if profile.noise_public_key == alloy_primitives::B256::ZERO {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     execute(
@@ -389,7 +389,7 @@ async fn reserve_order(
         Command::SolverReserved {
             order_id,
             solver_id,
-            noise_public_key: profile.noise_key.to_vec(),
+            noise_public_key: profile.noise_public_key.to_vec(),
         },
     )
     .await
@@ -469,7 +469,7 @@ async fn solver_events_ws(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
         .filter(|profile| profile.active)
         .ok_or(StatusCode::FORBIDDEN)?;
-    if profile.noise_key == alloy_primitives::B256::ZERO {
+    if profile.noise_public_key == alloy_primitives::B256::ZERO {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let events = state.orderbook.subscribe();

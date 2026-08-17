@@ -10,6 +10,8 @@ use kage_orderbook::order::{OrderCommitment, OrderId};
 use tokio::sync::oneshot;
 use tokio_tungstenite::connect_async;
 
+use super::proof_transport;
+
 pub async fn run(
     http_url: String,
     ws_url: String,
@@ -70,7 +72,8 @@ pub async fn run(
                 continue;
             };
             let proof = format!("proof:{order_id}").into_bytes();
-            let ciphertext = xor(&proof, &noise_public_key);
+            let ciphertext =
+                proof_transport::encrypt_for_solver(order_id, &noise_public_key, &proof).unwrap();
 
             client
                 .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
@@ -89,12 +92,4 @@ pub async fn run(
             );
         }
     }
-}
-
-fn xor(bytes: &[u8], key: &[u8]) -> Vec<u8> {
-    bytes
-        .iter()
-        .zip(key.iter().cycle())
-        .map(|(byte, key)| byte ^ key)
-        .collect()
 }

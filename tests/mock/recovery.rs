@@ -3,9 +3,11 @@ use kage_orderbook::core::command::Command;
 use kage_orderbook::core::engine::start_orderbook;
 use kage_orderbook::core::guards::MOCK_CHAIN_ID;
 use kage_orderbook::order::OrderState;
+use kage_orderbook::storage::OrderRepository;
 use uuid::Uuid;
 
-use super::support::{commitment, noise_key, solver_address, terms};
+use super::proof_transport;
+use super::support::{commitment, noise_private_key, noise_public_key, solver_address, terms};
 
 #[tokio::test]
 async fn proof_relayed_order_survives_restart_and_reaches_filled() {
@@ -16,8 +18,11 @@ async fn proof_relayed_order_survives_restart_and_reaches_filled() {
     );
     let order_id = Uuid::new_v4();
     let solver_id = solver_address(0x11);
-    let noise_key = noise_key(0x33).to_vec();
-    let ciphertext = vec![1, 2, 3, 4];
+    let noise_private_key = noise_private_key(0x33);
+    let noise_public_key = noise_public_key(0x33).to_vec();
+    let plaintext = b"private-proof";
+    let ciphertext =
+        proof_transport::encrypt_for_solver(order_id, &noise_public_key, plaintext).unwrap();
     let tx_hash = B256::repeat_byte(9);
 
     let first = start_orderbook(&database_url).await.unwrap();
@@ -33,7 +38,7 @@ async fn proof_relayed_order_survives_restart_and_reaches_filled() {
         .execute(Command::SolverReserved {
             order_id,
             solver_id,
-            noise_public_key: noise_key.clone(),
+            noise_public_key: noise_public_key.clone(),
         })
         .await
         .unwrap();
@@ -61,7 +66,7 @@ async fn proof_relayed_order_survives_restart_and_reaches_filled() {
         .execute(Command::SolverReserved {
             order_id,
             solver_id,
-            noise_public_key: noise_key,
+            noise_public_key,
         })
         .await
         .unwrap();
@@ -86,6 +91,11 @@ async fn proof_relayed_order_survives_restart_and_reaches_filled() {
     assert_eq!(proofs.len(), 1);
     assert_eq!(proofs[0].order_id, order_id);
     assert_eq!(proofs[0].ciphertext, ciphertext);
+    assert_eq!(
+        proof_transport::decrypt_from_user(order_id, &noise_private_key, &proofs[0].ciphertext,)
+            .unwrap(),
+        plaintext
+    );
 
     restarted
         .execute(Command::ExecutionStarted {
@@ -103,6 +113,8 @@ async fn proof_relayed_order_survives_restart_and_reaches_filled() {
         })
         .await
         .unwrap();
+    let repository = OrderRepository::connect(&database_url).await.unwrap();
+    assert!(repository.get_proof(order_id).await.unwrap().is_none());
     restarted
         .execute(Command::RelayEncryptedProof {
             order_id,

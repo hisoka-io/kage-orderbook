@@ -10,40 +10,81 @@ use kage_orderbook::logging::short_id;
 use kage_orderbook::order::{Order, OrderId, SolverId};
 use kage_orderbook::proof::IntentProofV1;
 use kage_orderbook::readiness::ReadinessSnapshot;
+use kage_orderbook::registry::SolverProfile;
 use reqwest::StatusCode;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 
+#[path = "mock_support/proof_transport.rs"]
+mod proof_transport;
+
 type BoxError = Box<dyn Error + Send + Sync>;
+const DEFAULT_MOCK_PRIVATE_KEY: [u8; 32] = [0x33; 32];
+
+#[derive(Debug, thiserror::Error)]
+#[error("mock registry registration failed: {0}")]
+struct RegistryRegistrationError(#[source] reqwest::Error);
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
     let http_url =
         std::env::var("ORDERBOOK_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned());
     let ws_url = std::env::var("ORDERBOOK_WS_URL")
         .unwrap_or_else(|_| "ws://127.0.0.1:3000/events/solver/ws".to_owned());
+    let registry_url =
+        std::env::var("KAGE_REGISTRY_URL").unwrap_or_else(|_| "http://127.0.0.1:4000".to_owned());
     let solver_id = std::env::var("SOLVER_ADDRESS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| Address::repeat_byte(0x11));
-    let noise_key = std::env::var("SOLVER_NOISE_KEY")
-        .ok()
-        .and_then(|value| value.parse::<B256>().ok())
-        .unwrap_or_else(|| B256::repeat_byte(0x33))
-        .to_vec();
+    let noise_private_key: [u8; 32] = match std::env::var("SOLVER_NOISE_PRIVATE_KEY") {
+        Ok(value) => value
+            .parse::<B256>()
+            .expect("SOLVER_NOISE_PRIVATE_KEY must contain exactly 32 hex bytes")
+            .into(),
+        Err(std::env::VarError::NotPresent) => DEFAULT_MOCK_PRIVATE_KEY,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("SOLVER_NOISE_PRIVATE_KEY must be valid UTF-8")
+        }
+    };
+    let noise_public_key = B256::from(
+        proof_transport::public_key(&noise_private_key)
+            .expect("SOLVER_NOISE_PRIVATE_KEY must be a non-zero X25519 private key"),
+    );
 
-    kage_orderbook::service_log!("solver", "started solver={solver_id}");
+    kage_orderbook::service_log!(
+        "solver",
+        "started solver={solver_id} noise_public_key=derived"
+    );
 
     let mut waiting_for = None;
     loop {
         let mut connected = false;
-        let result = run(&http_url, &ws_url, solver_id, &noise_key, &mut connected).await;
+        let result = run(
+            &http_url,
+            &ws_url,
+            &registry_url,
+            solver_id,
+            &noise_private_key,
+            noise_public_key,
+            &mut connected,
+        )
+        .await;
         if connected {
             waiting_for = None;
         }
         if let Err(error) = result {
-            if is_service_unavailable(&error) {
+            if error.downcast_ref::<RegistryRegistrationError>().is_some() {
+                if waiting_for.as_deref() != Some("registry") {
+                    kage_orderbook::service_log!(
+                        "solver",
+                        "waiting reason=registry_unavailable retry_in_ms=1000"
+                    );
+                    waiting_for = Some("registry".to_owned());
+                }
+            } else if is_service_unavailable(&error) {
                 let missing = missing_dependencies(&http_url)
                     .await
                     .unwrap_or_else(|| "unknown".to_owned());
@@ -66,11 +107,16 @@ async fn main() {
 async fn run(
     http_url: &str,
     ws_url: &str,
+    registry_url: &str,
     solver_id: SolverId,
-    noise_key: &[u8],
+    noise_private_key: &[u8; 32],
+    noise_public_key: B256,
     connected: &mut bool,
 ) -> Result<(), BoxError> {
     let client = reqwest::Client::new();
+    register_solver(&client, registry_url, solver_id, noise_public_key)
+        .await
+        .map_err(RegistryRegistrationError)?;
     let mut ws_request = ws_url.into_client_request()?;
     ws_request.headers_mut().insert(
         SOLVER_ADDRESS_HEADER,
@@ -91,34 +137,73 @@ async fn run(
     for order in jobs {
         reserve(&client, http_url, order.id, solver_id).await?;
     }
-    execute_proofs(&client, http_url, solver_id, noise_key).await?;
+    execute_proofs(&client, http_url, solver_id, noise_private_key).await?;
 
-    while let Some(message) = socket.next().await {
-        let message = message?;
-        if !message.is_text() {
-            continue;
-        }
+    let mut registry_heartbeat = tokio::time::interval(Duration::from_secs(5));
+    registry_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    registry_heartbeat.tick().await;
 
-        let event: OrderEvent = serde_json::from_str(message.to_text()?)?;
-        match event {
-            OrderEvent::SolverReservationRequested { order_id } => {
-                kage_orderbook::service_log!("solver", "available order={}", short_id(order_id));
-                reserve(&client, http_url, order_id, solver_id).await?;
+    loop {
+        tokio::select! {
+            _ = registry_heartbeat.tick() => {
+                register_solver(&client, registry_url, solver_id, noise_public_key)
+                    .await
+                    .map_err(RegistryRegistrationError)?;
             }
-            OrderEvent::ProofRelayed {
-                solver_id: assigned_solver,
-                ..
-            } if assigned_solver == solver_id => {
-                kage_orderbook::service_log!(
-                    "solver",
-                    "encrypted proof available solver={solver_id}"
-                );
-                execute_proofs(&client, http_url, solver_id, noise_key).await?;
+            message = socket.next() => {
+                let Some(message) = message else {
+                    return Ok(());
+                };
+                let message = message?;
+                if !message.is_text() {
+                    continue;
+                }
+
+                let event: OrderEvent = serde_json::from_str(message.to_text()?)?;
+                match event {
+                    OrderEvent::SolverReservationRequested { order_id } => {
+                        kage_orderbook::service_log!(
+                            "solver",
+                            "available order={}",
+                            short_id(order_id)
+                        );
+                        reserve(&client, http_url, order_id, solver_id).await?;
+                    }
+                    OrderEvent::ProofRelayed {
+                        solver_id: assigned_solver,
+                        ..
+                    } if assigned_solver == solver_id => {
+                        kage_orderbook::service_log!(
+                            "solver",
+                            "encrypted proof available solver={solver_id}"
+                        );
+                        execute_proofs(&client, http_url, solver_id, noise_private_key).await?;
+                    }
+                    _ => {}
+                }
             }
-            _ => {}
         }
     }
+}
 
+async fn register_solver(
+    client: &reqwest::Client,
+    registry_url: &str,
+    solver_id: SolverId,
+    noise_public_key: B256,
+) -> Result<(), reqwest::Error> {
+    client
+        .put(format!(
+            "{}/solvers/{solver_id}",
+            registry_url.trim_end_matches('/')
+        ))
+        .json(&SolverProfile {
+            noise_public_key,
+            active: true,
+        })
+        .send()
+        .await?
+        .error_for_status()?;
     Ok(())
 }
 
@@ -187,7 +272,7 @@ async fn execute_proofs(
     client: &reqwest::Client,
     http_url: &str,
     solver_id: SolverId,
-    noise_key: &[u8],
+    noise_private_key: &[u8; 32],
 ) -> Result<(), BoxError> {
     let proofs = client
         .get(format!("{http_url}/solver/proofs"))
@@ -199,10 +284,24 @@ async fn execute_proofs(
         .await?;
 
     for delivery in proofs {
-        let proof = xor(&delivery.ciphertext, noise_key);
+        let proof = match proof_transport::decrypt_from_user(
+            delivery.order_id,
+            noise_private_key,
+            &delivery.ciphertext,
+        ) {
+            Ok(proof) => proof,
+            Err(error) => {
+                kage_orderbook::service_error!(
+                    "solver",
+                    "proof rejected order={} reason=noise_decryption_failed error={error}",
+                    short_id(delivery.order_id)
+                );
+                continue;
+            }
+        };
         kage_orderbook::service_log!(
             "solver",
-            "decrypted proof order={} ciphertext_bytes={}",
+            "Noise proof decrypted order={} ciphertext_bytes={}",
             short_id(delivery.order_id),
             delivery.ciphertext.len()
         );
@@ -253,14 +352,6 @@ async fn execute_proofs(
     }
 
     Ok(())
-}
-
-fn xor(bytes: &[u8], key: &[u8]) -> Vec<u8> {
-    bytes
-        .iter()
-        .zip(key.iter().cycle())
-        .map(|(byte, key)| byte ^ key)
-        .collect()
 }
 
 fn tx_hash(order_id: OrderId) -> B256 {

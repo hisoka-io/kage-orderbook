@@ -1,6 +1,8 @@
 mod chain;
 mod chaos;
 mod expiry;
+#[path = "../../src/bin/mock_support/proof_transport.rs"]
+mod proof_transport;
 mod recovery;
 mod solver;
 mod support;
@@ -20,7 +22,7 @@ use kage_orderbook::core::guards::{
     DEFAULT_ORDER_TTL_SECONDS, MAX_ORDER_TTL_SECONDS, MIN_ORDER_TTL_SECONDS, MOCK_CHAIN_ID,
 };
 use kage_orderbook::order::{Order, OrderCommitment, OrderId, OrderState};
-use support::{commitment, noise_key, registry, solver_address, terms};
+use support::{commitment, noise_private_key, registry, solver_address, terms};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -582,7 +584,7 @@ async fn external_services_drive_orders_to_filled() {
         http_url,
         solver_ws_url,
         solver_address(0x11),
-        noise_key(0x33).to_vec(),
+        noise_private_key(0x33),
         solver_ready_tx,
     ));
     solver_ready_rx.await.unwrap();

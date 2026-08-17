@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
@@ -14,18 +16,19 @@ use kage_orderbook::order::{Order, OrderId, TxHash};
 use kage_orderbook::registry::SolverProfile;
 use reqwest::StatusCode;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tokio_tungstenite::connect_async;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct MockRegistry {
-    solver_id: Address,
-    profile: SolverProfile,
+    profiles: Arc<RwLock<HashMap<Address, SolverProfile>>>,
 }
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
     let http_url =
         std::env::var("ORDERBOOK_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned());
     let ws_url = std::env::var("ORDERBOOK_WS_URL")
@@ -35,26 +38,15 @@ async fn main() {
         .and_then(|value| value.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_millis(500));
-    let solver_id = std::env::var("SOLVER_ADDRESS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| Address::repeat_byte(0x11));
-    let noise_key = std::env::var("SOLVER_NOISE_KEY")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| B256::repeat_byte(0x33));
     let registry_address =
         std::env::var("MOCK_REGISTRY_ADDRESS").unwrap_or_else(|_| "127.0.0.1:4000".to_owned());
     let registry = Router::new()
-        .route("/solvers/{solver_id}", get(solver_profile))
+        .route(
+            "/solvers/{solver_id}",
+            get(solver_profile).put(register_solver),
+        )
         .route("/health", get(health))
-        .with_state(MockRegistry {
-            solver_id,
-            profile: SolverProfile {
-                noise_key,
-                active: true,
-            },
-        });
+        .with_state(MockRegistry::default());
     let listener = TcpListener::bind(&registry_address).await.unwrap();
     tokio::spawn(async move {
         axum::serve(listener, registry).await.unwrap();
@@ -77,10 +69,36 @@ async fn solver_profile(
     State(registry): State<MockRegistry>,
     Path(solver_id): Path<Address>,
 ) -> Result<Json<SolverProfile>, AxumStatusCode> {
-    if solver_id != registry.solver_id {
-        return Err(AxumStatusCode::NOT_FOUND);
+    registry
+        .profiles
+        .read()
+        .await
+        .get(&solver_id)
+        .copied()
+        .map(Json)
+        .ok_or(AxumStatusCode::NOT_FOUND)
+}
+
+async fn register_solver(
+    State(registry): State<MockRegistry>,
+    Path(solver_id): Path<Address>,
+    Json(profile): Json<SolverProfile>,
+) -> Result<AxumStatusCode, AxumStatusCode> {
+    if profile.noise_public_key == B256::ZERO {
+        return Err(AxumStatusCode::BAD_REQUEST);
     }
-    Ok(Json(registry.profile))
+
+    let mut profiles = registry.profiles.write().await;
+    let changed = profiles.get(&solver_id).is_none_or(|existing| {
+        existing.noise_public_key != profile.noise_public_key || existing.active != profile.active
+    });
+    profiles.insert(solver_id, profile);
+    drop(profiles);
+
+    if changed {
+        kage_orderbook::service_log!("chain", "solver registered solver={solver_id}");
+    }
+    Ok(AxumStatusCode::NO_CONTENT)
 }
 
 async fn run(http_url: &str, ws_url: &str, delay: Duration) -> Result<(), BoxError> {
@@ -145,4 +163,48 @@ async fn settle(
         short_id(order_id)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn solver_registers_its_derived_noise_public_key() {
+        let registry = MockRegistry::default();
+        let solver_id = Address::repeat_byte(0x11);
+        let profile = SolverProfile {
+            noise_public_key: B256::repeat_byte(0x22),
+            active: true,
+        };
+
+        assert_eq!(
+            register_solver(State(registry.clone()), Path(solver_id), Json(profile)).await,
+            Ok(AxumStatusCode::NO_CONTENT)
+        );
+        let registered = solver_profile(State(registry), Path(solver_id))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(registered.noise_public_key, profile.noise_public_key);
+        assert!(registered.active);
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_an_empty_noise_public_key() {
+        let profile = SolverProfile {
+            noise_public_key: B256::ZERO,
+            active: true,
+        };
+
+        assert_eq!(
+            register_solver(
+                State(MockRegistry::default()),
+                Path(Address::repeat_byte(0x11)),
+                Json(profile)
+            )
+            .await,
+            Err(AxumStatusCode::BAD_REQUEST)
+        );
+    }
 }

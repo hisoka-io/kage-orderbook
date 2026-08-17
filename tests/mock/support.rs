@@ -3,12 +3,18 @@ use kage_orderbook::core::guards::MOCK_CHAIN_ID;
 use kage_orderbook::order::TradeTerms;
 use kage_orderbook::registry::{SolverProfile, SolverRegistry};
 
+use super::proof_transport;
+
 pub fn solver_address(n: u8) -> Address {
     Address::repeat_byte(n)
 }
 
-pub fn noise_key(n: u8) -> B256 {
-    B256::repeat_byte(n)
+pub fn noise_private_key(n: u8) -> [u8; 32] {
+    [n; 32]
+}
+
+pub fn noise_public_key(n: u8) -> B256 {
+    B256::from(proof_transport::public_key(&noise_private_key(n)).unwrap())
 }
 
 pub fn registry() -> SolverRegistry {
@@ -16,14 +22,14 @@ pub fn registry() -> SolverRegistry {
         (
             solver_address(0x11),
             SolverProfile {
-                noise_key: noise_key(0x33),
+                noise_public_key: noise_public_key(0x33),
                 active: true,
             },
         ),
         (
             solver_address(0x22),
             SolverProfile {
-                noise_key: noise_key(0x44),
+                noise_public_key: noise_public_key(0x44),
                 active: true,
             },
         ),

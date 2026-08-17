@@ -10,11 +10,13 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 
+use super::proof_transport;
+
 pub async fn run(
     http_url: String,
     ws_url: String,
     solver_id: SolverId,
-    noise_key: Vec<u8>,
+    noise_private_key: [u8; 32],
     ready: oneshot::Sender<()>,
 ) {
     let client = reqwest::Client::new();
@@ -56,7 +58,7 @@ pub async fn run(
                 solver_id: assigned_solver,
                 ..
             } if assigned_solver == solver_id => {
-                execute_proofs(&client, &http_url, solver_id, &noise_key).await;
+                execute_proofs(&client, &http_url, solver_id, &noise_private_key).await;
             }
             _ => {}
         }
@@ -84,7 +86,7 @@ async fn execute_proofs(
     client: &reqwest::Client,
     http_url: &str,
     solver_id: SolverId,
-    noise_key: &[u8],
+    noise_private_key: &[u8; 32],
 ) {
     let deliveries: Vec<SolverProofDelivery> = client
         .get(format!("{http_url}/solver/proofs"))
@@ -97,7 +99,12 @@ async fn execute_proofs(
         .unwrap();
 
     for delivery in deliveries {
-        let proof = xor(&delivery.ciphertext, noise_key);
+        let proof = proof_transport::decrypt_from_user(
+            delivery.order_id,
+            noise_private_key,
+            &delivery.ciphertext,
+        )
+        .unwrap();
         assert_eq!(proof, format!("proof:{}", delivery.order_id).as_bytes());
         kage_orderbook::service_log!(
             "solver",
@@ -126,14 +133,6 @@ async fn execute_proofs(
             short_id(delivery.order_id)
         );
     }
-}
-
-fn xor(bytes: &[u8], key: &[u8]) -> Vec<u8> {
-    bytes
-        .iter()
-        .zip(key.iter().cycle())
-        .map(|(byte, key)| byte ^ key)
-        .collect()
 }
 
 fn tx_hash(order_id: OrderId) -> B256 {

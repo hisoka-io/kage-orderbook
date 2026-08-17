@@ -12,8 +12,8 @@ use kage_orderbook::logging::short_id;
 use kage_orderbook::order::{Order, OrderId, OrderState, SolverId};
 use reqwest::{Client, Response, StatusCode};
 
-use super::support::{noise_key, solver_address};
-use super::{create_order_with_commitment, server};
+use super::support::{noise_private_key, noise_public_key, solver_address};
+use super::{create_order_with_commitment, proof_transport, server};
 
 const ORDERS: u64 = 4;
 
@@ -29,7 +29,8 @@ async fn run() {
     let client = Client::new();
     let solver_id = solver_address(0x11);
     let wrong_solver_id = solver_address(0x22);
-    let noise_key = noise_key(0x33).to_vec();
+    let noise_private_key = noise_private_key(0x33);
+    let noise_public_key = noise_public_key(0x33).to_vec();
 
     let created = join_all((1..=ORDERS).map(|number| {
         let client = client.clone();
@@ -122,15 +123,25 @@ async fn run() {
         first,
     );
 
+    let encrypted_proofs = orders
+        .iter()
+        .map(|order_id| {
+            let proof = format!("proof:{order_id}");
+            let ciphertext =
+                proof_transport::encrypt_for_solver(*order_id, &noise_public_key, proof.as_bytes())
+                    .unwrap();
+            (*order_id, ciphertext)
+        })
+        .collect::<HashMap<_, _>>();
+
     join_all(orders.iter().enumerate().map(|(index, order_id)| {
         let client = client.clone();
         let http_url = http_url.clone();
-        let noise_key = noise_key.clone();
         let order_id = *order_id;
         let order_commitment = commitments[&order_id];
+        let ciphertext = encrypted_proofs[&order_id].clone();
         async move {
             tokio::time::sleep(delay(index, 15)).await;
-            let ciphertext = xor(format!("proof:{order_id}").as_bytes(), &noise_key);
             let response = client
                 .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
                 .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
@@ -148,7 +159,7 @@ async fn run() {
     }))
     .await;
 
-    let first_ciphertext = xor(format!("proof:{first}").as_bytes(), &noise_key);
+    let first_ciphertext = encrypted_proofs[&first].clone();
     expect(
         client
             .post(format!("{http_url}/orders/{first}/encrypted-proof"))
@@ -201,11 +212,15 @@ async fn run() {
     join_all(proofs.into_iter().enumerate().map(|(index, delivery)| {
         let client = client.clone();
         let http_url = http_url.clone();
-        let noise_key = noise_key.clone();
         async move {
             tokio::time::sleep(delay(index, 25)).await;
             assert_eq!(
-                xor(&delivery.ciphertext, &noise_key),
+                proof_transport::decrypt_from_user(
+                    delivery.order_id,
+                    &noise_private_key,
+                    &delivery.ciphertext,
+                )
+                .unwrap(),
                 format!("proof:{}", delivery.order_id).as_bytes()
             );
             let response = client
@@ -397,14 +412,6 @@ fn expect(response: Response, expected: StatusCode, action: &str, order_id: Orde
 
 fn delay(index: usize, step_ms: u64) -> Duration {
     Duration::from_millis((index as u64 + 1) * step_ms)
-}
-
-fn xor(bytes: &[u8], key: &[u8]) -> Vec<u8> {
-    bytes
-        .iter()
-        .zip(key.iter().cycle())
-        .map(|(byte, key)| byte ^ key)
-        .collect()
 }
 
 fn tx_hash(order_id: OrderId) -> B256 {

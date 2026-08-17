@@ -9,7 +9,7 @@ use crate::order::SolverId;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SolverProfile {
-    pub noise_key: B256,
+    pub noise_public_key: B256,
     pub active: bool,
 }
 

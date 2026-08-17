@@ -86,7 +86,7 @@ pub fn handle(order: Option<&Order>, command: Command) -> Result<Transition, Ord
             if order.state != OrderState::Reserving {
                 return Err(OrderError::InvalidState);
             }
-            if noise_public_key.is_empty() || noise_public_key.len() > 128 {
+            if noise_public_key.len() != 32 {
                 return Err(OrderError::InvalidPayload);
             }
 
@@ -222,7 +222,9 @@ impl Orderbook {
         let expected_version = current.map(|order| order.version);
         let delete_proof = matches!(
             &command,
-            Command::SettlementObserved { .. } | Command::ExpireOrder { .. }
+            Command::ExecutionStarted { .. }
+                | Command::SettlementObserved { .. }
+                | Command::ExpireOrder { .. }
         );
         let transition = handle(current, command)?;
         let mut order = match current {
@@ -286,10 +288,8 @@ fn is_idempotent(order: Option<&Order>, command: &Command, stored_proof: Option<
                 && order.solver_noise_public_key.as_deref() == Some(noise_public_key)
         }
         Command::RelayEncryptedProof { ciphertext, .. } => {
-            matches!(
-                order.state,
-                OrderState::ProofRelayed | OrderState::Executing
-            ) && stored_proof == Some(ciphertext)
+            order.state == OrderState::Executing
+                || (order.state == OrderState::ProofRelayed && stored_proof == Some(ciphertext))
         }
         Command::ExecutionStarted {
             solver_id, tx_hash, ..

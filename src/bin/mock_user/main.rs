@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use uuid::Uuid;
 
+#[path = "../mock_support/proof_transport.rs"]
+mod proof_transport;
 mod prover_worker;
 
 use prover_worker::{ProofOrderV1, ProverWorker};
@@ -489,7 +491,8 @@ async fn send_proof(
 ) -> Result<(), io::Error> {
     let proof = prover.prove(proof_order).await.map_err(io::Error::other)?;
     let proof = serde_json::to_vec(&proof).map_err(io::Error::other)?;
-    let ciphertext = xor(&proof, noise_public_key);
+    let ciphertext = proof_transport::encrypt_for_solver(order_id, noise_public_key, &proof)
+        .map_err(io::Error::other)?;
     let ciphertext_bytes = ciphertext.len();
     client
         .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
@@ -507,12 +510,4 @@ async fn send_proof(
         proof.len()
     );
     Ok(())
-}
-
-fn xor(bytes: &[u8], key: &[u8]) -> Vec<u8> {
-    bytes
-        .iter()
-        .zip(key.iter().cycle())
-        .map(|(byte, key)| byte ^ key)
-        .collect()
 }

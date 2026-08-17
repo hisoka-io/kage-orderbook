@@ -298,8 +298,18 @@ pub(crate) mod tests {
     #[ignore = "requires tools dependencies and a built ../darkpool prover"]
     async fn generates_a_real_proof_through_the_worker() {
         let mut worker = ProverWorker::spawn(Duration::from_secs(120)).unwrap();
-        let proof = worker.prove(real_test_order()).await.unwrap();
+        let order = real_test_order();
+        let order_id = order.order_id;
+        let proof = worker.prove(order).await.unwrap();
         proof.validate().unwrap();
+        let plaintext = serde_json::to_vec(&proof).unwrap();
+        let private_key = [0x33; 32];
+        let public_key = crate::proof_transport::public_key(&private_key).unwrap();
+        let envelope =
+            crate::proof_transport::encrypt_for_solver(order_id, &public_key, &plaintext).unwrap();
+        let decrypted =
+            crate::proof_transport::decrypt_from_user(order_id, &private_key, &envelope).unwrap();
+        assert_eq!(decrypted, plaintext);
         worker.shutdown().await.unwrap();
     }
 
