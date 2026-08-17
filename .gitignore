@@ -19,6 +19,7 @@ orderbook.db-wal
 
 
 /mem
+/artifacts
 
 .env
 .env.*

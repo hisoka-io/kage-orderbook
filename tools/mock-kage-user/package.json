@@ -1,0 +1,5 @@
+{
+  "name": "@kage/mock-kage-user",
+  "private": true,
+  "type": "module"
+}

@@ -18,6 +18,12 @@ submit-priced-order:
 wrong-quote:
     ./scripts/wrong-quote.sh
 
+generate-intent-proof *args:
+    bash ./scripts/generate-intent-proof.sh {{args}}
+
+test-intent-proof:
+    bash ./scripts/test-intent-proof.sh
+
 ci:
     cargo fmt --check
     cargo clippy --all-targets -- -D warnings
