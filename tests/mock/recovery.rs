@@ -1,13 +1,15 @@
 use alloy_primitives::B256;
-use kage_orderbook::core::command::Command;
-use kage_orderbook::core::engine::start_orderbook;
-use kage_orderbook::core::guards::MOCK_CHAIN_ID;
-use kage_orderbook::order::OrderState;
-use kage_orderbook::storage::OrderRepository;
+use kage_orderbook::{
+    core::{command::Command, engine::start_orderbook, guards::MOCK_CHAIN_ID},
+    storage::OrderRepository,
+};
+use kage_types::orders::OrderState;
 use uuid::Uuid;
 
-use super::proof_transport;
-use super::support::{commitment, noise_private_key, noise_public_key, solver_address, terms};
+use super::{
+    proof_transport,
+    support::{commitment, noise_private_key, noise_public_key, solver_address, terms},
+};
 
 #[tokio::test]
 async fn proof_relayed_order_survives_restart_and_reaches_filled() {

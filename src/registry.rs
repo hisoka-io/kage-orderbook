@@ -1,17 +1,9 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use alloy_primitives::B256;
-use serde::{Deserialize, Serialize};
+pub use kage_types::registry::SolverProfile;
 use thiserror::Error;
 
 use crate::order::SolverId;
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct SolverProfile {
-    pub noise_public_key: B256,
-    pub active: bool,
-}
 
 #[derive(Clone)]
 pub struct SolverRegistry {

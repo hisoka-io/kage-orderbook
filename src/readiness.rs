@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
+pub use kage_types::health::ReadinessSnapshot;
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -27,17 +27,6 @@ struct ReadinessState {
 #[derive(Clone, Default)]
 pub struct ServiceReadiness {
     state: Arc<ReadinessState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReadinessSnapshot {
-    pub ready: bool,
-    pub pricing: bool,
-    pub registry: bool,
-    pub solver: bool,
-    pub chain: bool,
-    pub actor: bool,
-    pub missing: Vec<String>,
 }
 
 #[derive(Clone, Copy)]

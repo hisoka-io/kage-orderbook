@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use kage_types::proof::IntentProofV1;
 
 pub const INTENT_PROOF_FIELDS: usize = 458;
 pub const INTENT_PUBLIC_INPUTS: usize = 27;
@@ -6,61 +6,45 @@ pub const INTENT_VERIFICATION_KEY_FIELDS: usize = 115;
 pub const INTENT_VERIFICATION_KEY_HASH: &str =
     "0x2e0b51ed4736571c1daa939f67d50684aa262bab910d8971e77c0d65f89efc50";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct IntentProofV1 {
-    pub version: u8,
-    pub circuit: String,
-    pub proof_system: String,
-    pub verifier_target: String,
-    pub proof: String,
-    pub proof_as_fields: Vec<String>,
-    pub public_inputs: Vec<String>,
-    pub verification_key_fields: Vec<String>,
-    pub verification_key_hash: String,
-}
-
-impl IntentProofV1 {
-    pub fn validate(&self) -> Result<(), ProofValidationError> {
-        if self.version != 1
-            || self.circuit != "swap_intent"
-            || self.proof_system != "ultra_honk"
-            || self.verifier_target != "noir-recursive"
-        {
-            return Err(ProofValidationError::UnsupportedEnvelope);
-        }
-
-        validate_field_list("proof fields", &self.proof_as_fields, INTENT_PROOF_FIELDS)?;
-        validate_field_list("public inputs", &self.public_inputs, INTENT_PUBLIC_INPUTS)?;
-        validate_field_list(
-            "verification-key fields",
-            &self.verification_key_fields,
-            INTENT_VERIFICATION_KEY_FIELDS,
-        )?;
-
-        if !is_canonical_bytes(&self.proof) {
-            return Err(ProofValidationError::InvalidProofBytes);
-        }
-        let proof_body = &self.proof[2..];
-        if !proof_body.len().is_multiple_of(64) {
-            return Err(ProofValidationError::InvalidProofBytes);
-        }
-        if proof_body.len() / 64 != self.proof_as_fields.len()
-            || proof_body
-                .as_bytes()
-                .chunks_exact(64)
-                .zip(&self.proof_as_fields)
-                .any(|(chunk, field)| field.as_bytes().get(2..) != Some(chunk))
-        {
-            return Err(ProofValidationError::MismatchedProofFields);
-        }
-        if !is_canonical_field(&self.verification_key_hash)
-            || self.verification_key_hash != INTENT_VERIFICATION_KEY_HASH
-        {
-            return Err(ProofValidationError::VerificationKeyHash);
-        }
-        Ok(())
+pub fn validate(proof: &IntentProofV1) -> Result<(), ProofValidationError> {
+    if proof.version != 1
+        || proof.circuit != "swap_intent"
+        || proof.proof_system != "ultra_honk"
+        || proof.verifier_target != "noir-recursive"
+    {
+        return Err(ProofValidationError::UnsupportedEnvelope);
     }
+
+    validate_field_list("proof fields", &proof.proof_as_fields, INTENT_PROOF_FIELDS)?;
+    validate_field_list("public inputs", &proof.public_inputs, INTENT_PUBLIC_INPUTS)?;
+    validate_field_list(
+        "verification-key fields",
+        &proof.verification_key_fields,
+        INTENT_VERIFICATION_KEY_FIELDS,
+    )?;
+
+    if !is_canonical_bytes(&proof.proof) {
+        return Err(ProofValidationError::InvalidProofBytes);
+    }
+    let proof_body = &proof.proof[2..];
+    if !proof_body.len().is_multiple_of(64) {
+        return Err(ProofValidationError::InvalidProofBytes);
+    }
+    if proof_body.len() / 64 != proof.proof_as_fields.len()
+        || proof_body
+            .as_bytes()
+            .chunks_exact(64)
+            .zip(&proof.proof_as_fields)
+            .any(|(chunk, field)| field.as_bytes().get(2..) != Some(chunk))
+    {
+        return Err(ProofValidationError::MismatchedProofFields);
+    }
+    if !is_canonical_field(&proof.verification_key_hash)
+        || proof.verification_key_hash != INTENT_VERIFICATION_KEY_HASH
+    {
+        return Err(ProofValidationError::VerificationKeyHash);
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,7 +108,7 @@ mod tests {
 
     #[test]
     fn validates_a_pinned_proof_envelope() {
-        valid_proof().validate().unwrap();
+        validate(&valid_proof()).unwrap();
     }
 
     #[test]
@@ -132,7 +116,7 @@ mod tests {
         let mut proof = valid_proof();
         proof.proof_as_fields[0] = field("01");
         assert!(matches!(
-            proof.validate(),
+            validate(&proof),
             Err(ProofValidationError::MismatchedProofFields)
         ));
     }

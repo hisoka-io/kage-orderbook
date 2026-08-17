@@ -8,24 +8,29 @@ mod solver;
 mod support;
 mod user;
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
-use kage_orderbook::api::{
-    self, CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest, ORDER_COMMITMENT_HEADER,
-    SOLVER_ADDRESS_HEADER, UserEventClientMessage, UserEventServerMessage,
+use kage_orderbook::{
+    api,
+    core::{
+        engine::start_orderbook,
+        guards::{
+            DEFAULT_ORDER_TTL_SECONDS, MAX_ORDER_TTL_SECONDS, MIN_ORDER_TTL_SECONDS, MOCK_CHAIN_ID,
+        },
+    },
 };
-use kage_orderbook::core::engine::start_orderbook;
-use kage_orderbook::core::events::OrderEvent;
-use kage_orderbook::core::guards::{
-    DEFAULT_ORDER_TTL_SECONDS, MAX_ORDER_TTL_SECONDS, MIN_ORDER_TTL_SECONDS, MOCK_CHAIN_ID,
+use kage_types::{
+    api_types::{
+        CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest, ORDER_COMMITMENT_HEADER,
+        SOLVER_ADDRESS_HEADER, UserEventClientMessage, UserEventServerMessage,
+    },
+    events::OrderEvent,
+    identifiers::{OrderCommitment, OrderId},
+    orders::{OrderState, OrderV1 as Order},
 };
-use kage_orderbook::order::{Order, OrderCommitment, OrderId, OrderState};
 use support::{commitment, noise_private_key, registry, solver_address, terms};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 const USERS: u64 = 5;

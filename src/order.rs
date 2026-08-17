@@ -1,14 +1,11 @@
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::U256;
+pub use kage_types::{
+    identifiers::{OrderCommitment, OrderId, SolverId, TokenAddress, TxHash},
+    orders::{OrderState, OrderV1, TradeTerms},
+};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::core::events::OrderEvent;
-
-pub type OrderId = Uuid;
-pub type TokenAddress = Address;
-pub type TxHash = B256;
-pub type SolverId = Address;
-pub type OrderCommitment = B256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
@@ -27,40 +24,6 @@ pub struct Order {
     pub solver: Option<SolverId>,
     pub solver_noise_public_key: Option<Vec<u8>>,
     pub tx_hash: Option<TxHash>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OrderState {
-    Created,
-    Validated,
-    Reserving,
-    Assigned,
-    AwaitingUserProof,
-    ProofRelayed,
-    Executing,
-
-    Filled,
-    Expired,
-    Cancelled,
-    Failed,
-}
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct TradeTerms {
-    pub chain_id: u64,
-    pub token_in: TokenAddress,
-    pub token_out: TokenAddress,
-    pub amount_in: U256,
-    pub amount_out: U256,
-    pub expires_at_ms: i64,
-}
-
-impl OrderState {
-    pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Filled | Self::Expired | Self::Cancelled | Self::Failed
-        )
-    }
 }
 
 impl Order {
@@ -124,5 +87,24 @@ impl Order {
             }
         }
         self.version += 1;
+    }
+}
+
+impl From<&Order> for OrderV1 {
+    fn from(order: &Order) -> Self {
+        Self {
+            id: order.id,
+            state: order.state,
+            version: order.version,
+            chain_id: order.chain_id,
+            token_in: order.token_in,
+            token_out: order.token_out,
+            amount_in: order.amount_in,
+            amount_out: order.amount_out,
+            expires_at_ms: order.expires_at_ms,
+            solver: order.solver,
+            solver_noise_public_key: order.solver_noise_public_key.clone(),
+            tx_hash: order.tx_hash,
+        }
     }
 }

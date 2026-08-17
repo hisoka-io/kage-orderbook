@@ -1,19 +1,22 @@
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use alloy_primitives::B256;
 use futures_util::future::join_all;
-use kage_orderbook::api::{
-    EncryptedProofRequest, ExecutionStartedRequest, ORDER_COMMITMENT_HEADER, SOLVER_ADDRESS_HEADER,
-    SettlementRequest,
-};
-use kage_orderbook::core::engine::SolverProofDelivery;
 use kage_orderbook::logging::short_id;
-use kage_orderbook::order::{Order, OrderId, OrderState, SolverId};
+use kage_types::{
+    api_types::{
+        EncryptedProofRequest, ExecutionStartedRequest, ORDER_COMMITMENT_HEADER,
+        SOLVER_ADDRESS_HEADER, SettlementRequest, SolverProofDeliveryV1 as SolverProofDelivery,
+    },
+    identifiers::{OrderId, SolverId},
+    orders::{OrderState, OrderV1 as Order},
+};
 use reqwest::{Client, Response, StatusCode};
 
-use super::support::{noise_private_key, noise_public_key, solver_address};
-use super::{create_order_with_commitment, proof_transport, server};
+use super::{
+    create_order_with_commitment, proof_transport, server,
+    support::{noise_private_key, noise_public_key, solver_address},
+};
 
 const ORDERS: u64 = 4;
 

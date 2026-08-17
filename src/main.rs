@@ -1,12 +1,14 @@
 use std::time::Duration;
 
-use kage_orderbook::api;
-use kage_orderbook::config::AppConfig;
-use kage_orderbook::core::engine::start_orderbook_with_repository;
-use kage_orderbook::pricing::{self, PricingConfig, PricingValidator};
-use kage_orderbook::readiness::ServiceReadiness;
-use kage_orderbook::registry::SolverRegistry;
-use kage_orderbook::storage::OrderRepository;
+use kage_orderbook::{
+    api,
+    config::AppConfig,
+    core::engine::start_orderbook_with_repository,
+    pricing::{self, PricingConfig, PricingValidator},
+    readiness::ServiceReadiness,
+    registry::SolverRegistry,
+    storage::OrderRepository,
+};
 use tokio::net::TcpListener;
 
 #[tokio::main]

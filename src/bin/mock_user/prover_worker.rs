@@ -1,13 +1,11 @@
-use std::ffi::OsString;
-use std::io;
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::time::Duration;
+use std::{ffi::OsString, io, path::PathBuf, process::Stdio, time::Duration};
 
-use kage_orderbook::proof::{IntentProofV1, ProofValidationError};
+use kage_types::proof::IntentProofV1;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
+};
 use uuid::Uuid;
 
 const PROOF_PROTOCOL_VERSION: u8 = 1;
@@ -164,7 +162,7 @@ where
                     "successful response is missing its proof".to_owned(),
                 )
             })?;
-            proof.validate().map_err(ProverWorkerError::InvalidProof)?;
+            crate::proof_validation::validate(&proof).map_err(ProverWorkerError::InvalidProof)?;
             Ok(proof)
         } else {
             if response.proof.is_some() {
@@ -235,7 +233,7 @@ pub enum ProverWorkerError {
     #[error("prover response is invalid: {0}")]
     InvalidResponse(String),
     #[error("prover returned an invalid proof: {0}")]
-    InvalidProof(ProofValidationError),
+    InvalidProof(crate::proof_validation::ProofValidationError),
     #[error("prover rejected the request: {code}: {message}")]
     Rejected { code: String, message: String },
     #[error("prover worker timed out after {0:?}")]
@@ -254,7 +252,7 @@ pub enum ProverWorkerError {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use kage_orderbook::proof::{
+    use crate::proof_validation::{
         INTENT_PROOF_FIELDS, INTENT_PUBLIC_INPUTS, INTENT_VERIFICATION_KEY_FIELDS,
         INTENT_VERIFICATION_KEY_HASH,
     };
@@ -301,7 +299,7 @@ pub(crate) mod tests {
         let order = real_test_order();
         let order_id = order.order_id;
         let proof = worker.prove(order).await.unwrap();
-        proof.validate().unwrap();
+        crate::proof_validation::validate(&proof).unwrap();
         let plaintext = serde_json::to_vec(&proof).unwrap();
         let private_key = [0x33; 32];
         let public_key = crate::proof_transport::public_key(&private_key).unwrap();

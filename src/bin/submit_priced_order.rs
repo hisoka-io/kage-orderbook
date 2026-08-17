@@ -2,10 +2,10 @@ use std::{error::Error, io, time::Duration};
 
 use alloy_primitives::{B256, U256, U512};
 use kage_orderbook::{
-    api::{ApiErrorResponse, CreateOrderRequest, CreateOrderResponse},
     config::AppConfig,
     pricing::{self, PricingConfig},
 };
+use kage_types::api_types::{ApiErrorResponse, CreateOrderRequest, CreateOrderResponse};
 use reqwest::StatusCode;
 use uuid::Uuid;
 

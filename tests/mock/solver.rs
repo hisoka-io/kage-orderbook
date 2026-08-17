@@ -1,14 +1,20 @@
 use alloy_primitives::B256;
 use futures_util::StreamExt;
-use kage_orderbook::api::{ExecutionStartedRequest, SOLVER_ADDRESS_HEADER};
-use kage_orderbook::core::engine::SolverProofDelivery;
-use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
-use kage_orderbook::order::{Order, OrderId, SolverId};
+use kage_types::{
+    api_types::{
+        ExecutionStartedRequest, SOLVER_ADDRESS_HEADER,
+        SolverProofDeliveryV1 as SolverProofDelivery,
+    },
+    events::OrderEvent,
+    identifiers::{OrderId, SolverId},
+    orders::SolverOrderV1 as Order,
+};
 use tokio::sync::oneshot;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, http::HeaderValue},
+};
 
 use super::proof_transport;
 

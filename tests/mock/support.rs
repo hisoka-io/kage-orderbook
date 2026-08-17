@@ -1,7 +1,6 @@
 use alloy_primitives::{Address, B256, U256};
-use kage_orderbook::core::guards::MOCK_CHAIN_ID;
-use kage_orderbook::order::TradeTerms;
-use kage_orderbook::registry::{SolverProfile, SolverRegistry};
+use kage_orderbook::{core::guards::MOCK_CHAIN_ID, registry::SolverRegistry};
+use kage_types::{orders::TradeTerms, registry::SolverProfile};
 
 use super::proof_transport;
 

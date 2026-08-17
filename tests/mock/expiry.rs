@@ -1,9 +1,11 @@
 use std::time::Duration;
 
 use alloy_primitives::B256;
-use kage_orderbook::core::command::Command;
-use kage_orderbook::core::engine::{OrderError, ServiceError, start_orderbook};
-use kage_orderbook::order::OrderState;
+use kage_orderbook::core::{
+    command::Command,
+    engine::{OrderError, ServiceError, start_orderbook},
+};
+use kage_types::orders::OrderState;
 use uuid::Uuid;
 
 use super::support::{commitment, solver_address, terms};

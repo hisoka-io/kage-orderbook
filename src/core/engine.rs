@@ -1,20 +1,19 @@
-use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use alloy_primitives::{B256, U256};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use super::command::Command;
-use super::events::OrderEvent;
-use crate::logging::short_id;
-use crate::order::{Order, OrderCommitment, OrderId, OrderState, SolverId, TradeTerms};
-use crate::storage::{OrderRepository, RepositoryError};
+use super::{command::Command, events::OrderEvent};
+use crate::{
+    logging::short_id,
+    order::{Order, OrderCommitment, OrderId, OrderState, SolverId, TradeTerms},
+    storage::{OrderRepository, RepositoryError},
+};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SolverProofDelivery {
-    pub order_id: OrderId,
-    pub ciphertext: Vec<u8>,
-}
+pub use kage_types::api_types::SolverProofDeliveryV1 as SolverProofDelivery;
 
 #[derive(Debug, Clone)]
 pub struct CreateOrderOutcome {

@@ -1,28 +1,37 @@
 use std::collections::HashSet;
 
-use alloy_primitives::U256;
-use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, State, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+use axum::{
+    Json, Router,
+    extract::{
+        Path, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
+};
+pub use kage_types::api_types::{
+    ApiErrorResponse, CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest,
+    ExecutionStartedRequest, ORDER_COMMITMENT_HEADER, SOLVER_ADDRESS_HEADER, SettlementRequest,
+    UserEventClientMessage, UserEventServerMessage,
+};
+use serde::Serialize;
 use uuid::Uuid;
 
-use crate::core::command::Command;
-use crate::core::engine::{OrderError, OrderbookHandle, ServiceError, SolverProofDelivery};
-use crate::core::events::OrderEvent;
-use crate::core::guards::{CreateOrderInput, OrderPolicy, validate_create_order};
-use crate::logging::short_id;
-use crate::order::{Order, OrderCommitment, OrderId, SolverId, TokenAddress, TxHash};
-use crate::pricing::{PriceValidationError, PricingValidator};
-use crate::readiness::{ReadinessSnapshot, ServiceReadiness};
-use crate::registry::SolverRegistry;
-use crate::storage::RepositoryError;
-
-pub const ORDER_COMMITMENT_HEADER: &str = "x-order-commitment";
-pub const SOLVER_ADDRESS_HEADER: &str = "x-solver-address";
+use crate::{
+    core::{
+        command::Command,
+        engine::{OrderError, OrderbookHandle, ServiceError, SolverProofDelivery},
+        events::OrderEvent,
+        guards::{CreateOrderInput, OrderPolicy, validate_create_order},
+    },
+    logging::short_id,
+    order::{Order, OrderCommitment, OrderId, OrderV1, SolverId},
+    pricing::{PriceValidationError, PricingValidator},
+    readiness::{ReadinessSnapshot, ServiceReadiness},
+    registry::SolverRegistry,
+    storage::RepositoryError,
+};
 
 #[derive(Clone)]
 struct ApiState {
@@ -31,17 +40,6 @@ struct ApiState {
     order_policy: OrderPolicy,
     pricing_validator: Option<PricingValidator>,
     readiness: ServiceReadiness,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateOrderRequest {
-    pub order_commitment: OrderCommitment,
-    pub chain_id: u64,
-    pub token_in: TokenAddress,
-    pub token_out: TokenAddress,
-    pub amount_in: U256,
-    pub amount_out: U256,
-    pub ttl_seconds: Option<u32>,
 }
 
 impl From<CreateOrderRequest> for CreateOrderInput {
@@ -58,53 +56,7 @@ impl From<CreateOrderRequest> for CreateOrderInput {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CreateOrderResponse {
-    pub order_id: OrderId,
-    pub expires_at_ms: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ApiErrorResponse {
-    pub code: String,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub missing: Vec<String>,
-}
-
 type ApiError = (StatusCode, Json<ApiErrorResponse>);
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EncryptedProofRequest {
-    pub ciphertext: Vec<u8>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExecutionStartedRequest {
-    pub tx_hash: TxHash,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SettlementRequest {
-    pub tx_hash: TxHash,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum UserEventClientMessage {
-    Subscribe {
-        order_id: OrderId,
-        order_commitment: OrderCommitment,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum UserEventServerMessage {
-    Subscribed { order_id: OrderId },
-    Rejected { order_id: OrderId },
-    Event { event: OrderEvent },
-}
 
 pub fn router(orderbook: OrderbookHandle, registry: SolverRegistry) -> Router {
     router_with_policy(orderbook, registry, OrderPolicy::default())
@@ -322,37 +274,41 @@ async fn get_order(
     State(state): State<ApiState>,
     Path(order_id): Path<OrderId>,
     headers: HeaderMap,
-) -> Result<Json<Order>, StatusCode> {
+) -> Result<Json<OrderV1>, StatusCode> {
     let order_commitment = commitment_from_headers(&headers)?;
-    state
+    let order = state
         .orderbook
         .get_order_by_commitment(order_id, order_commitment)
         .await
         .map_err(status_for_error)?
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(OrderV1::from(&order)))
 }
 
 async fn reserving_orders(
     State(state): State<ApiState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<Order>>, StatusCode> {
+) -> Result<Json<Vec<OrderV1>>, StatusCode> {
     solver_id_from_headers(&headers)?;
     state
         .orderbook
         .reserving_orders()
         .await
-        .map(Json)
+        .map(|orders| Json(order_views(&orders)))
         .map_err(status_for_error)
 }
 
-async fn executing_orders(State(state): State<ApiState>) -> Result<Json<Vec<Order>>, StatusCode> {
+async fn executing_orders(State(state): State<ApiState>) -> Result<Json<Vec<OrderV1>>, StatusCode> {
     state
         .orderbook
         .executing_orders()
         .await
-        .map(Json)
+        .map(|orders| Json(order_views(&orders)))
         .map_err(status_for_error)
+}
+
+fn order_views(orders: &[Order]) -> Vec<OrderV1> {
+    orders.iter().map(OrderV1::from).collect()
 }
 
 async fn take_solver_proofs(

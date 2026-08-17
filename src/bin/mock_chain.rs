@@ -1,22 +1,23 @@
-use std::collections::HashMap;
-use std::error::Error;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, B256};
-use axum::extract::{Path, State};
-use axum::http::StatusCode as AxumStatusCode;
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode as AxumStatusCode,
+    routing::get,
+};
 use futures_util::StreamExt;
-use kage_orderbook::api::SettlementRequest;
-use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
-use kage_orderbook::order::{Order, OrderId, TxHash};
-use kage_orderbook::registry::SolverProfile;
+use kage_types::{
+    api_types::SettlementRequest,
+    events::OrderEvent,
+    identifiers::{OrderId, TxHash},
+    orders::ChainOrderV1,
+    registry::SolverProfile,
+};
 use reqwest::StatusCode;
-use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::{net::TcpListener, sync::RwLock};
 use tokio_tungstenite::connect_async;
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -109,7 +110,7 @@ async fn run(http_url: &str, ws_url: &str, delay: Duration) -> Result<(), BoxErr
         .send()
         .await?
         .error_for_status()?
-        .json::<Vec<Order>>()
+        .json::<Vec<ChainOrderV1>>()
         .await?;
 
     for order in jobs {

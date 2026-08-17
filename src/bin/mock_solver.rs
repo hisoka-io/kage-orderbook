@@ -1,23 +1,27 @@
-use std::error::Error;
-use std::time::Duration;
+use std::{error::Error, time::Duration};
 
 use alloy_primitives::{Address, B256};
 use futures_util::StreamExt;
-use kage_orderbook::api::{ExecutionStartedRequest, SOLVER_ADDRESS_HEADER};
-use kage_orderbook::core::engine::SolverProofDelivery;
-use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
-use kage_orderbook::order::{Order, OrderId, SolverId};
-use kage_orderbook::proof::IntentProofV1;
-use kage_orderbook::readiness::ReadinessSnapshot;
-use kage_orderbook::registry::SolverProfile;
+use kage_types::{
+    api_types::{ExecutionStartedRequest, SOLVER_ADDRESS_HEADER, SolverProofDeliveryV1},
+    events::OrderEvent,
+    health::ReadinessSnapshot,
+    identifiers::{OrderId, SolverId},
+    orders::SolverOrderV1,
+    proof::IntentProofV1,
+    registry::SolverProfile,
+};
 use reqwest::StatusCode;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, http::HeaderValue},
+};
 
 #[path = "mock_support/proof_transport.rs"]
 mod proof_transport;
+#[path = "mock_support/proof_validation.rs"]
+mod proof_validation;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 const DEFAULT_MOCK_PRIVATE_KEY: [u8; 32] = [0x33; 32];
@@ -131,7 +135,7 @@ async fn run(
         .send()
         .await?
         .error_for_status()?
-        .json::<Vec<Order>>()
+        .json::<Vec<SolverOrderV1>>()
         .await?;
 
     for order in jobs {
@@ -280,7 +284,7 @@ async fn execute_proofs(
         .send()
         .await?
         .error_for_status()?
-        .json::<Vec<SolverProofDelivery>>()
+        .json::<Vec<SolverProofDeliveryV1>>()
         .await?;
 
     for delivery in proofs {
@@ -316,7 +320,7 @@ async fn execute_proofs(
                 continue;
             }
         };
-        if let Err(error) = proof.validate() {
+        if let Err(error) = proof_validation::validate(&proof) {
             kage_orderbook::service_error!(
                 "solver",
                 "proof rejected order={} reason=validation_failed error={error}",

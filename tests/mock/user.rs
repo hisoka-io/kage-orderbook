@@ -1,12 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
 use futures_util::{SinkExt, StreamExt};
-use kage_orderbook::api::{
-    EncryptedProofRequest, ORDER_COMMITMENT_HEADER, UserEventClientMessage, UserEventServerMessage,
-};
-use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
-use kage_orderbook::order::{OrderCommitment, OrderId};
+use kage_types::{
+    api_types::{
+        EncryptedProofRequest, ORDER_COMMITMENT_HEADER, UserEventClientMessage,
+        UserEventServerMessage,
+    },
+    events::OrderEvent,
+    identifiers::{OrderCommitment, OrderId},
+};
 use tokio::sync::oneshot;
 use tokio_tungstenite::connect_async;
 

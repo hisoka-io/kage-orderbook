@@ -1,10 +1,13 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use kage_orderbook::api::SettlementRequest;
-use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
-use kage_orderbook::order::{Order, OrderId, TxHash};
+use kage_types::{
+    api_types::SettlementRequest,
+    events::OrderEvent,
+    identifiers::{OrderId, TxHash},
+    orders::ChainOrderV1 as Order,
+};
 use tokio::sync::oneshot;
 use tokio_tungstenite::connect_async;
 

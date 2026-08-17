@@ -1,25 +1,34 @@
-use std::collections::{HashMap, HashSet};
-use std::error::Error;
-use std::io;
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    io,
+    time::Duration,
+};
 
 use alloy_primitives::{B256, U256, U512};
 use futures_util::{SinkExt, StreamExt};
-use kage_orderbook::api::{
-    CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest, ORDER_COMMITMENT_HEADER,
-    UserEventClientMessage, UserEventServerMessage,
+use kage_orderbook::{
+    config::AppConfig,
+    logging::short_id,
+    pricing::{self, PricePoint, PricingConfig, PricingHandle},
 };
-use kage_orderbook::config::AppConfig;
-use kage_orderbook::core::events::OrderEvent;
-use kage_orderbook::logging::short_id;
-use kage_orderbook::order::{Order, OrderId, OrderState};
-use kage_orderbook::pricing::{self, PricePoint, PricingConfig, PricingHandle};
+use kage_types::{
+    api_types::{
+        CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest, ORDER_COMMITMENT_HEADER,
+        UserEventClientMessage, UserEventServerMessage,
+    },
+    events::OrderEvent,
+    identifiers::OrderId,
+    orders::{OrderState, OrderV1},
+};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use uuid::Uuid;
 
 #[path = "../mock_support/proof_transport.rs"]
 mod proof_transport;
+#[path = "../mock_support/proof_validation.rs"]
+mod proof_validation;
 mod prover_worker;
 
 use prover_worker::{ProofOrderV1, ProverWorker};
@@ -304,7 +313,7 @@ async fn main() -> Result<(), BoxError> {
             .send()
             .await?
             .error_for_status()?
-            .json::<Order>()
+            .json::<OrderV1>()
             .await?;
 
         if order.state != OrderState::Filled {
@@ -359,7 +368,7 @@ async fn wait_for_filled(
                 .map_err(|error| invalid(error.to_string()))?
                 .error_for_status()
                 .map_err(|error| invalid(error.to_string()))?
-                .json::<Order>()
+                .json::<OrderV1>()
                 .await
                 .map_err(|error| invalid(error.to_string()))?;
             if order.state == OrderState::AwaitingUserProof

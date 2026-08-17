@@ -1994,6 +1994,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures-util",
+ "kage-types",
  "reqwest",
  "serde",
  "serde_json",
@@ -2005,6 +2006,16 @@ dependencies = [
  "tokio-tungstenite",
  "uuid",
  "x25519-dalek",
+]
+
+[[package]]
+name = "kage-types"
+version = "0.1.0"
+source = "git+https://github.com/hisoka-io/kage-types?branch=feat%2Ftypes#f6edcf08f3d030aabf89146fff67736f563ade8b"
+dependencies = [
+ "alloy-primitives",
+ "serde",
+ "uuid",
 ]
 
 [[package]]

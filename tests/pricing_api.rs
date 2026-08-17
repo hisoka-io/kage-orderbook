@@ -7,15 +7,15 @@ use axum::{
 };
 use futures_util::{StreamExt, stream};
 use kage_orderbook::{
-    api::{self, CreateOrderRequest},
+    api,
     config::AppConfig,
     core::engine::{OrderbookHandle, start_orderbook},
     pricing::{self, PricingConfig, PricingStatus, PricingValidator},
     registry::SolverRegistry,
 };
+use kage_types::api_types::CreateOrderRequest;
 use serde::Deserialize;
-use std::convert::Infallible;
-use std::time::Duration;
+use std::{convert::Infallible, time::Duration};
 use tokio::{net::TcpListener, task::JoinHandle};
 
 const CONFIG: &str = r#"{

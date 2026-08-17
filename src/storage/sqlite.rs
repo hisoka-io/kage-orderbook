@@ -1,11 +1,12 @@
-use std::str::FromStr;
-use std::time::Duration;
+use std::{str::FromStr, time::Duration};
 
 use alloy_primitives::{Address, B256, U256};
-use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
+use sqlx::{
+    Row, SqlitePool,
+    sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
+    },
 };
-use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
 
