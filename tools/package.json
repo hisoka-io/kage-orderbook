@@ -2,13 +2,15 @@
   "name": "@kage/tools",
   "private": true,
   "scripts": {
-    "proof:generate": "bash ../scripts/generate-intent-proof.sh",
     "proof:test": "bash ../scripts/test-intent-proof.sh",
+    "prover:worker": "node --import tsx mock-kage-user/src/worker.ts",
+    "prover:sample": "bash ../scripts/run-prover-worker-sample.sh",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "packageManager": "pnpm@10.24.0",
   "devDependencies": {
     "@types/node": "^26.2.0",
+    "tsx": "4.21.0",
     "typescript": "5.9.2"
   }
 }

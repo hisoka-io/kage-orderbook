@@ -19,4 +19,5 @@ fi
 
 cd "$prover_root"
 node --import "$tsx_loader" --test \
-  "$repo_root/tools/mock-kage-user/test/intent-proof-v1.test.ts"
+  "$repo_root/tools/mock-kage-user/test/intent-proof-v1.test.ts" \
+  "$repo_root/tools/mock-kage-user/test/protocol.test.ts"

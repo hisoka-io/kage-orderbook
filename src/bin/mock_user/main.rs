@@ -18,12 +18,17 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use uuid::Uuid;
 
+mod prover_worker;
+
+use prover_worker::{ProofOrderV1, ProverWorker};
+
 type BoxError = Box<dyn Error + Send + Sync>;
 
 struct Config {
     orders: usize,
     interval: Duration,
     timeout: Duration,
+    prover_timeout: Duration,
     seed: u64,
     http_url: String,
     ws_url: String,
@@ -35,6 +40,7 @@ impl Config {
             orders: 5,
             interval: Duration::from_millis(250),
             timeout: Duration::from_secs(30),
+            prover_timeout: Duration::from_secs(60),
             seed: 42,
             http_url: std::env::var("ORDERBOOK_HTTP_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned()),
@@ -51,6 +57,9 @@ impl Config {
                 }
                 "--timeout-secs" => {
                     config.timeout = Duration::from_secs(value(&mut args, &arg)?.parse()?)
+                }
+                "--prover-timeout-secs" => {
+                    config.prover_timeout = Duration::from_secs(value(&mut args, &arg)?.parse()?)
                 }
                 "--seed" => config.seed = value(&mut args, &arg)?.parse()?,
                 "--http-url" => config.http_url = value(&mut args, &arg)?,
@@ -83,8 +92,13 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn print_help() {
     println!(
         "mock_user [--orders N] [--interval-ms N] [--timeout-secs N] [--seed N] \
-         [--http-url URL] [--ws-url URL]"
+         [--prover-timeout-secs N] [--http-url URL] [--ws-url URL]"
     );
+}
+
+struct SubmittedOrder {
+    commitment: B256,
+    proof_order: ProofOrderV1,
 }
 
 struct Generator(u64);
@@ -149,6 +163,8 @@ async fn main() -> Result<(), BoxError> {
     let (mut socket_tx, mut socket_rx) = socket.split();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (subscription_tx, mut subscription_rx) = mpsc::unbounded_channel();
+    let mut prover = ProverWorker::spawn(options.prover_timeout)?;
+    kage_orderbook::service_log!("user", "prover worker started protocol=v1");
 
     let reader = tokio::spawn(async move {
         while let Some(message) = socket_rx.next().await {
@@ -248,7 +264,21 @@ async fn main() -> Result<(), BoxError> {
             request.amount_out,
             response.expires_at_ms
         );
-        orders.insert(response.order_id, request.order_commitment);
+        orders.insert(
+            response.order_id,
+            SubmittedOrder {
+                commitment: request.order_commitment,
+                proof_order: ProofOrderV1 {
+                    order_id: response.order_id,
+                    chain_id: request.chain_id,
+                    token_in: request.token_in.to_string().to_lowercase(),
+                    token_out: request.token_out.to_string().to_lowercase(),
+                    amount_in: request.amount_in.to_string(),
+                    amount_out: request.amount_out.to_string(),
+                    expires_at_ms: response.expires_at_ms,
+                },
+            },
+        );
 
         if index + 1 < options.orders {
             tokio::time::sleep(options.interval).await;
@@ -260,14 +290,15 @@ async fn main() -> Result<(), BoxError> {
         &options.http_url,
         &mut event_rx,
         &orders,
+        &mut prover,
         options.timeout,
     )
     .await?;
 
-    for (order_id, order_commitment) in &orders {
+    for (order_id, submitted) in &orders {
         let order = client
             .get(format!("{}/orders/{order_id}", options.http_url))
-            .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
+            .header(ORDER_COMMITMENT_HEADER, submitted.commitment.to_string())
             .send()
             .await?
             .error_for_status()?
@@ -299,6 +330,7 @@ async fn main() -> Result<(), BoxError> {
         options.orders
     );
 
+    prover.shutdown().await?;
     reader.abort();
     Ok(())
 }
@@ -307,7 +339,8 @@ async fn wait_for_filled(
     client: &reqwest::Client,
     http_url: &str,
     events: &mut mpsc::UnboundedReceiver<OrderEvent>,
-    orders: &HashMap<OrderId, B256>,
+    orders: &HashMap<OrderId, SubmittedOrder>,
+    prover: &mut ProverWorker,
     timeout: Duration,
 ) -> Result<HashMap<OrderId, Vec<String>>, BoxError> {
     tokio::time::timeout(timeout, async {
@@ -315,10 +348,10 @@ async fn wait_for_filled(
         let mut proofs_sent = HashSet::new();
         let mut trails: HashMap<OrderId, Vec<String>> = HashMap::new();
 
-        for (order_id, order_commitment) in orders {
+        for (order_id, submitted) in orders {
             let order = client
                 .get(format!("{http_url}/orders/{order_id}"))
-                .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
+                .header(ORDER_COMMITMENT_HEADER, submitted.commitment.to_string())
                 .send()
                 .await
                 .map_err(|error| invalid(error.to_string()))?
@@ -334,8 +367,10 @@ async fn wait_for_filled(
                     client,
                     http_url,
                     *order_id,
-                    *order_commitment,
+                    submitted.commitment,
+                    submitted.proof_order.clone(),
                     &noise_public_key,
+                    prover,
                 )
                 .await?;
                 proofs_sent.insert(*order_id);
@@ -348,7 +383,7 @@ async fn wait_for_filled(
                 .await
                 .ok_or_else(|| invalid("event stream closed"))?;
             let order_id = event.order_id();
-            let Some(order_commitment) = orders.get(&order_id) else {
+            let Some(submitted) = orders.get(&order_id) else {
                 continue;
             };
 
@@ -373,8 +408,10 @@ async fn wait_for_filled(
                             client,
                             http_url,
                             order_id,
-                            *order_commitment,
+                            submitted.commitment,
+                            submitted.proof_order.clone(),
                             &noise_public_key,
+                            prover,
                         )
                         .await?;
                     }
@@ -446,9 +483,12 @@ async fn send_proof(
     http_url: &str,
     order_id: OrderId,
     order_commitment: B256,
+    proof_order: ProofOrderV1,
     noise_public_key: &[u8],
+    prover: &mut ProverWorker,
 ) -> Result<(), io::Error> {
-    let proof = format!("proof:{order_id}").into_bytes();
+    let proof = prover.prove(proof_order).await.map_err(io::Error::other)?;
+    let proof = serde_json::to_vec(&proof).map_err(io::Error::other)?;
     let ciphertext = xor(&proof, noise_public_key);
     let ciphertext_bytes = ciphertext.len();
     client
@@ -462,8 +502,9 @@ async fn send_proof(
         .map_err(|error| invalid(error.to_string()))?;
     kage_orderbook::service_log!(
         "user",
-        "encrypted proof sent order={} bytes={ciphertext_bytes}",
-        short_id(order_id)
+        "real encrypted proof sent order={} proof_bytes={} ciphertext_bytes={ciphertext_bytes}",
+        short_id(order_id),
+        proof.len()
     );
     Ok(())
 }

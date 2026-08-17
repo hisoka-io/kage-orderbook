@@ -8,6 +8,7 @@ use kage_orderbook::core::engine::SolverProofDelivery;
 use kage_orderbook::core::events::OrderEvent;
 use kage_orderbook::logging::short_id;
 use kage_orderbook::order::{Order, OrderId, SolverId};
+use kage_orderbook::proof::IntentProofV1;
 use kage_orderbook::readiness::ReadinessSnapshot;
 use reqwest::StatusCode;
 use tokio_tungstenite::connect_async;
@@ -205,18 +206,31 @@ async fn execute_proofs(
             short_id(delivery.order_id),
             delivery.ciphertext.len()
         );
-        if proof != expected_proof(delivery.order_id) {
+        let proof = match serde_json::from_slice::<IntentProofV1>(&proof) {
+            Ok(proof) => proof,
+            Err(error) => {
+                kage_orderbook::service_error!(
+                    "solver",
+                    "proof rejected order={} reason=invalid_envelope error={error}",
+                    short_id(delivery.order_id)
+                );
+                continue;
+            }
+        };
+        if let Err(error) = proof.validate() {
             kage_orderbook::service_error!(
                 "solver",
-                "proof rejected order={}",
-                short_id(delivery.order_id)
+                "proof rejected order={} reason=validation_failed error={error}",
+                short_id(delivery.order_id),
             );
             continue;
         }
         kage_orderbook::service_log!(
             "solver",
-            "proof verified order={}",
-            short_id(delivery.order_id)
+            "proof envelope accepted order={} proof_fields={} public_inputs={}",
+            short_id(delivery.order_id),
+            proof.proof_as_fields.len(),
+            proof.public_inputs.len()
         );
 
         let tx_hash = tx_hash(delivery.order_id);
@@ -239,10 +253,6 @@ async fn execute_proofs(
     }
 
     Ok(())
-}
-
-fn expected_proof(order_id: OrderId) -> Vec<u8> {
-    format!("proof:{order_id}").into_bytes()
 }
 
 fn xor(bytes: &[u8], key: &[u8]) -> Vec<u8> {

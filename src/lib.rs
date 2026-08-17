@@ -4,6 +4,7 @@ pub mod core;
 pub mod logging;
 pub mod order;
 pub mod pricing;
+pub mod proof;
 pub mod readiness;
 pub mod registry;
 pub mod storage;
