@@ -57,7 +57,7 @@ pub async fn run(
 
         let event: OrderEvent = serde_json::from_str(message.to_text().unwrap()).unwrap();
         match event {
-            OrderEvent::SolverReservationRequested { order_id } => {
+            OrderEvent::SolverReservationRequested { order_id, .. } => {
                 reserve(&client, &http_url, order_id, solver_id).await;
             }
             OrderEvent::ProofRelayed {

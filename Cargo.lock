@@ -2011,7 +2011,7 @@ dependencies = [
 [[package]]
 name = "kage-types"
 version = "0.1.0"
-source = "git+https://github.com/hisoka-io/kage-types?branch=feat%2Ftypes#f6edcf08f3d030aabf89146fff67736f563ade8b"
+source = "git+https://github.com/hisoka-io/kage-types?branch=feat%2Ftypes#e39802f1c8de59f2bccadbe7067c7a0e55531686"
 dependencies = [
  "alloy-primitives",
  "serde",

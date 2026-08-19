@@ -70,7 +70,7 @@ pub fn handle(order: Option<&Order>, command: Command) -> Result<Transition, Ord
                 events: vec![
                     OrderEvent::OrderCreated { order_id, terms },
                     OrderEvent::OrderValidated { order_id },
-                    OrderEvent::SolverReservationRequested { order_id },
+                    OrderEvent::SolverReservationRequested { order_id, terms },
                 ],
                 deliveries: vec![],
             })
@@ -901,13 +901,22 @@ mod tests {
     fn drives_an_order_from_created_to_filled() {
         let mut book = Orderbook::default();
         let order_id = Uuid::new_v4();
+        let trade_terms = terms();
 
-        book.process(Command::CreateOrder {
-            order_id,
-            order_commitment: B256::repeat_byte(1),
-            terms: terms(),
-        })
-        .unwrap();
+        let events = book
+            .process(Command::CreateOrder {
+                order_id,
+                order_commitment: B256::repeat_byte(1),
+                terms: trade_terms,
+            })
+            .unwrap();
+        assert_eq!(
+            events.last(),
+            Some(&OrderEvent::SolverReservationRequested {
+                order_id,
+                terms: trade_terms,
+            })
+        );
         assert_eq!(book.orders[&order_id].state, OrderState::Reserving);
 
         let solver_id = Address::repeat_byte(3);
