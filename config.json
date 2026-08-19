@@ -2,7 +2,8 @@
   "order": {
     "default_ttl_seconds": 60,
     "min_ttl_seconds": 5,
-    "max_ttl_seconds": 300
+    "max_ttl_seconds": 300,
+    "max_order_usd_cents": 25000
   },
   "database": {
     "max_connections": 1,

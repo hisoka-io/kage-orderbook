@@ -66,7 +66,9 @@ async fn run() -> Result<(), BoxError> {
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "pricing feed did not become ready"))??;
 
-    let amount_in = pow10(token_in.decimals)?;
+    let target_usd_cents = u64::try_from(u128::from(config.order.max_order_usd_cents) * 9 / 10)
+        .map_err(|_| invalid("order USD target overflow"))?;
+    let amount_in = amount_for_usd_cents(target_usd_cents, price_in.price_e18, token_in.decimals)?;
     let fair_amount_out = fair_output(
         amount_in,
         price_in.price_e18,
@@ -110,9 +112,10 @@ async fn run() -> Result<(), BoxError> {
                 .into());
         }
         println!(
-            "wrong quote rejected: status={status} market={}→{} amount_in={} fair_amount_out={} submitted_amount_out={} limit_bps={} submitted_deviation_bps={}",
+            "wrong quote rejected: status={status} market={}→{} target_usd_cents={} amount_in={} fair_amount_out={} submitted_amount_out={} limit_bps={} submitted_deviation_bps={}",
             token_in.symbol,
             token_out.symbol,
+            target_usd_cents,
             amount_in,
             fair_amount_out,
             amount_out,
@@ -127,8 +130,13 @@ async fn run() -> Result<(), BoxError> {
         }
         let created = response.json::<CreateOrderResponse>().await?;
         println!(
-            "order accepted: status={status} order_id={} market={}→{} amount_in={} amount_out={}",
-            created.order_id, token_in.symbol, token_out.symbol, amount_in, amount_out
+            "order accepted: status={status} order_id={} market={}→{} target_usd_cents={} amount_in={} amount_out={}",
+            created.order_id,
+            token_in.symbol,
+            token_out.symbol,
+            target_usd_cents,
+            amount_in,
+            amount_out
         );
     }
     Ok(())
@@ -170,6 +178,28 @@ fn pow10(decimals: u8) -> Result<U256, io::Error> {
     U256::from(10_u8)
         .checked_pow(U256::from(decimals))
         .ok_or_else(|| invalid("token decimal scale overflow"))
+}
+
+fn amount_for_usd_cents(usd_cents: u64, price_e18: U256, decimals: u8) -> Result<U256, io::Error> {
+    if usd_cents == 0 || price_e18 == U256::ZERO {
+        return Err(invalid(
+            "USD value and token price must be greater than zero",
+        ));
+    }
+    let price_scale = U512::from(10_u8)
+        .checked_pow(U512::from(18_u8))
+        .ok_or_else(|| invalid("price scale overflow"))?;
+    let numerator = U512::from(usd_cents)
+        .checked_mul(U512::from(pow10(decimals)?))
+        .and_then(|value| value.checked_mul(price_scale))
+        .ok_or_else(|| invalid("order amount numerator overflow"))?;
+    let denominator = U512::from(price_e18)
+        .checked_mul(U512::from(100_u8))
+        .ok_or_else(|| invalid("order amount denominator overflow"))?;
+    let amount = numerator / denominator;
+    U256::checked_from_limbs_slice(amount.as_limbs())
+        .filter(|amount| *amount != U256::ZERO)
+        .ok_or_else(|| invalid("order amount does not fit U256 or is zero"))
 }
 
 fn fair_output(

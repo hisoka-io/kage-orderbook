@@ -123,11 +123,25 @@ impl Generator {
         self.0
     }
 
-    fn amount_in(&mut self, decimals: u8) -> Result<U256, io::Error> {
-        let whole_tokens = self.next() % 10 + 1;
-        pow10(decimals)?
-            .checked_mul(U256::from(whole_tokens))
-            .ok_or_else(|| invalid("mock amount overflow"))
+    fn amount_in(
+        &mut self,
+        decimals: u8,
+        price_e18: U256,
+        max_order_usd_cents: u64,
+    ) -> Result<(U256, u64), io::Error> {
+        // Exercise a useful range while staying comfortably below the configured limit.
+        let usage_bps = 1_000 + self.next() % 8_001;
+        let target_usd_cents =
+            u64::try_from(u128::from(max_order_usd_cents) * u128::from(usage_bps) / 10_000)
+                .map_err(|_| invalid("mock USD target overflow"))?
+                .max(1);
+        let amount = amount_for_usd_cents(target_usd_cents, price_e18, decimals)?;
+        if amount == U256::ZERO {
+            return Err(invalid(
+                "configured order limit produces a zero token amount",
+            ));
+        }
+        Ok((amount, target_usd_cents))
     }
 }
 
@@ -222,7 +236,11 @@ async fn main() -> Result<(), BoxError> {
             &token_out.pricing_asset,
         )
         .await?;
-        let amount_in = generator.amount_in(token_in.decimals)?;
+        let (amount_in, target_usd_cents) = generator.amount_in(
+            token_in.decimals,
+            price_in.price_e18,
+            app_config.order.max_order_usd_cents,
+        )?;
         let amount_out = fair_output(
             amount_in,
             price_in.price_e18,
@@ -267,12 +285,13 @@ async fn main() -> Result<(), BoxError> {
 
         kage_orderbook::service_log!(
             "user",
-            "created order={} token_in={} token_out={} amount_in={} amount_out={} expires_at_ms={}",
+            "created order={} token_in={} token_out={} amount_in={} amount_out={} target_usd_cents={} expires_at_ms={}",
             short_id(response.order_id),
             request.token_in,
             request.token_out,
             request.amount_in,
             request.amount_out,
+            target_usd_cents,
             response.expires_at_ms
         );
         orders.insert(
@@ -470,6 +489,27 @@ fn pow10(decimals: u8) -> Result<U256, io::Error> {
         .ok_or_else(|| invalid("token decimal scale overflow"))
 }
 
+fn amount_for_usd_cents(usd_cents: u64, price_e18: U256, decimals: u8) -> Result<U256, io::Error> {
+    if usd_cents == 0 || price_e18 == U256::ZERO {
+        return Err(invalid(
+            "USD value and token price must be greater than zero",
+        ));
+    }
+    let price_scale = U512::from(10_u8)
+        .checked_pow(U512::from(18_u8))
+        .ok_or_else(|| invalid("price scale overflow"))?;
+    let numerator = U512::from(usd_cents)
+        .checked_mul(U512::from(pow10(decimals)?))
+        .and_then(|value| value.checked_mul(price_scale))
+        .ok_or_else(|| invalid("mock amount numerator overflow"))?;
+    let denominator = U512::from(price_e18)
+        .checked_mul(U512::from(100_u8))
+        .ok_or_else(|| invalid("mock amount denominator overflow"))?;
+    let amount = numerator / denominator;
+    U256::checked_from_limbs_slice(amount.as_limbs())
+        .ok_or_else(|| invalid("mock amount does not fit U256"))
+}
+
 fn fair_output(
     amount_in: U256,
     price_in: U256,
@@ -519,4 +559,38 @@ async fn send_proof(
         proof.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod amount_tests {
+    use super::*;
+
+    #[test]
+    fn generated_eth_orders_stay_below_the_configured_usd_limit() {
+        let price_e18 = U256::from(2_000_u64) * U256::from(10_u64).pow(U256::from(18_u8));
+        let mut generator = Generator(42);
+
+        for _ in 0..100 {
+            let (amount, target_usd_cents) = generator.amount_in(18, price_e18, 25_000).unwrap();
+            assert!((2_500..=22_500).contains(&target_usd_cents));
+
+            let value_cents_scaled =
+                U512::from(amount) * U512::from(price_e18) * U512::from(100_u8);
+            let limit_cents_scaled = U512::from(25_000_u64)
+                * U512::from(10_u64).pow(U512::from(18_u8))
+                * U512::from(10_u64).pow(U512::from(18_u8));
+            assert!(value_cents_scaled < limit_cents_scaled);
+        }
+    }
+
+    #[test]
+    fn converts_target_usd_value_and_keeps_the_output_quote_fair() {
+        let price_scale = U256::from(10_u64).pow(U256::from(18_u8));
+        let eth_price = U256::from(2_000_u64) * price_scale;
+        let amount_in = amount_for_usd_cents(22_500, eth_price, 18).unwrap();
+        let amount_out = fair_output(amount_in, eth_price, price_scale, 18, 6).unwrap();
+
+        assert_eq!(amount_in, U256::from(112_500_000_000_000_000_u64));
+        assert_eq!(amount_out, U256::from(225_000_000_u64));
+    }
 }

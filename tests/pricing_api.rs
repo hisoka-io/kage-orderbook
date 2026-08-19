@@ -13,13 +13,13 @@ use kage_orderbook::{
     pricing::{self, PricingConfig, PricingStatus, PricingValidator},
     registry::SolverRegistry,
 };
-use kage_types::api_types::CreateOrderRequest;
+use kage_types::api_types::{ApiErrorResponse, CreateOrderRequest};
 use serde::Deserialize;
 use std::{convert::Infallible, time::Duration};
 use tokio::{net::TcpListener, task::JoinHandle};
 
 const CONFIG: &str = r#"{
-  "order": { "default_ttl_seconds": 60, "min_ttl_seconds": 5, "max_ttl_seconds": 300 },
+  "order": { "default_ttl_seconds": 60, "min_ttl_seconds": 5, "max_ttl_seconds": 300, "max_order_usd_cents": 25000 },
   "database": { "max_connections": 1, "busy_timeout_ms": 5000 },
   "runtime": { "command_capacity": 256 },
   "pricing": { "max_age_ms": 5000, "reconnect_delay_ms": 50, "idle_timeout_ms": 1000 },
@@ -100,7 +100,7 @@ fn request(commitment: u8, amount_out: u64) -> CreateOrderRequest {
         chain_id: 31_337,
         token_in: Address::repeat_byte(1),
         token_out: Address::repeat_byte(2),
-        amount_in: U256::from(1_000_000_000_000_000_000_u64),
+        amount_in: U256::from(100_000_000_000_000_000_u64),
         amount_out: U256::from(amount_out),
         ttl_seconds: None,
     }
@@ -144,7 +144,7 @@ async fn pricing_validation_controls_http_admission() {
     let (url, orderbook, server) = spawn_orderbook(&config, validator).await;
     let client = reqwest::Client::new();
 
-    let accepted = request(1, 2_000_000_000);
+    let accepted = request(1, 200_000_000);
     let response = client
         .post(format!("{url}/orders"))
         .json(&accepted)
@@ -160,7 +160,7 @@ async fn pricing_validation_controls_http_admission() {
             .is_some()
     );
 
-    let rejected = request(2, 1_990_000_000);
+    let rejected = request(2, 199_000_000);
     let response = client
         .post(format!("{url}/orders"))
         .json(&rejected)
@@ -168,9 +168,30 @@ async fn pricing_validation_controls_http_admission() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let error = response.json::<ApiErrorResponse>().await.unwrap();
+    assert_eq!(error.code, "invalid_quote");
     assert!(
         orderbook
             .find_order_by_commitment(rejected.order_commitment)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let mut oversized = request(3, 2_000_000_000);
+    oversized.amount_in = U256::from(1_000_000_000_000_000_000_u64);
+    let response = client
+        .post(format!("{url}/orders"))
+        .json(&oversized)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let error = response.json::<ApiErrorResponse>().await.unwrap();
+    assert_eq!(error.code, "order_value_limit");
+    assert!(
+        orderbook
+            .find_order_by_commitment(oversized.order_commitment)
             .await
             .unwrap()
             .is_none()
@@ -186,7 +207,7 @@ async fn stale_pricing_returns_service_unavailable_without_persisting() {
     let stale_at = now_ms().saturating_sub(config.pricing.max_age_ms + 1);
     let (validator, feed) = pricing(&config, stale_at, PricingStatus::Stale).await;
     let (url, orderbook, server) = spawn_orderbook(&config, validator).await;
-    let request = request(3, 2_000_000_000);
+    let request = request(4, 200_000_000);
 
     let response = reqwest::Client::new()
         .post(format!("{url}/orders"))

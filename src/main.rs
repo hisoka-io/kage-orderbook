@@ -52,7 +52,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let listener = TcpListener::bind(&listen_address).await?;
 
-    kage_orderbook::service_log!("orderbook", "started address={listen_address}");
+    kage_orderbook::service_log!(
+        "orderbook",
+        "started address={} max_order_usd_cents={}",
+        listen_address,
+        config.order.max_order_usd_cents
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

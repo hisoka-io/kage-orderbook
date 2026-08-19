@@ -27,6 +27,7 @@ pub struct OrderSettings {
     pub default_ttl_seconds: u32,
     pub min_ttl_seconds: u32,
     pub max_ttl_seconds: u32,
+    pub max_order_usd_cents: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -201,6 +202,11 @@ impl AppConfig {
         {
             return Err(invalid("order TTL must satisfy 0 < min <= default <= max"));
         }
+        if self.order.max_order_usd_cents == 0 {
+            return Err(invalid(
+                "order.max_order_usd_cents must be greater than zero",
+            ));
+        }
         if self.database.max_connections == 0 || self.database.busy_timeout_ms == 0 {
             return Err(invalid("database values must be greater than zero"));
         }
@@ -326,7 +332,7 @@ mod tests {
 
     const VALID_CONFIG: &str = r#"
     {
-      "order": { "default_ttl_seconds": 60, "min_ttl_seconds": 5, "max_ttl_seconds": 300 },
+      "order": { "default_ttl_seconds": 60, "min_ttl_seconds": 5, "max_ttl_seconds": 300, "max_order_usd_cents": 25000 },
       "database": { "max_connections": 1, "busy_timeout_ms": 5000 },
       "runtime": { "command_capacity": 256 },
       "pricing": { "max_age_ms": 5000, "reconnect_delay_ms": 1000, "idle_timeout_ms": 30000 },
@@ -370,6 +376,7 @@ mod tests {
             token_out: Address::repeat_byte(2),
         }));
         assert_eq!(config.pricing_assets(), vec!["ETH", "USDC"]);
+        assert_eq!(config.order.max_order_usd_cents, 25_000);
         assert_eq!(
             config
                 .token(31_337, Address::repeat_byte(2))
@@ -404,6 +411,15 @@ mod tests {
         );
         assert!(matches!(
             AppConfig::from_json(&bad_bps),
+            Err(ConfigError::Invalid(_))
+        ));
+
+        let zero_order_cap = VALID_CONFIG.replace(
+            "\"max_order_usd_cents\": 25000",
+            "\"max_order_usd_cents\": 0",
+        );
+        assert!(matches!(
+            AppConfig::from_json(&zero_order_cap),
             Err(ConfigError::Invalid(_))
         ));
     }

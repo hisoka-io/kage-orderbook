@@ -60,6 +60,9 @@ impl Order {
                 self.state = OrderState::Validated;
             }
             OrderEvent::SolverReservationRequested { .. } => {
+                self.solver = None;
+                self.solver_noise_public_key = None;
+                self.tx_hash = None;
                 self.state = OrderState::Reserving;
             }
             OrderEvent::SolverAssigned { solver_id, .. } => {

@@ -123,6 +123,7 @@ fn router_with_state(
         .route("/solver/proofs", get(take_solver_proofs))
         .route("/chain/jobs", get(executing_orders))
         .route("/orders/{order_id}/reserve", post(reserve_order))
+        .route("/orders/{order_id}/decline", post(decline_order))
         .route(
             "/orders/{order_id}/encrypted-proof",
             post(relay_encrypted_proof),
@@ -215,10 +216,10 @@ async fn create_order(
                 terms.amount_out,
                 status.as_u16()
             );
-            let code = if matches!(error, PriceValidationError::Pricing(_)) {
-                "pricing_unavailable"
-            } else {
-                "invalid_quote"
+            let code = match error {
+                PriceValidationError::Pricing(_) => "pricing_unavailable",
+                PriceValidationError::OrderValueExceeded { .. } => "order_value_limit",
+                _ => "invalid_quote",
             };
             return Err(api_error(status, code, error.to_string(), Vec::new()));
         }
@@ -351,6 +352,37 @@ async fn reserve_order(
     .await
 }
 
+async fn decline_order(
+    State(state): State<ApiState>,
+    Path(order_id): Path<OrderId>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    let solver_id = solver_id_from_headers(&headers)?;
+    let order = state
+        .orderbook
+        .get_order(order_id)
+        .await
+        .map_err(status_for_error)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if order.solver != Some(solver_id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    crate::service_error!(
+        "orderbook",
+        "solver declined order={} solver={solver_id}",
+        short_id(order_id)
+    );
+    execute(
+        &state.orderbook,
+        Command::SolverDeclined {
+            order_id,
+            solver_id,
+        },
+    )
+    .await
+}
+
 async fn relay_encrypted_proof(
     State(state): State<ApiState>,
     Path(order_id): Path<OrderId>,
@@ -433,7 +465,15 @@ async fn solver_events_ws(
     Ok(ws.on_upgrade(move |socket| async move {
         let connection = readiness.solver_connection();
         crate::service_log!("orderbook", "solver connected solver={solver_id}");
-        forward_service_events(socket, events, ServiceStream::Solver(solver_id)).await;
+        forward_service_events(
+            socket,
+            events,
+            ServiceStream::Solver {
+                solver_id,
+                orderbook: state.orderbook,
+            },
+        )
+        .await;
         drop(connection);
         crate::service_log!("orderbook", "solver disconnected solver={solver_id}");
     }))
@@ -513,9 +553,11 @@ async fn forward_user_events(
     }
 }
 
-#[derive(Clone, Copy)]
 enum ServiceStream {
-    Solver(SolverId),
+    Solver {
+        solver_id: SolverId,
+        orderbook: OrderbookHandle,
+    },
     Chain,
 }
 
@@ -542,13 +584,23 @@ async fn forward_service_events(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 };
 
-                let relevant = match stream {
-                    ServiceStream::Solver(solver_id) => match &event {
+                let relevant = match &stream {
+                    ServiceStream::Solver {
+                        solver_id,
+                        orderbook,
+                    } => match &event {
                         OrderEvent::SolverReservationRequested { .. } => true,
                         OrderEvent::ProofRelayed {
                             solver_id: assigned,
                             ..
-                        } => *assigned == solver_id,
+                        } => assigned == solver_id,
+                        OrderEvent::OrderFilled { order_id, .. }
+                        | OrderEvent::OrderExpired { order_id } => orderbook
+                            .get_order(*order_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|order| order.solver == Some(*solver_id)),
                         _ => false,
                     },
                     ServiceStream::Chain => matches!(event, OrderEvent::ExecutionStarted { .. }),
@@ -604,7 +656,8 @@ fn status_for_price_validation(error: &PriceValidationError) -> StatusCode {
         PriceValidationError::Pricing(_) => StatusCode::SERVICE_UNAVAILABLE,
         PriceValidationError::UnsupportedMarket
         | PriceValidationError::Arithmetic
-        | PriceValidationError::DeviationExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        | PriceValidationError::DeviationExceeded { .. }
+        | PriceValidationError::OrderValueExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 

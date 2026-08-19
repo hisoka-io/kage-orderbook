@@ -105,6 +105,35 @@ pub fn handle(order: Option<&Order>, command: Command) -> Result<Transition, Ord
             })
         }
 
+        Command::SolverDeclined {
+            order_id,
+            solver_id,
+        } => {
+            let order = order.ok_or(OrderError::NotFound)?;
+            if order.solver != Some(solver_id)
+                || !matches!(
+                    order.state,
+                    OrderState::Assigned | OrderState::AwaitingUserProof | OrderState::ProofRelayed
+                )
+            {
+                return Err(OrderError::InvalidState);
+            }
+            let expires_at_ms = order.expires_at_ms.ok_or(OrderError::InvalidState)?;
+            let terms = TradeTerms {
+                chain_id: order.chain_id,
+                token_in: order.token_in,
+                token_out: order.token_out,
+                amount_in: order.amount_in,
+                amount_out: order.amount_out,
+                expires_at_ms,
+            };
+
+            Ok(Transition {
+                events: vec![OrderEvent::SolverReservationRequested { order_id, terms }],
+                deliveries: vec![],
+            })
+        }
+
         Command::RelayEncryptedProof {
             order_id,
             ciphertext,
@@ -222,6 +251,7 @@ impl Orderbook {
         let delete_proof = matches!(
             &command,
             Command::ExecutionStarted { .. }
+                | Command::SolverDeclined { .. }
                 | Command::SettlementObserved { .. }
                 | Command::ExpireOrder { .. }
         );
@@ -290,6 +320,7 @@ fn is_idempotent(order: Option<&Order>, command: &Command, stored_proof: Option<
             order.state == OrderState::Executing
                 || (order.state == OrderState::ProofRelayed && stored_proof == Some(ciphertext))
         }
+        Command::SolverDeclined { .. } => order.state == OrderState::Reserving,
         Command::ExecutionStarted {
             solver_id, tx_hash, ..
         } => {

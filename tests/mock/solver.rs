@@ -24,6 +24,7 @@ pub async fn run(
     solver_id: SolverId,
     noise_private_key: [u8; 32],
     ready: oneshot::Sender<()>,
+    settled: oneshot::Sender<OrderId>,
 ) {
     let client = reqwest::Client::new();
     let mut request = ws_url.into_client_request().unwrap();
@@ -48,6 +49,7 @@ pub async fn run(
     }
 
     let _ = ready.send(());
+    let mut settled = Some(settled);
 
     while let Some(message) = socket.next().await {
         let message = message.unwrap();
@@ -65,6 +67,11 @@ pub async fn run(
                 ..
             } if assigned_solver == solver_id => {
                 execute_proofs(&client, &http_url, solver_id, &noise_private_key).await;
+            }
+            OrderEvent::OrderFilled { order_id, .. } => {
+                if let Some(sender) = settled.take() {
+                    let _ = sender.send(order_id);
+                }
             }
             _ => {}
         }

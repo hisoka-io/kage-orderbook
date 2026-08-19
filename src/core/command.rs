@@ -13,6 +13,11 @@ pub enum Command {
         noise_public_key: Vec<u8>,
     },
 
+    SolverDeclined {
+        order_id: OrderId,
+        solver_id: SolverId,
+    },
+
     RelayEncryptedProof {
         order_id: OrderId,
         ciphertext: Vec<u8>,
@@ -39,6 +44,7 @@ impl Command {
         match self {
             Command::CreateOrder { order_id, .. }
             | Command::SolverReserved { order_id, .. }
+            | Command::SolverDeclined { order_id, .. }
             | Command::RelayEncryptedProof { order_id, .. }
             | Command::ExecutionStarted { order_id, .. }
             | Command::SettlementObserved { order_id, .. }
@@ -50,6 +56,7 @@ impl Command {
         match self {
             Command::CreateOrder { .. } => "CreateOrder",
             Command::SolverReserved { .. } => "SolverReserved",
+            Command::SolverDeclined { .. } => "SolverDeclined",
             Command::RelayEncryptedProof { .. } => "RelayEncryptedProof",
             Command::ExecutionStarted { .. } => "ExecutionStarted",
             Command::SettlementObserved { .. } => "SettlementObserved",

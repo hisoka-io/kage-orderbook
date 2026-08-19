@@ -26,6 +26,7 @@ struct MarketPricing {
 pub struct PricingValidator {
     pricing: PricingHandle,
     markets: Arc<HashMap<MarketKey, MarketPricing>>,
+    max_order_usd_cents: u64,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -38,6 +39,11 @@ pub enum PriceValidationError {
     Arithmetic,
     #[error("quote exceeds the maximum deviation of {max_bps} BPS")]
     DeviationExceeded { max_bps: u16 },
+    #[error("{side} value exceeds the configured maximum of {max_usd_cents} USD cents")]
+    OrderValueExceeded {
+        side: &'static str,
+        max_usd_cents: u64,
+    },
 }
 
 impl PricingValidator {
@@ -85,6 +91,7 @@ impl PricingValidator {
         Self {
             pricing,
             markets: Arc::new(markets),
+            max_order_usd_cents: config.order.max_order_usd_cents,
         }
     }
 
@@ -105,6 +112,21 @@ impl PricingValidator {
             self.pricing
                 .fresh_pair_at(&market.asset_in, &market.asset_out, now_ms)?;
 
+        validate_order_value(
+            terms.amount_in,
+            price_in.price_e18,
+            market.decimals_in,
+            "input",
+            self.max_order_usd_cents,
+        )?;
+        validate_order_value(
+            terms.amount_out,
+            price_out.price_e18,
+            market.decimals_out,
+            "output",
+            self.max_order_usd_cents,
+        )?;
+
         let input_value =
             normalized_value(terms.amount_in, price_in.price_e18, market.decimals_out)?;
         let output_value =
@@ -124,6 +146,37 @@ impl PricingValidator {
         }
         Ok(())
     }
+}
+
+fn validate_order_value(
+    amount: U256,
+    price_e18: U256,
+    decimals: u8,
+    side: &'static str,
+    max_usd_cents: u64,
+) -> Result<(), PriceValidationError> {
+    let value_cents_scaled = U512::from(amount)
+        .checked_mul(U512::from(price_e18))
+        .and_then(|value| value.checked_mul(U512::from(100_u8)))
+        .ok_or(PriceValidationError::Arithmetic)?;
+    let token_scale = U512::from(10_u8)
+        .checked_pow(U512::from(decimals))
+        .ok_or(PriceValidationError::Arithmetic)?;
+    let price_scale = U512::from(10_u8)
+        .checked_pow(U512::from(18_u8))
+        .ok_or(PriceValidationError::Arithmetic)?;
+    let limit_cents_scaled = U512::from(max_usd_cents)
+        .checked_mul(token_scale)
+        .and_then(|value| value.checked_mul(price_scale))
+        .ok_or(PriceValidationError::Arithmetic)?;
+
+    if value_cents_scaled > limit_cents_scaled {
+        return Err(PriceValidationError::OrderValueExceeded {
+            side,
+            max_usd_cents,
+        });
+    }
+    Ok(())
 }
 
 fn normalized_value(
@@ -157,7 +210,7 @@ mod tests {
     fn config() -> AppConfig {
         AppConfig::from_json(
             r#"{
-              "order": { "default_ttl_seconds": 60, "min_ttl_seconds": 5, "max_ttl_seconds": 300 },
+              "order": { "default_ttl_seconds": 60, "min_ttl_seconds": 5, "max_ttl_seconds": 300, "max_order_usd_cents": 25000 },
               "database": { "max_connections": 1, "busy_timeout_ms": 5000 },
               "runtime": { "command_capacity": 256 },
               "pricing": { "max_age_ms": 1000, "reconnect_delay_ms": 1000, "idle_timeout_ms": 30000 },
@@ -180,7 +233,7 @@ mod tests {
             chain_id: 31_337,
             token_in: Address::repeat_byte(1),
             token_out: Address::repeat_byte(2),
-            amount_in: U256::from(1_000_000_000_000_000_000_u64),
+            amount_in: U256::from(100_000_000_000_000_000_u64),
             amount_out: U256::from(amount_out),
             expires_at_ms: 60_000,
         }
@@ -230,28 +283,56 @@ mod tests {
     #[test]
     fn accepts_exact_boundary_and_mixed_decimals() {
         let validator = validator(NOW_MS, true);
-        assert_eq!(validator.validate_at(&terms(2_000_000_000), NOW_MS), Ok(()));
-        assert_eq!(validator.validate_at(&terms(1_990_000_000), NOW_MS), Ok(()));
+        assert_eq!(validator.validate_at(&terms(200_000_000), NOW_MS), Ok(()));
+        assert_eq!(validator.validate_at(&terms(199_000_000), NOW_MS), Ok(()));
     }
 
     #[test]
     fn accepts_within_limit_and_rejects_outside_limit() {
         let validator = validator(NOW_MS, true);
-        assert_eq!(validator.validate_at(&terms(1_992_000_000), NOW_MS), Ok(()));
+        assert_eq!(validator.validate_at(&terms(199_200_000), NOW_MS), Ok(()));
         assert_eq!(
-            validator.validate_at(&terms(1_980_000_000), NOW_MS),
+            validator.validate_at(&terms(198_000_000), NOW_MS),
             Err(PriceValidationError::DeviationExceeded { max_bps: 50 })
+        );
+    }
+
+    #[test]
+    fn accepts_exact_order_cap_and_rejects_either_side_above_it() {
+        let validator = validator(NOW_MS, true);
+        let mut boundary = terms(250_000_000);
+        boundary.amount_in = U256::from(125_000_000_000_000_000_u64);
+        assert_eq!(validator.validate_at(&boundary, NOW_MS), Ok(()));
+
+        let mut input_over = boundary;
+        input_over.amount_in += U256::from(1_u8);
+        assert_eq!(
+            validator.validate_at(&input_over, NOW_MS),
+            Err(PriceValidationError::OrderValueExceeded {
+                side: "input",
+                max_usd_cents: 25_000,
+            })
+        );
+
+        let mut output_over = boundary;
+        output_over.amount_out += U256::from(1_u8);
+        assert_eq!(
+            validator.validate_at(&output_over, NOW_MS),
+            Err(PriceValidationError::OrderValueExceeded {
+                side: "output",
+                max_usd_cents: 25_000,
+            })
         );
     }
 
     #[test]
     fn rejects_stale_and_missing_prices() {
         assert!(matches!(
-            validator(NOW_MS - 1_001, true).validate_at(&terms(2_000_000_000), NOW_MS),
+            validator(NOW_MS - 1_001, true).validate_at(&terms(200_000_000), NOW_MS),
             Err(PriceValidationError::Pricing(PricingReadError::Stale(_)))
         ));
         assert!(matches!(
-            validator(NOW_MS, false).validate_at(&terms(2_000_000_000), NOW_MS),
+            validator(NOW_MS, false).validate_at(&terms(200_000_000), NOW_MS),
             Err(PriceValidationError::Pricing(PricingReadError::Missing(_)))
         ));
     }
@@ -259,7 +340,7 @@ mod tests {
     #[test]
     fn rejects_arithmetic_overflow() {
         let validator = validator_with_eth_price(NOW_MS, true, U256::MAX);
-        let mut overflowing = terms(2_000_000_000);
+        let mut overflowing = terms(200_000_000);
         overflowing.amount_in = U256::MAX;
         assert_eq!(
             validator.validate_at(&overflowing, NOW_MS),
@@ -270,10 +351,10 @@ mod tests {
     #[test]
     fn rejects_an_unconfigured_direction() {
         let validator = validator(NOW_MS, true);
-        let mut reversed = terms(2_000_000_000);
+        let mut reversed = terms(200_000_000);
         (reversed.token_in, reversed.token_out) = (reversed.token_out, reversed.token_in);
-        reversed.amount_in = U256::from(2_000_000_000_u64);
-        reversed.amount_out = U256::from(1_000_000_000_000_000_000_u64);
+        reversed.amount_in = U256::from(200_000_000_u64);
+        reversed.amount_out = U256::from(100_000_000_000_000_000_u64);
         assert_eq!(
             validator.validate_at(&reversed, NOW_MS),
             Err(PriceValidationError::UnsupportedMarket)

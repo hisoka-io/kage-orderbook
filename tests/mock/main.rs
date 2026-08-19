@@ -548,6 +548,54 @@ async fn orders_wait_for_an_external_solver() {
 }
 
 #[tokio::test]
+async fn assigned_solver_can_decline_and_requeue_an_order() {
+    let (http_url, _, server) = server().await;
+    let client = reqwest::Client::new();
+    let (order_id, order_commitment) = create_order_with_commitment(&client, &http_url, 1).await;
+
+    client
+        .post(format!("{http_url}/orders/{order_id}/reserve"))
+        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let wrong_solver = client
+        .post(format!("{http_url}/orders/{order_id}/decline"))
+        .header(SOLVER_ADDRESS_HEADER, solver_address(0x22).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_solver.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let declined = client
+        .post(format!("{http_url}/orders/{order_id}/decline"))
+        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(declined.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let order = client
+        .get(format!("{http_url}/orders/{order_id}"))
+        .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Order>()
+        .await
+        .unwrap();
+    assert_eq!(order.state, OrderState::Reserving);
+    assert_eq!(order.solver, None);
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn external_services_drive_orders_to_filled() {
     let orderbook = start_orderbook("sqlite::memory:").await.unwrap();
     let mut events = orderbook.subscribe();
@@ -585,12 +633,14 @@ async fn external_services_drive_orders_to_filled() {
     user_ready_rx.await.unwrap();
 
     let (solver_ready_tx, solver_ready_rx) = oneshot::channel();
+    let (solver_settled_tx, solver_settled_rx) = oneshot::channel();
     let solver = tokio::spawn(solver::run(
         http_url,
         solver_ws_url,
         solver_address(0x11),
         noise_private_key(0x33),
         solver_ready_tx,
+        solver_settled_tx,
     ));
     solver_ready_rx.await.unwrap();
 
@@ -637,6 +687,11 @@ async fn external_services_drive_orders_to_filled() {
             ]
         );
     }
+    let settled_order = tokio::time::timeout(Duration::from_secs(1), solver_settled_rx)
+        .await
+        .expect("solver did not receive OrderFilled")
+        .expect("solver settlement channel closed");
+    assert!(seen.contains_key(&settled_order));
 
     solver.abort();
     chain.abort();
