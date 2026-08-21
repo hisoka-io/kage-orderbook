@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use kage_orderbook::{
     api,
-    config::AppConfig,
+    config::{AppConfig, Network},
     core::engine::start_orderbook_with_repository,
     pricing::{self, PricingConfig, PricingValidator},
     readiness::ServiceReadiness,
@@ -13,8 +13,8 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
-    let config = AppConfig::load()?;
+    let network = Network::bootstrap(std::env::args().nth(1))?;
+    let config = AppConfig::load(network)?;
     let database_url = std::env::var("DATABASE_URL")?;
     let listen_address = std::env::var("KAGE_ORDERBOOK_LISTEN_ADDR")?;
     let registry_url = std::env::var("KAGE_REGISTRY_URL")?;
@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.database.max_connections,
     )
     .await?;
+    repository.bind_network(network).await?;
     let orderbook =
         start_orderbook_with_repository(repository, config.runtime.command_capacity).await?;
     let registry = SolverRegistry::http(registry_url);
@@ -54,7 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     kage_orderbook::service_log!(
         "orderbook",
-        "started address={} max_order_usd_cents={}",
+        "started network={} address={} max_order_usd_cents={}",
+        network,
         listen_address,
         config.order.max_order_usd_cents
     );

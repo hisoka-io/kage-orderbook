@@ -8,7 +8,7 @@ use std::{
 use alloy_primitives::{B256, U256, U512};
 use futures_util::{SinkExt, StreamExt};
 use kage_orderbook::{
-    config::AppConfig,
+    config::{AppConfig, Network},
     logging::short_id,
     pricing::{self, PricePoint, PricingConfig, PricingHandle},
 };
@@ -154,9 +154,9 @@ fn new_order_commitment() -> B256 {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    dotenvy::dotenv().ok();
+    let network = Network::bootstrap(None)?;
     let options = Config::from_args()?;
-    let app_config = AppConfig::load()?;
+    let app_config = AppConfig::load(network)?;
     let chain = app_config
         .chains
         .first()

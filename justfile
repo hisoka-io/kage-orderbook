@@ -1,7 +1,7 @@
 default: ci
 
-run:
-    cargo run
+run network="localnet":
+    cargo run -- {{network}}
 
 fmt:
     cargo fmt

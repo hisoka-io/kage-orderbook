@@ -10,7 +10,10 @@ use sqlx::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::order::{Order, OrderCommitment, OrderId, OrderState, SolverId};
+use crate::{
+    config::Network,
+    order::{Order, OrderCommitment, OrderId, OrderState, SolverId},
+};
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -24,6 +27,8 @@ pub enum RepositoryError {
     DuplicateOrderCommitment,
     #[error("invalid stored {field}: {value}")]
     InvalidData { field: &'static str, value: String },
+    #[error("database belongs to {found}, refusing to open it as {expected}")]
+    NetworkMismatch { found: String, expected: Network },
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +77,28 @@ impl OrderRepository {
         let repository = Self { pool };
         repository.migrate().await?;
         Ok(repository)
+    }
+
+    /// Stamps an unstamped database with its network and rejects one that
+    pub async fn bind_network(&self, network: Network) -> Result<(), RepositoryError> {
+        let found: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await?;
+        if found == network.stamp() {
+            return Ok(());
+        }
+        if found != 0 {
+            return Err(RepositoryError::NetworkMismatch {
+                found: Network::from_stamp(found)
+                    .map_or_else(|| format!("unknown stamp {found}"), |net| net.to_string()),
+                expected: network,
+            });
+        }
+        // PRAGMA does not accept bound parameters.
+        sqlx::query(&format!("PRAGMA user_version = {}", network.stamp()))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn migrate(&self) -> Result<(), RepositoryError> {
@@ -498,6 +525,19 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[tokio::test]
+    async fn network_stamp_is_sticky() {
+        let repository = OrderRepository::connect("sqlite::memory:").await.unwrap();
+
+        repository.bind_network(Network::Localnet).await.unwrap();
+        repository.bind_network(Network::Localnet).await.unwrap();
+
+        assert!(matches!(
+            repository.bind_network(Network::Mainnet).await,
+            Err(RepositoryError::NetworkMismatch { .. })
+        ));
+    }
 
     fn order(state: OrderState, version: u64) -> Order {
         Order {

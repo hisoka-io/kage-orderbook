@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use alloy_primitives::Address;
@@ -10,6 +12,69 @@ use thiserror::Error;
 use crate::core::guards::{ApprovedMarket, OrderPolicy};
 
 const MAX_TOKEN_DECIMALS: u8 = 77;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Network {
+    Localnet,
+    Testnet,
+    Mainnet,
+}
+
+impl Network {
+    pub fn bootstrap(explicit: Option<String>) -> Result<Self, ConfigError> {
+        let network: Self = explicit
+            .or_else(|| std::env::var("KAGE_NETWORK").ok())
+            .unwrap_or_else(|| Self::Localnet.as_str().to_owned())
+            .parse()?;
+        let file = format!(".env.{network}");
+        dotenvy::from_filename(&file).map_err(|source| ConfigError::Env { file, source })?;
+        Ok(network)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Localnet => "localnet",
+            Self::Testnet => "testnet",
+            Self::Mainnet => "mainnet",
+        }
+    }
+
+    /// Written into the database's `PRAGMA user_version` so a database opened
+    pub fn stamp(self) -> i64 {
+        match self {
+            Self::Localnet => 1,
+            Self::Testnet => 2,
+            Self::Mainnet => 3,
+        }
+    }
+
+    pub fn from_stamp(stamp: i64) -> Option<Self> {
+        [Self::Localnet, Self::Testnet, Self::Mainnet]
+            .into_iter()
+            .find(|network| network.stamp() == stamp)
+    }
+}
+
+impl FromStr for Network {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "localnet" => Ok(Self::Localnet),
+            "testnet" => Ok(Self::Testnet),
+            "mainnet" => Ok(Self::Mainnet),
+            other => Err(invalid(format!(
+                "unknown network {other}, expected localnet|testnet|mainnet"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,6 +150,11 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to load env file {file}: {source}")]
+    Env {
+        file: String,
+        source: dotenvy::Error,
+    },
     #[error("invalid config JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid config: {0}")]
@@ -92,10 +162,10 @@ pub enum ConfigError {
 }
 
 impl AppConfig {
-    pub fn load() -> Result<Self, ConfigError> {
+    pub fn load(network: Network) -> Result<Self, ConfigError> {
         let path = std::env::var("KAGE_ORDERBOOK_CONFIG")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("config.json"));
+            .unwrap_or_else(|_| PathBuf::from(format!("config/{network}.json")));
         Self::load_from(path)
     }
 
@@ -426,9 +496,19 @@ mod tests {
 
     #[test]
     fn checked_in_config_is_valid() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.json");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/localnet.json");
         let config = AppConfig::load_from(path).unwrap();
 
-        assert_eq!(config.pricing_assets(), vec!["ETH", "LINK", "USDC", "USDT"]);
+        assert_eq!(config.pricing_assets(), vec!["ETH", "USDC", "USDT"]);
+    }
+
+    #[test]
+    fn network_names_and_stamps_are_distinct() {
+        for network in [Network::Localnet, Network::Testnet, Network::Mainnet] {
+            assert_eq!(network.as_str().parse::<Network>().unwrap(), network);
+            assert_eq!(Network::from_stamp(network.stamp()), Some(network));
+        }
+        assert!("mainet".parse::<Network>().is_err());
+        assert!(Network::from_stamp(0).is_none());
     }
 }

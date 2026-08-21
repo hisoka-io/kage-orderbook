@@ -2,7 +2,7 @@ use std::{error::Error, io, time::Duration};
 
 use alloy_primitives::{B256, U256, U512};
 use kage_orderbook::{
-    config::AppConfig,
+    config::{AppConfig, Network},
     pricing::{self, PricingConfig},
 };
 use kage_types::api_types::{ApiErrorResponse, CreateOrderRequest, CreateOrderResponse};
@@ -20,9 +20,9 @@ async fn main() {
 }
 
 async fn run() -> Result<(), BoxError> {
-    dotenvy::dotenv().ok();
+    let network = Network::bootstrap(None)?;
     let wrong_quote = parse_args()?;
-    let config = AppConfig::load()?;
+    let config = AppConfig::load(network)?;
     let feed_url = std::env::var("KAGE_PRICING_FEED_URL")?;
     let token = std::env::var("KAGE_PRICING_FEED_TOKEN")?;
     let http_url =
