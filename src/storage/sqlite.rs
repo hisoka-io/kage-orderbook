@@ -107,10 +107,9 @@ impl OrderRepository {
         let result = sqlx::query(
             "INSERT INTO orders (
                 id, chain_id, state, version, token_in, token_out, amount_in, amount_out,
-                solver_id, solver_noise_public_key, tx_hash,
-                created_at_ms, updated_at_ms, expires_at_ms, order_commitment,
-                solver_address
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                solver_noise_public_key, tx_hash, created_at_ms, updated_at_ms,
+                expires_at_ms, order_commitment, solver_address
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(order.id.to_string())
         .bind(u64_to_i64("chain_id", order.chain_id)?)
@@ -120,7 +119,6 @@ impl OrderRepository {
         .bind(order.token_out.as_slice())
         .bind(order.amount_in.to_string())
         .bind(order.amount_out.to_string())
-        .bind(Option::<String>::None)
         .bind(order.solver_noise_public_key.as_deref())
         .bind(order.tx_hash.map(|hash| hash.to_vec()))
         .bind(created_at_ms)
@@ -182,18 +180,15 @@ impl OrderRepository {
         if let Some((solver_id, ciphertext)) = proof {
             sqlx::query(
                 "INSERT INTO proof_payloads (
-                    order_id, solver_id, solver_address, ciphertext,
-                    created_at_ms, delivered_at_ms
-                 ) VALUES (?, ?, ?, ?, ?, NULL)
+                    order_id, solver_address, ciphertext, created_at_ms, delivered_at_ms
+                 ) VALUES (?, ?, ?, ?, NULL)
                  ON CONFLICT(order_id) DO UPDATE SET
-                    solver_id = excluded.solver_id,
                     solver_address = excluded.solver_address,
                     ciphertext = excluded.ciphertext,
                     created_at_ms = excluded.created_at_ms,
                     delivered_at_ms = NULL",
             )
             .bind(order.id.to_string())
-            .bind(solver_id.to_string())
             .bind(solver_id.as_slice())
             .bind(ciphertext)
             .bind(timestamp_ms)
