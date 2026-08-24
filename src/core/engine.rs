@@ -193,6 +193,29 @@ pub fn handle(order: Option<&Order>, command: Command) -> Result<Transition, Ord
             })
         }
 
+        Command::ExecutionFailed { order_id, tx_hash } => {
+            let order = order.ok_or(OrderError::NotFound)?;
+            if order.state != OrderState::Executing || order.tx_hash != Some(tx_hash) {
+                return Err(OrderError::InvalidState);
+            }
+            let expires_at_ms = order.expires_at_ms.ok_or(OrderError::InvalidState)?;
+
+            Ok(Transition {
+                events: vec![OrderEvent::SolverReservationRequested {
+                    order_id,
+                    terms: TradeTerms {
+                        chain_id: order.chain_id,
+                        token_in: order.token_in,
+                        token_out: order.token_out,
+                        amount_in: order.amount_in,
+                        amount_out: order.amount_out,
+                        expires_at_ms,
+                    },
+                }],
+                deliveries: vec![],
+            })
+        }
+
         Command::ExpireOrder { order_id } => {
             let order = order.ok_or(OrderError::NotFound)?;
             if matches!(
@@ -253,6 +276,7 @@ impl Orderbook {
             Command::ExecutionStarted { .. }
                 | Command::SolverDeclined { .. }
                 | Command::SettlementObserved { .. }
+                | Command::ExecutionFailed { .. }
                 | Command::ExpireOrder { .. }
         );
         let transition = handle(current, command)?;
@@ -289,10 +313,6 @@ impl Orderbook {
         let events = prepared.transition.events.clone();
         self.commit(&prepared);
         Ok(events)
-    }
-
-    pub fn orders(&self) -> &HashMap<OrderId, Order> {
-        &self.orders
     }
 }
 
@@ -331,6 +351,7 @@ fn is_idempotent(order: Option<&Order>, command: &Command, stored_proof: Option<
         Command::SettlementObserved { tx_hash, .. } => {
             order.state == OrderState::Filled && order.tx_hash == Some(*tx_hash)
         }
+        Command::ExecutionFailed { .. } => order.state == OrderState::Reserving,
         Command::CreateOrder { .. } | Command::ExpireOrder { .. } => false,
     }
 }
@@ -549,15 +570,8 @@ impl OrderbookHandle {
 }
 
 pub async fn start_orderbook(database_url: &str) -> Result<OrderbookHandle, RepositoryError> {
-    start_orderbook_with_capacity(database_url, 256).await
-}
-
-pub async fn start_orderbook_with_capacity(
-    database_url: &str,
-    capacity: usize,
-) -> Result<OrderbookHandle, RepositoryError> {
     let repository = OrderRepository::connect(database_url).await?;
-    start_orderbook_with_repository(repository, capacity).await
+    start_orderbook_with_repository(repository, 256).await
 }
 
 pub async fn start_orderbook_with_repository(
@@ -573,7 +587,11 @@ pub async fn start_orderbook_with_repository(
     let events = event_tx.clone();
 
     tokio::spawn(async move {
-        crate::service_log!("orderbook", "restored active_orders={restored_count}");
+        if restored_count > 0 {
+            crate::service_log!("orderbook", "orders restored active={restored_count}");
+        } else {
+            tracing::debug!(target: "orderbook", "no active orders to restore");
+        }
         let mut expiry_interval = tokio::time::interval(Duration::from_millis(100));
         expiry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -721,19 +739,19 @@ async fn create_order_idempotently(
         .map_err(ServiceError::Repository)?
     {
         if !same_create_terms(&existing.order, &terms) {
-            crate::service_error!(
+            crate::service_warn!(
                 "orderbook",
-                "rejected command=CreateOrder order={} existing_order={} error=ConflictingCommitment",
+                "rejected command=CreateOrder order_id={} existing_order_id={} error=ConflictingCommitment",
                 short_id(order_id),
                 short_id(existing.order.id)
             );
             return Err(ServiceError::Order(OrderError::AlreadyExists));
         }
 
-        crate::service_log!(
-            "orderbook",
-            "idempotent command=CreateOrder order={}",
-            short_id(existing.order.id)
+        tracing::debug!(
+            target: "orderbook",
+            order_id = %short_id(existing.order.id),
+            "idempotent create"
         );
         return Ok(CreateOrderOutcome {
             order: existing.order,
@@ -780,10 +798,11 @@ async fn execute_command(
 ) -> Result<(), ServiceError> {
     let order_id = command.order_id();
     let command_name = command.name();
-    crate::service_log!(
-        "orderbook",
-        "received command={command_name} order={}",
-        short_id(order_id)
+    tracing::debug!(
+        target: "orderbook",
+        command = command_name,
+        order_id = %short_id(order_id),
+        "command received"
     );
 
     let result: Result<(), ServiceError> = async {
@@ -849,19 +868,15 @@ async fn execute_command(
                 persisted.map_err(ServiceError::Repository)?;
                 orderbook.commit(&prepared);
                 for event in prepared.transition.events {
-                    crate::service_log!(
-                        "orderbook",
-                        "emitted event={} order={}",
-                        event.name(),
-                        short_id(event.order_id())
-                    );
+                    log_order_event(&event);
                     let _ = events.send(event);
                 }
             }
-            None => crate::service_log!(
-                "orderbook",
-                "idempotent command={command_name} order={}",
-                short_id(order_id)
+            None => tracing::debug!(
+                target: "orderbook",
+                command = command_name,
+                order_id = %short_id(order_id),
+                "idempotent command"
             ),
         }
         Ok(())
@@ -869,13 +884,63 @@ async fn execute_command(
     .await;
 
     if let Err(error) = &result {
-        crate::service_error!(
-            "orderbook",
-            "rejected command={command_name} order={} error={error:?}",
-            short_id(order_id)
-        );
+        match error {
+            ServiceError::Order(_) => crate::service_warn!(
+                "orderbook",
+                "command rejected command={command_name} order_id={} error={error:?}",
+                short_id(order_id)
+            ),
+            ServiceError::Closed | ServiceError::Repository(_) => crate::service_error!(
+                "orderbook",
+                "command failed command={command_name} order_id={} error={error:?}",
+                short_id(order_id)
+            ),
+        }
     }
     result
+}
+
+fn log_order_event(event: &OrderEvent) {
+    match event {
+        OrderEvent::SolverAssigned {
+            order_id,
+            solver_id,
+        } => crate::service_log!(
+            "orderbook",
+            "order assigned order_id={} solver={solver_id}",
+            short_id(*order_id)
+        ),
+        OrderEvent::ProofRelayed { order_id, .. } => {
+            crate::service_log!(
+                "orderbook",
+                "proof received order_id={}",
+                short_id(*order_id)
+            )
+        }
+        OrderEvent::ExecutionStarted { order_id, tx_hash } => crate::service_log!(
+            "orderbook",
+            "execution submitted order_id={} tx_hash={tx_hash}",
+            short_id(*order_id)
+        ),
+        OrderEvent::OrderFilled { order_id, tx_hash } => crate::service_log!(
+            "orderbook",
+            "order filled order_id={} tx_hash={tx_hash}",
+            short_id(*order_id)
+        ),
+        OrderEvent::OrderExpired { order_id } => {
+            crate::service_log!(
+                "orderbook",
+                "order expired order_id={}",
+                short_id(*order_id)
+            )
+        }
+        _ => tracing::debug!(
+            target: "orderbook",
+            event = event.name(),
+            order_id = %short_id(event.order_id()),
+            "order transition"
+        ),
+    }
 }
 
 async fn expire_due_orders(

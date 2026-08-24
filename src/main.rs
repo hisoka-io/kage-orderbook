@@ -1,12 +1,16 @@
 use std::time::Duration;
 
+use kage_registry::{Config as RegistryConfig, RegistryIndexer};
+
 use kage_orderbook::{
     api,
+    chain::SettlementWatcher,
     config::{AppConfig, Network},
     core::engine::start_orderbook_with_repository,
     pricing::{self, PricingConfig, PricingValidator},
     readiness::ServiceReadiness,
     registry::SolverRegistry,
+    session::{SolverSessions, domain},
     storage::OrderRepository,
 };
 use tokio::net::TcpListener;
@@ -14,12 +18,17 @@ use tokio::net::TcpListener;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let network = Network::bootstrap(std::env::args().nth(1))?;
+    kage_orderbook::logging::init();
     let config = AppConfig::load(network)?;
     let database_url = std::env::var("DATABASE_URL")?;
     let listen_address = std::env::var("KAGE_ORDERBOOK_LISTEN_ADDR")?;
-    let registry_url = std::env::var("KAGE_REGISTRY_URL")?;
+    let rpc_url = std::env::var("KAGE_RPC_URL")?;
     let pricing_feed_url = std::env::var("KAGE_PRICING_FEED_URL")?;
     let pricing_token = std::env::var("KAGE_PRICING_FEED_TOKEN")?;
+
+    let [chain] = config.chains.as_slice() else {
+        return Err("exactly one chain must be configured".into());
+    };
 
     let pricing = pricing::spawn(PricingConfig {
         feed_url: pricing_feed_url,
@@ -39,27 +48,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     repository.bind_network(network).await?;
     let orderbook =
         start_orderbook_with_repository(repository, config.runtime.command_capacity).await?;
-    let registry = SolverRegistry::http(registry_url);
+    let indexer = RegistryIndexer::init(RegistryConfig {
+        confirmations: chain.confirmations,
+        ..RegistryConfig::new(rpc_url.clone(), chain.registry, chain.registry_deploy_block)
+    })
+    .await?;
+    let registry = SolverRegistry::chain(indexer);
     let readiness = ServiceReadiness::new();
+    SettlementWatcher::connect(
+        &rpc_url,
+        chain.darkpool,
+        chain.confirmations,
+        orderbook.clone(),
+    )
+    .await?
+    .spawn();
+    readiness.set_chain(true);
     readiness.monitor_pricing(pricing, Duration::from_millis(250));
     readiness.monitor_registry(registry.clone(), Duration::from_secs(1));
-    readiness.monitor_actor(orderbook.clone(), Duration::from_millis(250));
+    readiness.monitor_engine(orderbook.clone(), Duration::from_millis(250));
     let app = api::router_with_readiness(
         orderbook,
         registry,
+        SolverSessions::new(domain(network, chain.chain_id)),
         config.order_policy(),
         pricing_validator,
-        readiness,
+        readiness.clone(),
     );
     let listener = TcpListener::bind(&listen_address).await?;
 
     kage_orderbook::service_log!(
         "orderbook",
-        "started network={} address={} max_order_usd_cents={}",
+        "listening network={} address={} chain_id={} registry_contract={} max_order_usd=${}.{:02}",
         network,
         listen_address,
-        config.order.max_order_usd_cents
+        chain.chain_id,
+        chain.registry,
+        config.order.max_order_usd_cents / 100,
+        config.order.max_order_usd_cents % 100
     );
+    readiness.report();
     axum::serve(listener, app).await?;
     Ok(())
 }

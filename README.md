@@ -1,60 +1,52 @@
-# kage-orderbook
+# Kage Orderbook
 
-## Run
+The orderbook validates orders, checks market prices, routes orders to registered
+solvers, stores encrypted proofs, and tracks on-chain settlement.
+
+It runs independently from `kage-solver`. The services communicate through the
+orderbook HTTP and WebSocket APIs.
+
+## Run locally
+
+Start the local chain, deploy the Darkpool and Registry contracts, and start the
+pricing feed first.
 
 ```sh
-cp .env.example .env.localnet   # set KAGE_PRICING_FEED_TOKEN
-just run                        # localnet
-just run mainnet                # or: cargo run -- mainnet
+cp .env.example .env.localnet
+# Set KAGE_PRICING_FEED_TOKEN in .env.localnet
+
+just run
 ```
 
-Needs the pricing feed (`../kage-price-estimate`) running first.
-
-## Networks
-
-`localnet` (default), `testnet`, `mainnet`. The name picks all three together:
-
-| network | env | config | database |
-|---|---|---|---|
-| `localnet` | `.env.localnet` | `config/localnet.json` | `orderbook.localnet.db` |
-| `testnet` | `.env.testnet` | `config/testnet.json` | `orderbook.testnet.db` |
-| `mainnet` | `.env.mainnet` | `config/mainnet.json` | `orderbook.mainnet.db` |
-
-First argument for the orderbook, `KAGE_NETWORK` for other binaries. Each
-database is stamped on first use (`PRAGMA user_version`), so opening one from
-another network fails at startup with `NetworkMismatch`.
-
-## Config
-
-`config/<network>.json` (committed): chains, tokens, approved markets, TTL
-limits, `max_order_usd_cents`, pricing freshness, BPS limits, database tuning.
-Markets are directional — list each direction you want. A market BPS override
-may only tighten the stricter of its two token limits.
-
-`.env.<network>` (gitignored): `DATABASE_URL`, `KAGE_ORDERBOOK_LISTEN_ADDR`,
-`KAGE_REGISTRY_URL`, `KAGE_PRICING_FEED_URL`, `KAGE_PRICING_FEED_TOKEN`.
-
-## Commands
+The service listens on `127.0.0.1:3000` by default. Check readiness with:
 
 ```sh
-just                      # fmt, clippy, test
-just submit-priced-order  # one live-priced order
-just wrong-quote          # expect HTTP 422
-just test-intent-proof
-just test-prover-worker
-
-cargo run --bin mock_user -- --orders 1   # needs ../kage-solver + mock_chain
 curl -i http://127.0.0.1:3000/health/ready
 ```
 
-## Proof worker
+Set `RUST_LOG` in `.env.localnet` to control log filtering, for example
+`RUST_LOG=orderbook=debug,info,kage_registry=warn`.
 
-`tools/mock-kage-user` calls the Darkpool SDK at `../darkpool` (override with
-`DARKPOOL_ROOT`). Envelopes are Noise-encrypted to the assigned solver's
-registry key; the orderbook stores only the opaque payload.
+Runtime settings come from `.env.<network>`. Order, chain, token, market,
+pricing, and contract settings come from `config/<network>.json`. Localnet is
+included; add both files before running another network with `just run <network>`.
+
+## Development
 
 ```sh
-pnpm proof:test      # from tools/
-pnpm prover:sample
-pnpm prover:worker
+just ci                    # format check, Clippy, and tests
+just submit-priced-order   # submit a correctly priced order
+just wrong-quote           # submit an invalid quote and expect HTTP 422
+```
+
+Run the mock user against the independently running orderbook and solver:
+
+```sh
+cargo run --bin mock_user -- --orders 1
+```
+
+Run the ignored real-prover integration test explicitly with:
+
+```sh
+just test-prover-worker
 ```

@@ -21,24 +21,28 @@
     {
       "chain_id": 31337,
       "name": "local",
+      "darkpool": "0x9A9f2CCfdE556A7E9Ff0848998Aa4a0CFD8863AE",
+      "registry": "0xa85233C63b9Ee964Add6F2cffe00Fd84eb32338f",
+      "registry_deploy_block": 100,
+      "confirmations": 0,
       "tokens": [
         {
           "symbol": "WETH",
-          "address": "0x47Eed74d6D3551a7bCa61B16bb89f165B69fc508",
+          "address": "0x59b670e9fA9D0A427751Af201D676719a970857b",
           "decimals": 18,
           "pricing_asset": "ETH",
           "max_price_deviation_bps": 50
         },
         {
           "symbol": "USDC",
-          "address": "0x19F4ECD5cBde2721D2573341F76280B74dDcd7E6",
+          "address": "0x4ed7c70F96B99c776995fB64377f0d4aB3B0e1C1",
           "decimals": 6,
           "pricing_asset": "USDC",
           "max_price_deviation_bps": 20
         },
         {
           "symbol": "USDT",
-          "address": "0x231CB1d4E0C40b1b51C41B490D794512CCA40977",
+          "address": "0x322813Fd9A801c5507c9de605d63CEA4f2CE6c44",
           "decimals": 6,
           "pricing_asset": "USDT",
           "max_price_deviation_bps": 20

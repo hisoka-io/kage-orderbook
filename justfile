@@ -1,22 +1,25 @@
 default: ci
 
 run network="localnet":
-    cargo run -- {{network}}
+    @cargo run --quiet -- {{network}}
 
 fmt:
     cargo fmt
 
+fmt-check:
+    cargo fmt --check
+
 lint:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --locked --all-targets -- -D warnings
 
 test:
-    cargo test
+    cargo test --locked --all-targets
 
 submit-priced-order:
-    ./scripts/submit-priced-order.sh
+    cargo run --quiet --bin submit_priced_order
 
 wrong-quote:
-    ./scripts/wrong-quote.sh
+    cargo run --quiet --bin submit_priced_order -- --wrong-quote
 
 test-intent-proof:
     bash ./scripts/test-intent-proof.sh
@@ -24,7 +27,4 @@ test-intent-proof:
 test-prover-worker:
     cargo test --bin mock_user prover_worker::tests::generates_a_real_proof_through_the_worker -- --ignored --nocapture
 
-ci:
-    cargo fmt --check
-    cargo clippy --all-targets -- -D warnings
-    cargo test
+ci: fmt-check lint test

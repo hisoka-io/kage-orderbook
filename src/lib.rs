@@ -1,4 +1,5 @@
 pub mod api;
+pub mod chain;
 pub mod config;
 pub mod core;
 pub mod logging;
@@ -6,4 +7,5 @@ pub mod order;
 pub mod pricing;
 pub mod readiness;
 pub mod registry;
+pub mod session;
 pub mod storage;

@@ -19,9 +19,11 @@ use crate::{
 struct ReadinessState {
     pricing: AtomicBool,
     registry: AtomicBool,
-    actor: AtomicBool,
+    engine: AtomicBool,
     solvers: AtomicUsize,
-    chains: AtomicUsize,
+    chain: AtomicBool,
+    reported: AtomicBool,
+    announced_ready: AtomicBool,
 }
 
 #[derive(Clone, Default)]
@@ -29,15 +31,8 @@ pub struct ServiceReadiness {
     state: Arc<ReadinessState>,
 }
 
-#[derive(Clone, Copy)]
-enum ConnectionKind {
-    Solver,
-    Chain,
-}
-
-pub(crate) struct ConnectionGuard {
+pub(crate) struct SolverConnection {
     readiness: ServiceReadiness,
-    kind: ConnectionKind,
 }
 
 impl ServiceReadiness {
@@ -48,9 +43,9 @@ impl ServiceReadiness {
     pub fn snapshot(&self) -> ReadinessSnapshot {
         let pricing = self.state.pricing.load(Ordering::Acquire);
         let registry = self.state.registry.load(Ordering::Acquire);
-        let actor = self.state.actor.load(Ordering::Acquire);
+        let engine = self.state.engine.load(Ordering::Acquire);
         let solver = self.state.solvers.load(Ordering::Acquire) > 0;
-        let chain = self.state.chains.load(Ordering::Acquire) > 0;
+        let chain = self.state.chain.load(Ordering::Acquire);
         let mut missing = Vec::new();
         if !pricing {
             missing.push("pricing".to_owned());
@@ -64,8 +59,8 @@ impl ServiceReadiness {
         if !chain {
             missing.push("chain".to_owned());
         }
-        if !actor {
-            missing.push("actor".to_owned());
+        if !engine {
+            missing.push("orderbook_engine".to_owned());
         }
 
         ReadinessSnapshot {
@@ -74,12 +69,13 @@ impl ServiceReadiness {
             registry,
             solver,
             chain,
-            actor,
+            actor: engine,
             missing,
         }
     }
 
     pub fn monitor_pricing(&self, pricing: PricingHandle, interval: Duration) -> JoinHandle<()> {
+        self.set_pricing(pricing.status() == PricingStatus::Ready);
         let readiness = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(interval);
@@ -92,45 +88,36 @@ impl ServiceReadiness {
     }
 
     pub fn monitor_registry(&self, registry: SolverRegistry, interval: Duration) -> JoinHandle<()> {
+        self.set_registry(registry.health().is_ok());
         let readiness = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let healthy = tokio::time::timeout(interval.period(), registry.health())
-                    .await
-                    .is_ok_and(|result| result.is_ok());
-                readiness.set_registry(healthy);
+                readiness.set_registry(registry.health().is_ok());
             }
         })
     }
 
-    pub fn monitor_actor(&self, orderbook: OrderbookHandle, interval: Duration) -> JoinHandle<()> {
+    pub fn monitor_engine(&self, orderbook: OrderbookHandle, interval: Duration) -> JoinHandle<()> {
+        self.set_engine(orderbook.is_available());
         let readiness = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                readiness.set_actor(orderbook.is_available());
+                readiness.set_engine(orderbook.is_available());
             }
         })
     }
 
-    pub(crate) fn solver_connection(&self) -> ConnectionGuard {
+    pub(crate) fn solver_connection(&self) -> SolverConnection {
         self.state.solvers.fetch_add(1, Ordering::AcqRel);
-        ConnectionGuard {
+        self.state_changed();
+        SolverConnection {
             readiness: self.clone(),
-            kind: ConnectionKind::Solver,
-        }
-    }
-
-    pub(crate) fn chain_connection(&self) -> ConnectionGuard {
-        self.state.chains.fetch_add(1, Ordering::AcqRel);
-        ConnectionGuard {
-            readiness: self.clone(),
-            kind: ConnectionKind::Chain,
         }
     }
 
@@ -138,38 +125,74 @@ impl ServiceReadiness {
         let readiness = Self::new();
         readiness.state.pricing.store(true, Ordering::Release);
         readiness.state.registry.store(true, Ordering::Release);
-        readiness.state.actor.store(true, Ordering::Release);
+        readiness.state.engine.store(true, Ordering::Release);
         readiness.state.solvers.store(1, Ordering::Release);
-        readiness.state.chains.store(1, Ordering::Release);
+        readiness.state.chain.store(true, Ordering::Release);
         readiness
     }
 
     pub(crate) fn set_pricing(&self, ready: bool) {
-        set_dependency("pricing", &self.state.pricing, ready);
+        self.set_dependency(&self.state.pricing, ready);
     }
 
     pub(crate) fn set_registry(&self, ready: bool) {
-        set_dependency("registry", &self.state.registry, ready);
+        self.set_dependency(&self.state.registry, ready);
     }
 
-    pub(crate) fn set_actor(&self, ready: bool) {
-        set_dependency("actor", &self.state.actor, ready);
+    pub(crate) fn set_engine(&self, ready: bool) {
+        self.set_dependency(&self.state.engine, ready);
+    }
+
+    pub fn set_chain(&self, ready: bool) {
+        self.set_dependency(&self.state.chain, ready);
+    }
+
+    pub fn report(&self) {
+        self.state.reported.store(true, Ordering::Release);
+        let snapshot = self.snapshot();
+        self.state
+            .announced_ready
+            .store(snapshot.ready, Ordering::Release);
+        if snapshot.ready {
+            tracing::info!(target: "readiness", "accepting orders");
+        } else {
+            tracing::warn!(
+                target: "readiness",
+                missing = %snapshot.missing.join(","),
+                "not accepting orders"
+            );
+        }
+    }
+
+    fn set_dependency(&self, status: &AtomicBool, ready: bool) {
+        if status.swap(ready, Ordering::AcqRel) != ready {
+            self.state_changed();
+        }
+    }
+
+    fn state_changed(&self) {
+        if !self.state.reported.load(Ordering::Acquire) {
+            return;
+        }
+        let snapshot = self.snapshot();
+        if snapshot.ready {
+            if !self.state.announced_ready.swap(true, Ordering::AcqRel) {
+                tracing::info!(target: "readiness", "accepting orders");
+            }
+        } else if self.state.announced_ready.swap(false, Ordering::AcqRel) {
+            tracing::warn!(
+                target: "readiness",
+                missing = %snapshot.missing.join(","),
+                "not accepting orders"
+            );
+        }
     }
 }
 
-impl Drop for ConnectionGuard {
+impl Drop for SolverConnection {
     fn drop(&mut self) {
-        let counter = match self.kind {
-            ConnectionKind::Solver => &self.readiness.state.solvers,
-            ConnectionKind::Chain => &self.readiness.state.chains,
-        };
-        counter.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-fn set_dependency(name: &str, status: &AtomicBool, ready: bool) {
-    if status.swap(ready, Ordering::AcqRel) != ready {
-        crate::service_log!("readiness", "dependency={name} ready={ready}");
+        self.readiness.state.solvers.fetch_sub(1, Ordering::AcqRel);
+        self.readiness.state_changed();
     }
 }
 
@@ -182,17 +205,17 @@ mod tests {
         let readiness = ServiceReadiness::new();
         assert_eq!(
             readiness.snapshot().missing,
-            vec!["pricing", "registry", "solver", "chain", "actor"]
+            vec!["pricing", "registry", "solver", "chain", "orderbook_engine"]
         );
 
         readiness.set_pricing(true);
         readiness.set_registry(true);
-        readiness.set_actor(true);
+        readiness.set_engine(true);
+        readiness.set_chain(true);
         let solver = readiness.solver_connection();
-        let chain = readiness.chain_connection();
         assert!(readiness.snapshot().ready);
 
-        drop(chain);
+        readiness.set_chain(false);
         assert_eq!(readiness.snapshot().missing, vec!["chain"]);
         drop(solver);
         assert_eq!(readiness.snapshot().missing, vec!["solver", "chain"]);

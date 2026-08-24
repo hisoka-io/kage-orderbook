@@ -155,6 +155,7 @@ fn new_order_commitment() -> B256 {
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let network = Network::bootstrap(None)?;
+    kage_orderbook::logging::init();
     let options = Config::from_args()?;
     let app_config = AppConfig::load(network)?;
     let chain = app_config

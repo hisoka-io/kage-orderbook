@@ -10,10 +10,14 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use axum_extra::headers::{
+    Header,
+    authorization::{Authorization, Bearer},
+};
 pub use kage_types::api_types::{
     ApiErrorResponse, CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest,
-    ExecutionStartedRequest, ORDER_COMMITMENT_HEADER, SOLVER_ADDRESS_HEADER, SettlementRequest,
-    UserEventClientMessage, UserEventServerMessage,
+    ExecutionStartedRequest, ORDER_COMMITMENT_HEADER, UserEventClientMessage,
+    UserEventServerMessage,
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -26,10 +30,11 @@ use crate::{
         guards::{CreateOrderInput, OrderPolicy, validate_create_order},
     },
     logging::short_id,
-    order::{Order, OrderCommitment, OrderId, OrderV1, SolverId},
+    order::{OrderCommitment, OrderId, OrderV1, SolverId},
     pricing::{PriceValidationError, PricingValidator},
     readiness::{ReadinessSnapshot, ServiceReadiness},
-    registry::SolverRegistry,
+    registry::{SolverProfile, SolverRegistry},
+    session::{ChallengeResponse, SessionRequest, SessionResponse, SolverSessions, domain},
     storage::RepositoryError,
 };
 
@@ -37,9 +42,14 @@ use crate::{
 struct ApiState {
     orderbook: OrderbookHandle,
     registry: SolverRegistry,
+    sessions: SolverSessions,
     order_policy: OrderPolicy,
     pricing_validator: Option<PricingValidator>,
     readiness: ServiceReadiness,
+}
+
+fn now_ms() -> u64 {
+    chrono::Utc::now().timestamp_millis().max(0) as u64
 }
 
 impl From<CreateOrderRequest> for CreateOrderInput {
@@ -70,6 +80,7 @@ pub fn router_with_policy(
     router_with_state(
         orderbook,
         registry,
+        SolverSessions::new(domain(crate::config::Network::Localnet, 0)),
         order_policy,
         None,
         ServiceReadiness::always_ready(),
@@ -85,6 +96,7 @@ pub fn router_with_pricing(
     router_with_state(
         orderbook,
         registry,
+        SolverSessions::new(domain(crate::config::Network::Localnet, 0)),
         order_policy,
         Some(pricing_validator),
         ServiceReadiness::always_ready(),
@@ -94,6 +106,7 @@ pub fn router_with_pricing(
 pub fn router_with_readiness(
     orderbook: OrderbookHandle,
     registry: SolverRegistry,
+    sessions: SolverSessions,
     order_policy: OrderPolicy,
     pricing_validator: PricingValidator,
     readiness: ServiceReadiness,
@@ -101,6 +114,7 @@ pub fn router_with_readiness(
     router_with_state(
         orderbook,
         registry,
+        sessions,
         order_policy,
         Some(pricing_validator),
         readiness,
@@ -110,6 +124,7 @@ pub fn router_with_readiness(
 fn router_with_state(
     orderbook: OrderbookHandle,
     registry: SolverRegistry,
+    sessions: SolverSessions,
     order_policy: OrderPolicy,
     pricing_validator: Option<PricingValidator>,
     readiness: ServiceReadiness,
@@ -119,9 +134,10 @@ fn router_with_state(
         .route("/health/ready", get(readiness_health))
         .route("/orders", post(create_order))
         .route("/orders/{order_id}", get(get_order))
+        .route("/solver/challenge", post(solver_challenge))
+        .route("/solver/session", post(solver_session))
         .route("/solver/jobs", get(reserving_orders))
         .route("/solver/proofs", get(take_solver_proofs))
-        .route("/chain/jobs", get(executing_orders))
         .route("/orders/{order_id}/reserve", post(reserve_order))
         .route("/orders/{order_id}/decline", post(decline_order))
         .route(
@@ -132,17 +148,35 @@ fn router_with_state(
             "/orders/{order_id}/execution-started",
             post(execution_started),
         )
-        .route("/orders/{order_id}/settlement", post(settlement))
         .route("/events/user/ws", get(user_events_ws))
         .route("/events/solver/ws", get(solver_events_ws))
-        .route("/events/chain/ws", get(chain_events_ws))
         .with_state(ApiState {
             orderbook,
             registry,
+            sessions,
             order_policy,
             pricing_validator,
             readiness,
         })
+}
+
+async fn solver_challenge(State(state): State<ApiState>) -> Json<ChallengeResponse> {
+    Json(state.sessions.issue_challenge(now_ms()))
+}
+
+async fn solver_session(
+    State(state): State<ApiState>,
+    Json(request): Json<SessionRequest>,
+) -> Result<Json<SessionResponse>, StatusCode> {
+    let now = now_ms();
+    let solver_id = state.sessions.recover(&request, now).map_err(|error| {
+        crate::service_warn!("orderbook", "solver authentication failed reason={error}");
+        StatusCode::UNAUTHORIZED
+    })?;
+    active_solver(&state, solver_id)?;
+
+    tracing::debug!(target: "orderbook", %solver_id, "solver authenticated");
+    Ok(Json(state.sessions.open(solver_id, now)))
 }
 
 async fn liveness() -> StatusCode {
@@ -188,9 +222,9 @@ async fn create_order(
     if existing.is_none() {
         let readiness = state.readiness.snapshot();
         if !readiness.ready {
-            crate::service_error!(
+            crate::service_warn!(
                 "orderbook",
-                "create rejected request={} status=503 reason=service_not_ready missing={}",
+                "create rejected order_id={} status=503 reason=service_not_ready missing={}",
                 short_id(order_id),
                 readiness.missing.join(",")
             );
@@ -205,9 +239,9 @@ async fn create_order(
             && let Err(error) = validator.validate(&terms)
         {
             let status = status_for_price_validation(&error);
-            crate::service_error!(
+            crate::service_warn!(
                 "orderbook",
-                "create rejected request={} chain_id={} token_in={} token_out={} amount_in={} amount_out={} status={} reason={error}",
+                "create rejected order_id={} chain_id={} token_in={} token_out={} amount_in={} amount_out={} status={} reason={error}",
                 short_id(order_id),
                 terms.chain_id,
                 terms.token_in,
@@ -225,18 +259,6 @@ async fn create_order(
         }
     }
 
-    crate::service_log!(
-        "orderbook",
-        "create request order={} chain_id={} token_in={} token_out={} amount_in={} amount_out={} expires_at_ms={}",
-        short_id(order_id),
-        terms.chain_id,
-        terms.token_in,
-        terms.token_out,
-        terms.amount_in,
-        terms.amount_out,
-        terms.expires_at_ms
-    );
-
     let outcome = state
         .orderbook
         .create_order(order_id, validated.order_commitment, terms)
@@ -251,13 +273,17 @@ async fn create_order(
         )
     })?;
     let status = if outcome.created {
-        crate::service_log!("orderbook", "create accepted order={}", short_id(order_id));
-        StatusCode::CREATED
-    } else {
         crate::service_log!(
             "orderbook",
-            "create replayed order={}",
-            short_id(outcome.order.id)
+            "order created order_id={} expires_at_ms={expires_at_ms}",
+            short_id(order_id)
+        );
+        StatusCode::CREATED
+    } else {
+        tracing::debug!(
+            target: "orderbook",
+            order_id = %short_id(outcome.order.id),
+            "create replayed"
         );
         StatusCode::OK
     };
@@ -290,33 +316,20 @@ async fn reserving_orders(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<OrderV1>>, StatusCode> {
-    solver_id_from_headers(&headers)?;
+    authenticated_solver(&state, &headers)?;
     state
         .orderbook
         .reserving_orders()
         .await
-        .map(|orders| Json(order_views(&orders)))
+        .map(|orders| Json(orders.iter().map(OrderV1::from).collect()))
         .map_err(status_for_error)
-}
-
-async fn executing_orders(State(state): State<ApiState>) -> Result<Json<Vec<OrderV1>>, StatusCode> {
-    state
-        .orderbook
-        .executing_orders()
-        .await
-        .map(|orders| Json(order_views(&orders)))
-        .map_err(status_for_error)
-}
-
-fn order_views(orders: &[Order]) -> Vec<OrderV1> {
-    orders.iter().map(OrderV1::from).collect()
 }
 
 async fn take_solver_proofs(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SolverProofDelivery>>, StatusCode> {
-    let solver_id = solver_id_from_headers(&headers)?;
+    let solver_id = authenticated_solver(&state, &headers)?;
     state
         .orderbook
         .take_solver_proofs(solver_id)
@@ -330,17 +343,8 @@ async fn reserve_order(
     Path(order_id): Path<OrderId>,
     headers: HeaderMap,
 ) -> Result<StatusCode, StatusCode> {
-    let solver_id = solver_id_from_headers(&headers)?;
-    let profile = state
-        .registry
-        .get(solver_id)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-        .filter(|profile| profile.active)
-        .ok_or(StatusCode::FORBIDDEN)?;
-    if profile.noise_public_key == alloy_primitives::B256::ZERO {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
+    let solver_id = authenticated_solver(&state, &headers)?;
+    let profile = active_solver(&state, solver_id)?;
     execute(
         &state.orderbook,
         Command::SolverReserved {
@@ -357,7 +361,7 @@ async fn decline_order(
     Path(order_id): Path<OrderId>,
     headers: HeaderMap,
 ) -> Result<StatusCode, StatusCode> {
-    let solver_id = solver_id_from_headers(&headers)?;
+    let solver_id = authenticated_solver(&state, &headers)?;
     let order = state
         .orderbook
         .get_order(order_id)
@@ -368,9 +372,9 @@ async fn decline_order(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    crate::service_error!(
+    crate::service_warn!(
         "orderbook",
-        "solver declined order={} solver={solver_id}",
+        "solver declined order_id={} solver={solver_id}",
         short_id(order_id)
     );
     execute(
@@ -404,27 +408,12 @@ async fn execution_started(
     headers: HeaderMap,
     Json(request): Json<ExecutionStartedRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let solver_id = solver_id_from_headers(&headers)?;
+    let solver_id = authenticated_solver(&state, &headers)?;
     execute(
         &state.orderbook,
         Command::ExecutionStarted {
             order_id,
             solver_id,
-            tx_hash: request.tx_hash,
-        },
-    )
-    .await
-}
-
-async fn settlement(
-    State(state): State<ApiState>,
-    Path(order_id): Path<OrderId>,
-    Json(request): Json<SettlementRequest>,
-) -> Result<StatusCode, StatusCode> {
-    execute(
-        &state.orderbook,
-        Command::SettlementObserved {
-            order_id,
             tx_hash: request.tx_hash,
         },
     )
@@ -449,46 +438,25 @@ async fn solver_events_ws(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let solver_id = solver_id_from_headers(&headers)?;
-    let profile = state
-        .registry
-        .get(solver_id)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-        .filter(|profile| profile.active)
-        .ok_or(StatusCode::FORBIDDEN)?;
-    if profile.noise_public_key == alloy_primitives::B256::ZERO {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
+    let solver_id = authenticated_solver(&state, &headers)?;
+    active_solver(&state, solver_id)?;
     let events = state.orderbook.subscribe();
     let readiness = state.readiness.clone();
     Ok(ws.on_upgrade(move |socket| async move {
         let connection = readiness.solver_connection();
-        crate::service_log!("orderbook", "solver connected solver={solver_id}");
+        tracing::debug!(target: "orderbook", %solver_id, "solver connected");
         forward_service_events(
             socket,
             events,
-            ServiceStream::Solver {
+            SolverStream {
                 solver_id,
                 orderbook: state.orderbook,
             },
         )
         .await;
         drop(connection);
-        crate::service_log!("orderbook", "solver disconnected solver={solver_id}");
+        tracing::debug!(target: "orderbook", %solver_id, "solver disconnected");
     }))
-}
-
-async fn chain_events_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) -> impl IntoResponse {
-    let events = state.orderbook.subscribe();
-    let readiness = state.readiness.clone();
-    ws.on_upgrade(move |socket| async move {
-        let connection = readiness.chain_connection();
-        crate::service_log!("orderbook", "chain connected");
-        forward_service_events(socket, events, ServiceStream::Chain).await;
-        drop(connection);
-        crate::service_log!("orderbook", "chain disconnected");
-    })
 }
 
 async fn forward_user_events(
@@ -553,18 +521,15 @@ async fn forward_user_events(
     }
 }
 
-enum ServiceStream {
-    Solver {
-        solver_id: SolverId,
-        orderbook: OrderbookHandle,
-    },
-    Chain,
+struct SolverStream {
+    solver_id: SolverId,
+    orderbook: OrderbookHandle,
 }
 
 async fn forward_service_events(
     mut socket: WebSocket,
     mut events: tokio::sync::broadcast::Receiver<OrderEvent>,
-    stream: ServiceStream,
+    stream: SolverStream,
 ) {
     loop {
         tokio::select! {
@@ -584,11 +549,11 @@ async fn forward_service_events(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 };
 
-                let relevant = match &stream {
-                    ServiceStream::Solver {
-                        solver_id,
-                        orderbook,
-                    } => match &event {
+                let SolverStream {
+                    solver_id,
+                    orderbook,
+                } = &stream;
+                let relevant = match &event {
                         OrderEvent::SolverReservationRequested { .. } => true,
                         OrderEvent::ProofRelayed {
                             solver_id: assigned,
@@ -601,9 +566,7 @@ async fn forward_service_events(
                             .ok()
                             .flatten()
                             .is_some_and(|order| order.solver == Some(*solver_id)),
-                        _ => false,
-                    },
-                    ServiceStream::Chain => matches!(event, OrderEvent::ExecutionStarted { .. }),
+                    _ => false,
                 };
                 if relevant && send_json(&mut socket, &event).await.is_err() {
                     return;
@@ -629,11 +592,33 @@ fn commitment_from_headers(headers: &HeaderMap) -> Result<OrderCommitment, Statu
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-fn solver_id_from_headers(headers: &HeaderMap) -> Result<SolverId, StatusCode> {
-    headers
-        .get(SOLVER_ADDRESS_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
+fn active_solver(state: &ApiState, solver_id: SolverId) -> Result<SolverProfile, StatusCode> {
+    state.registry.health().map_err(|error| {
+        crate::service_warn!(
+            "orderbook",
+            "solver lookup deferred solver={solver_id} {error}"
+        );
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+    let profile = state
+        .registry
+        .get(solver_id)
+        .filter(|profile| profile.active)
+        .ok_or(StatusCode::FORBIDDEN)?;
+    if profile.noise_public_key == alloy_primitives::B256::ZERO {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(profile)
+}
+
+fn authenticated_solver(state: &ApiState, headers: &HeaderMap) -> Result<SolverId, StatusCode> {
+    let Authorization(bearer) = Authorization::<Bearer>::decode(
+        &mut headers.get_all(axum::http::header::AUTHORIZATION).iter(),
+    )
+    .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    state
+        .sessions
+        .resolve(bearer.token(), now_ms())
         .ok_or(StatusCode::UNAUTHORIZED)
 }
 
@@ -717,6 +702,7 @@ mod tests {
         let app = router_with_state(
             orderbook,
             SolverRegistry::from_profiles([]),
+            SolverSessions::new("kage-orderbook:test:0"),
             OrderPolicy::default(),
             None,
             readiness.clone(),
@@ -750,9 +736,9 @@ mod tests {
 
         readiness.set_pricing(true);
         readiness.set_registry(true);
-        readiness.set_actor(true);
+        readiness.set_engine(true);
+        readiness.set_chain(true);
         let solver = readiness.solver_connection();
-        let chain = readiness.chain_connection();
         assert_eq!(
             client
                 .get(format!("{url}/health/ready"))
@@ -775,7 +761,7 @@ mod tests {
             StatusCode::CREATED
         );
 
-        drop(chain);
+        readiness.set_chain(false);
         let rejected = request(2);
         let response = client
             .post(format!("{url}/orders"))
@@ -795,7 +781,7 @@ mod tests {
                 .is_none()
         );
 
-        let _chain = readiness.chain_connection();
+        readiness.set_chain(true);
         assert_eq!(
             client
                 .post(format!("{url}/orders"))

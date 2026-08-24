@@ -26,6 +26,10 @@ const CONFIG: &str = r#"{
   "chains": [{
     "chain_id": 31337,
     "name": "local",
+    "darkpool": "0x0303030303030303030303030303030303030303",
+    "registry": "0x0404040404040404040404040404040404040404",
+    "registry_deploy_block": 100,
+    "confirmations": 0,
     "tokens": [
       { "symbol": "ETH", "address": "0x0101010101010101010101010101010101010101", "decimals": 18, "pricing_asset": "ETH", "max_price_deviation_bps": 50 },
       { "symbol": "USDC", "address": "0x0202020202020202020202020202020202020202", "decimals": 6, "pricing_asset": "USDC", "max_price_deviation_bps": 20 }

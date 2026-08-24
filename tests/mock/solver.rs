@@ -2,41 +2,40 @@ use alloy_primitives::B256;
 use futures_util::StreamExt;
 use kage_orderbook::logging::short_id;
 use kage_types::{
-    api_types::{
-        ExecutionStartedRequest, SOLVER_ADDRESS_HEADER,
-        SolverProofDeliveryV1 as SolverProofDelivery,
-    },
+    api_types::{ExecutionStartedRequest, SolverProofDeliveryV1 as SolverProofDelivery},
     events::OrderEvent,
     identifiers::{OrderId, SolverId},
     orders::SolverOrderV1 as Order,
 };
+use reqwest::header::AUTHORIZATION;
 use tokio::sync::oneshot;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, http::HeaderValue},
 };
 
-use super::proof_transport;
+use super::{proof_transport, support::bearer};
 
 pub async fn run(
     http_url: String,
     ws_url: String,
+    solver_key: u8,
     solver_id: SolverId,
     noise_private_key: [u8; 32],
     ready: oneshot::Sender<()>,
     settled: oneshot::Sender<OrderId>,
 ) {
     let client = reqwest::Client::new();
+    let token = bearer(&http_url, solver_key).await;
     let mut request = ws_url.into_client_request().unwrap();
-    request.headers_mut().insert(
-        SOLVER_ADDRESS_HEADER,
-        HeaderValue::from_str(&solver_id.to_string()).unwrap(),
-    );
+    request
+        .headers_mut()
+        .insert(AUTHORIZATION, HeaderValue::from_str(&token).unwrap());
     let (mut socket, _) = connect_async(request).await.unwrap();
 
     let jobs: Vec<Order> = client
         .get(format!("{http_url}/solver/jobs"))
-        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+        .header(AUTHORIZATION, &token)
         .send()
         .await
         .unwrap()
@@ -45,7 +44,7 @@ pub async fn run(
         .unwrap();
 
     for order in jobs {
-        reserve(&client, &http_url, order.id, solver_id).await;
+        reserve(&client, &http_url, order.id, solver_id, &token).await;
     }
 
     let _ = ready.send(());
@@ -60,13 +59,13 @@ pub async fn run(
         let event: OrderEvent = serde_json::from_str(message.to_text().unwrap()).unwrap();
         match event {
             OrderEvent::SolverReservationRequested { order_id, .. } => {
-                reserve(&client, &http_url, order_id, solver_id).await;
+                reserve(&client, &http_url, order_id, solver_id, &token).await;
             }
             OrderEvent::ProofRelayed {
                 solver_id: assigned_solver,
                 ..
             } if assigned_solver == solver_id => {
-                execute_proofs(&client, &http_url, solver_id, &noise_private_key).await;
+                execute_proofs(&client, &http_url, &token, &noise_private_key).await;
             }
             OrderEvent::OrderFilled { order_id, .. } => {
                 if let Some(sender) = settled.take() {
@@ -78,10 +77,16 @@ pub async fn run(
     }
 }
 
-async fn reserve(client: &reqwest::Client, http_url: &str, order_id: OrderId, solver_id: SolverId) {
+async fn reserve(
+    client: &reqwest::Client,
+    http_url: &str,
+    order_id: OrderId,
+    solver_id: SolverId,
+    token: &str,
+) {
     let response = client
         .post(format!("{http_url}/orders/{order_id}/reserve"))
-        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+        .header(AUTHORIZATION, token)
         .send()
         .await
         .unwrap();
@@ -98,12 +103,12 @@ async fn reserve(client: &reqwest::Client, http_url: &str, order_id: OrderId, so
 async fn execute_proofs(
     client: &reqwest::Client,
     http_url: &str,
-    solver_id: SolverId,
+    token: &str,
     noise_private_key: &[u8; 32],
 ) {
     let deliveries: Vec<SolverProofDelivery> = client
         .get(format!("{http_url}/solver/proofs"))
-        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+        .header(AUTHORIZATION, token)
         .send()
         .await
         .unwrap()
@@ -130,7 +135,7 @@ async fn execute_proofs(
                 "{http_url}/orders/{}/execution-started",
                 delivery.order_id
             ))
-            .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+            .header(AUTHORIZATION, token)
             .json(&ExecutionStartedRequest {
                 tx_hash: tx_hash(delivery.order_id),
             })
@@ -148,7 +153,7 @@ async fn execute_proofs(
     }
 }
 
-fn tx_hash(order_id: OrderId) -> B256 {
+pub fn tx_hash(order_id: OrderId) -> B256 {
     let mut bytes = [0_u8; 32];
     bytes[..16].copy_from_slice(order_id.as_bytes());
     bytes[16..].copy_from_slice(order_id.as_bytes());

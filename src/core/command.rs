@@ -34,6 +34,11 @@ pub enum Command {
         tx_hash: TxHash,
     },
 
+    ExecutionFailed {
+        order_id: OrderId,
+        tx_hash: TxHash,
+    },
+
     ExpireOrder {
         order_id: OrderId,
     },
@@ -48,6 +53,7 @@ impl Command {
             | Command::RelayEncryptedProof { order_id, .. }
             | Command::ExecutionStarted { order_id, .. }
             | Command::SettlementObserved { order_id, .. }
+            | Command::ExecutionFailed { order_id, .. }
             | Command::ExpireOrder { order_id } => *order_id,
         }
     }
@@ -60,6 +66,7 @@ impl Command {
             Command::RelayEncryptedProof { .. } => "RelayEncryptedProof",
             Command::ExecutionStarted { .. } => "ExecutionStarted",
             Command::SettlementObserved { .. } => "SettlementObserved",
+            Command::ExecutionFailed { .. } => "ExecutionFailed",
             Command::ExpireOrder { .. } => "ExpireOrder",
         }
     }

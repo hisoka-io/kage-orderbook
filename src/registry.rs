@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use kage_registry::{RegistryIndexer, SyncState};
 pub use kage_types::registry::SolverProfile;
 use thiserror::Error;
 
@@ -7,66 +8,79 @@ use crate::order::SolverId;
 
 #[derive(Clone)]
 pub struct SolverRegistry {
-    backend: Arc<RegistryBackend>,
+    backend: RegistryBackend,
 }
 
+#[derive(Clone)]
 enum RegistryBackend {
-    Http {
-        client: reqwest::Client,
-        base_url: String,
-    },
-    Static(HashMap<SolverId, SolverProfile>),
+    Chain(Arc<RegistryIndexer>),
+    Static(Arc<HashMap<SolverId, SolverProfile>>),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum RegistryError {
-    #[error(transparent)]
-    Http(#[from] reqwest::Error),
+    #[error("registry mirror is still backfilling")]
+    Syncing,
+    #[error("registry mirror is stale: {0}")]
+    Stale(String),
 }
 
 impl SolverRegistry {
-    pub fn http(base_url: impl Into<String>) -> Self {
+    pub fn chain(indexer: Arc<RegistryIndexer>) -> Self {
         Self {
-            backend: Arc::new(RegistryBackend::Http {
-                client: reqwest::Client::new(),
-                base_url: base_url.into().trim_end_matches('/').to_owned(),
-            }),
+            backend: RegistryBackend::Chain(indexer),
         }
     }
 
     pub fn from_profiles(profiles: impl IntoIterator<Item = (SolverId, SolverProfile)>) -> Self {
         Self {
-            backend: Arc::new(RegistryBackend::Static(profiles.into_iter().collect())),
+            backend: RegistryBackend::Static(Arc::new(profiles.into_iter().collect())),
         }
     }
 
-    pub async fn get(&self, solver_id: SolverId) -> Result<Option<SolverProfile>, RegistryError> {
-        match self.backend.as_ref() {
-            RegistryBackend::Static(profiles) => Ok(profiles.get(&solver_id).copied()),
-            RegistryBackend::Http { client, base_url } => {
-                let response = client
-                    .get(format!("{base_url}/solvers/{solver_id}"))
-                    .send()
-                    .await?;
-                if response.status() == reqwest::StatusCode::NOT_FOUND {
-                    return Ok(None);
-                }
-                Ok(Some(response.error_for_status()?.json().await?))
+    pub fn get(&self, solver_id: SolverId) -> Option<SolverProfile> {
+        match &self.backend {
+            RegistryBackend::Static(profiles) => profiles.get(&solver_id).copied(),
+            RegistryBackend::Chain(indexer) => {
+                indexer.get_solver(solver_id).map(|solver| SolverProfile {
+                    noise_public_key: solver.noise_key,
+                    active: solver.is_active(),
+                })
             }
         }
     }
 
-    pub async fn health(&self) -> Result<(), RegistryError> {
-        match self.backend.as_ref() {
+    pub fn health(&self) -> Result<(), RegistryError> {
+        match &self.backend {
             RegistryBackend::Static(_) => Ok(()),
-            RegistryBackend::Http { client, base_url } => {
-                client
-                    .get(format!("{base_url}/health"))
-                    .send()
-                    .await?
-                    .error_for_status()?;
-                Ok(())
-            }
+            RegistryBackend::Chain(indexer) => match indexer.state() {
+                SyncState::Active => Ok(()),
+                SyncState::Syncing => Err(RegistryError::Syncing),
+                SyncState::Error(message) => Err(RegistryError::Stale(message)),
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{Address, B256};
+
+    use super::*;
+
+    #[test]
+    fn an_unknown_solver_is_absent_rather_than_inactive() {
+        let known = Address::repeat_byte(1);
+        let registry = SolverRegistry::from_profiles([(
+            known,
+            SolverProfile {
+                noise_public_key: B256::repeat_byte(2),
+                active: true,
+            },
+        )]);
+
+        assert!(registry.get(known).is_some_and(|profile| profile.active));
+        assert!(registry.get(Address::repeat_byte(9)).is_none());
+        assert_eq!(registry.health(), Ok(()));
     }
 }

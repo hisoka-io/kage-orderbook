@@ -81,7 +81,7 @@ pub(super) async fn run(
         update(&sender, PricingSnapshot::set_disconnected);
         let message = error.to_string();
         if was_active || last_error.as_deref() != Some(message.as_str()) {
-            crate::service_error!("pricing", "disconnected error={message}");
+            crate::service_warn!("pricing", "disconnected error={message}");
         }
         last_error = Some(message);
         tokio::time::sleep(config.reconnect_delay).await;
@@ -107,7 +107,7 @@ async fn consume(
     .await
     .map_err(|_| ClientError::ConnectionTimeout)??
     .error_for_status()?;
-    crate::service_log!("pricing", "active assets={}", assets.join(","));
+    tracing::debug!(target: "pricing", assets = %assets.join(","), "feed active");
 
     let mut stream = response.bytes_stream();
     let mut decoder = SseDecoder::default();

@@ -1,8 +1,5 @@
 use alloy_primitives::B256;
-use kage_orderbook::{
-    core::{command::Command, engine::start_orderbook, guards::MOCK_CHAIN_ID},
-    storage::OrderRepository,
-};
+use kage_orderbook::core::{command::Command, engine::start_orderbook, guards::MOCK_CHAIN_ID};
 use kage_types::orders::OrderState;
 use uuid::Uuid;
 
@@ -115,8 +112,13 @@ async fn proof_relayed_order_survives_restart_and_reaches_filled() {
         })
         .await
         .unwrap();
-    let repository = OrderRepository::connect(&database_url).await.unwrap();
-    assert!(repository.get_proof(order_id).await.unwrap().is_none());
+    assert!(
+        restarted
+            .take_solver_proofs(solver_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     restarted
         .execute(Command::RelayEncryptedProof {
             order_id,

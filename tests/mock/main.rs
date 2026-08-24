@@ -10,9 +10,11 @@ mod user;
 
 use std::{collections::HashMap, time::Duration};
 
+use chain::MockChain;
 use futures_util::{SinkExt, StreamExt};
 use kage_orderbook::{
     api,
+    chain::SettlementWatcher,
     core::{
         engine::start_orderbook,
         guards::{
@@ -22,14 +24,15 @@ use kage_orderbook::{
 };
 use kage_types::{
     api_types::{
-        CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest, ORDER_COMMITMENT_HEADER,
-        SOLVER_ADDRESS_HEADER, UserEventClientMessage, UserEventServerMessage,
+        CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest, ExecutionStartedRequest,
+        ORDER_COMMITMENT_HEADER, UserEventClientMessage, UserEventServerMessage,
     },
     events::OrderEvent,
     identifiers::{OrderCommitment, OrderId},
     orders::{OrderState, OrderV1 as Order},
 };
-use support::{commitment, noise_private_key, registry, solver_address, terms};
+use reqwest::header::AUTHORIZATION;
+use support::{bearer, commitment, noise_private_key, registry, solver_address, terms};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
@@ -37,6 +40,27 @@ const USERS: u64 = 5;
 
 async fn server() -> (String, String, JoinHandle<()>) {
     server_with_database("sqlite::memory:").await
+}
+
+pub async fn server_with_chain() -> (String, MockChain, JoinHandle<()>) {
+    let orderbook = start_orderbook("sqlite::memory:").await.unwrap();
+    let watched = orderbook.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, api::router(orderbook, registry()))
+            .await
+            .unwrap();
+    });
+
+    let chain = MockChain::new(alloy_primitives::Address::repeat_byte(0xda));
+    let rpc_url = chain.clone().spawn().await;
+    SettlementWatcher::connect(&rpc_url, chain.darkpool(), 0, watched)
+        .await
+        .unwrap()
+        .spawn();
+
+    (format!("http://{address}"), chain, task)
 }
 
 async fn server_with_database(database_url: &str) -> (String, String, JoinHandle<()>) {
@@ -116,6 +140,7 @@ async fn subscribe_user_events(
 #[tokio::test]
 async fn retries_return_the_existing_order() {
     let (http_url, _, server) = server().await;
+    let token_11 = bearer(&http_url, 0x11).await;
     let client = reqwest::Client::new();
     let request = create_order_request(1, None);
 
@@ -142,7 +167,7 @@ async fn retries_return_the_existing_order() {
 
     let jobs = client
         .get(format!("{http_url}/solver/jobs"))
-        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
+        .header(AUTHORIZATION, &token_11)
         .send()
         .await
         .unwrap()
@@ -234,6 +259,7 @@ async fn rejects_a_commitment_reused_for_different_terms() {
 #[tokio::test]
 async fn concurrent_retries_create_only_one_order() {
     let (http_url, _, server) = server().await;
+    let token_11 = bearer(&http_url, 0x11).await;
     let client = reqwest::Client::new();
     let request = create_order_request(1, None);
     let responses = futures_util::future::join_all((0..8).map(|_| {
@@ -260,7 +286,7 @@ async fn concurrent_retries_create_only_one_order() {
 
     let jobs = client
         .get(format!("{http_url}/solver/jobs"))
-        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
+        .header(AUTHORIZATION, &token_11)
         .send()
         .await
         .unwrap()
@@ -285,6 +311,7 @@ async fn retry_after_restart_returns_the_original_order() {
     let request = create_order_request(1, None);
 
     let (http_url, _, first_server) = server_with_database(&database_url).await;
+    let token_11 = bearer(&http_url, 0x11).await;
     let first_response = client
         .post(format!("{http_url}/orders"))
         .json(&request)
@@ -298,6 +325,18 @@ async fn retry_after_restart_returns_the_original_order() {
     tokio::task::yield_now().await;
 
     let (http_url, _, restarted_server) = server_with_database(&database_url).await;
+    assert_eq!(
+        client
+            .get(format!("{http_url}/solver/jobs"))
+            .header(AUTHORIZATION, &token_11)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let token_11 = bearer(&http_url, 0x11).await;
+
     let retry_response = client
         .post(format!("{http_url}/orders"))
         .json(&request)
@@ -311,7 +350,7 @@ async fn retry_after_restart_returns_the_original_order() {
 
     let jobs = client
         .get(format!("{http_url}/solver/jobs"))
-        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
+        .header(AUTHORIZATION, &token_11)
         .send()
         .await
         .unwrap()
@@ -446,6 +485,8 @@ async fn protects_user_order_access_with_the_commitment() {
 #[tokio::test]
 async fn user_event_stream_is_private_and_reconnectable() {
     let (http_url, user_ws_url, server) = server().await;
+    let token_11 = bearer(&http_url, 0x11).await;
+    let token_22 = bearer(&http_url, 0x22).await;
     let client = reqwest::Client::new();
     let (first_id, first_commitment) = create_order_with_commitment(&client, &http_url, 1).await;
     let (second_id, second_commitment) = create_order_with_commitment(&client, &http_url, 2).await;
@@ -465,7 +506,7 @@ async fn user_event_stream_is_private_and_reconnectable() {
 
     client
         .post(format!("{http_url}/orders/{second_id}/reserve"))
-        .header(SOLVER_ADDRESS_HEADER, solver_address(0x22).to_string())
+        .header(AUTHORIZATION, &token_22)
         .send()
         .await
         .unwrap()
@@ -479,7 +520,7 @@ async fn user_event_stream_is_private_and_reconnectable() {
 
     client
         .post(format!("{http_url}/orders/{first_id}/reserve"))
-        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
+        .header(AUTHORIZATION, &token_11)
         .send()
         .await
         .unwrap()
@@ -519,6 +560,7 @@ async fn user_event_stream_is_private_and_reconnectable() {
 #[tokio::test]
 async fn orders_wait_for_an_external_solver() {
     let (http_url, _, server) = server().await;
+    let token_11 = bearer(&http_url, 0x11).await;
     let client = reqwest::Client::new();
 
     for i in 1..=USERS {
@@ -527,7 +569,7 @@ async fn orders_wait_for_an_external_solver() {
 
     let orders: Vec<Order> = client
         .get(format!("{http_url}/solver/jobs"))
-        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
+        .header(AUTHORIZATION, &token_11)
         .send()
         .await
         .unwrap()
@@ -550,12 +592,14 @@ async fn orders_wait_for_an_external_solver() {
 #[tokio::test]
 async fn assigned_solver_can_decline_and_requeue_an_order() {
     let (http_url, _, server) = server().await;
+    let token_11 = bearer(&http_url, 0x11).await;
+    let token_22 = bearer(&http_url, 0x22).await;
     let client = reqwest::Client::new();
     let (order_id, order_commitment) = create_order_with_commitment(&client, &http_url, 1).await;
 
     client
         .post(format!("{http_url}/orders/{order_id}/reserve"))
-        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
+        .header(AUTHORIZATION, &token_11)
         .send()
         .await
         .unwrap()
@@ -564,7 +608,7 @@ async fn assigned_solver_can_decline_and_requeue_an_order() {
 
     let wrong_solver = client
         .post(format!("{http_url}/orders/{order_id}/decline"))
-        .header(SOLVER_ADDRESS_HEADER, solver_address(0x22).to_string())
+        .header(AUTHORIZATION, &token_22)
         .send()
         .await
         .unwrap();
@@ -572,7 +616,7 @@ async fn assigned_solver_can_decline_and_requeue_an_order() {
 
     let declined = client
         .post(format!("{http_url}/orders/{order_id}/decline"))
-        .header(SOLVER_ADDRESS_HEADER, solver_address(0x11).to_string())
+        .header(AUTHORIZATION, &token_11)
         .send()
         .await
         .unwrap();
@@ -604,24 +648,29 @@ async fn external_services_drive_orders_to_filled() {
     let http_url = format!("http://{address}");
     let user_ws_url = format!("ws://{address}/events/user/ws");
     let solver_ws_url = format!("ws://{address}/events/solver/ws");
-    let chain_ws_url = format!("ws://{address}/events/chain/ws");
+    let watched = orderbook.clone();
     let server = tokio::spawn(async move {
         axum::serve(listener, api::router(orderbook, registry()))
             .await
             .unwrap();
     });
 
-    let (chain_ready_tx, chain_ready_rx) = oneshot::channel();
-    let chain = tokio::spawn(chain::run(http_url.clone(), chain_ws_url, chain_ready_tx));
-    chain_ready_rx.await.unwrap();
+    let chain = MockChain::new(alloy_primitives::Address::repeat_byte(0xda));
+    let rpc_url = chain.clone().spawn().await;
 
     let client = reqwest::Client::new();
     let mut commitments = HashMap::new();
     for i in 1..=USERS {
         let (order_id, order_commitment) =
             create_order_with_commitment(&client, &http_url, i).await;
+        chain.settle(solver::tx_hash(order_id));
         commitments.insert(order_id, order_commitment);
     }
+
+    SettlementWatcher::connect(&rpc_url, chain.darkpool(), 0, watched)
+        .await
+        .unwrap()
+        .spawn();
 
     let (user_ready_tx, user_ready_rx) = oneshot::channel();
     let user = tokio::spawn(user::run(
@@ -637,6 +686,7 @@ async fn external_services_drive_orders_to_filled() {
     let solver = tokio::spawn(solver::run(
         http_url,
         solver_ws_url,
+        0x11,
         solver_address(0x11),
         noise_private_key(0x33),
         solver_ready_tx,
@@ -694,7 +744,137 @@ async fn external_services_drive_orders_to_filled() {
     assert!(seen.contains_key(&settled_order));
 
     solver.abort();
-    chain.abort();
     user.abort();
     server.abort();
+}
+
+#[tokio::test]
+async fn solver_endpoints_reject_unproved_identities() {
+    let (http_url, _, server) = server().await;
+    let client = reqwest::Client::new();
+    let (order_id, _) = create_order_with_commitment(&client, &http_url, 1).await;
+
+    let unauthenticated = [
+        format!("{http_url}/solver/jobs"),
+        format!("{http_url}/solver/proofs"),
+        format!("{http_url}/orders/{order_id}/reserve"),
+        format!("{http_url}/orders/{order_id}/decline"),
+    ];
+    for url in &unauthenticated {
+        for header in [None, Some("Bearer not-a-real-token")] {
+            let mut request = client.post(url).header(AUTHORIZATION, header.unwrap_or(""));
+            if url.ends_with("jobs") || url.ends_with("proofs") {
+                request = client.get(url).header(AUTHORIZATION, header.unwrap_or(""));
+            }
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "{url} accepted an unproved caller"
+            );
+        }
+    }
+
+    let token = bearer(&http_url, 0x11).await;
+    assert_eq!(
+        client
+            .post(format!("{http_url}/orders/{order_id}/reserve"))
+            .header(AUTHORIZATION, &token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_reverted_settlement_requeues_the_order() {
+    for (label, prime) in [
+        (
+            "reverted",
+            MockChain::revert as fn(&MockChain, alloy_primitives::B256),
+        ),
+        (
+            "not a kageSwap",
+            MockChain::unrelated as fn(&MockChain, alloy_primitives::B256),
+        ),
+    ] {
+        let (http_url, chain, server) = server_with_chain().await;
+        let token = bearer(&http_url, 0x11).await;
+        let client = reqwest::Client::new();
+        let (order_id, order_commitment) =
+            create_order_with_commitment(&client, &http_url, 1).await;
+        let tx_hash = solver::tx_hash(order_id);
+        prime(&chain, tx_hash);
+
+        drive_to_executing(
+            &client,
+            &http_url,
+            &token,
+            order_id,
+            order_commitment,
+            tx_hash,
+        )
+        .await;
+
+        let mut requeued = false;
+        for _ in 0..200 {
+            let jobs = client
+                .get(format!("{http_url}/solver/jobs"))
+                .header(AUTHORIZATION, &token)
+                .send()
+                .await
+                .unwrap()
+                .json::<Vec<Order>>()
+                .await
+                .unwrap();
+            if jobs.iter().any(|job| job.id == order_id) {
+                requeued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(requeued, "{label} settlement did not requeue the order");
+        server.abort();
+    }
+}
+
+async fn drive_to_executing(
+    client: &reqwest::Client,
+    http_url: &str,
+    token: &str,
+    order_id: OrderId,
+    order_commitment: alloy_primitives::B256,
+    tx_hash: alloy_primitives::B256,
+) {
+    client
+        .post(format!("{http_url}/orders/{order_id}/reserve"))
+        .header(AUTHORIZATION, token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    client
+        .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
+        .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
+        .json(&EncryptedProofRequest {
+            ciphertext: vec![1, 2, 3],
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    client
+        .post(format!("{http_url}/orders/{order_id}/execution-started"))
+        .header(AUTHORIZATION, token)
+        .json(&ExecutionStartedRequest { tx_hash })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
 }

@@ -39,7 +39,6 @@ impl Network {
         }
     }
 
-    /// Written into the database's `PRAGMA user_version` so a database opened
     pub fn stamp(self) -> i64 {
         match self {
             Self::Localnet => 1,
@@ -121,6 +120,10 @@ pub struct PricingSettings {
 pub struct ChainConfig {
     pub chain_id: u64,
     pub name: String,
+    pub darkpool: Address,
+    pub registry: Address,
+    pub registry_deploy_block: u64,
+    pub confirmations: u64,
     pub tokens: Vec<TokenConfig>,
     pub markets: Vec<MarketConfig>,
 }
@@ -224,47 +227,6 @@ impl AppConfig {
         assets
     }
 
-    pub fn token(&self, chain_id: u64, address: Address) -> Option<&TokenConfig> {
-        self.chains
-            .iter()
-            .find(|chain| chain.chain_id == chain_id)?
-            .tokens
-            .iter()
-            .find(|token| token.address == address)
-    }
-
-    pub fn market_max_price_deviation_bps(
-        &self,
-        chain_id: u64,
-        token_in: Address,
-        token_out: Address,
-    ) -> Option<u16> {
-        let chain = self
-            .chains
-            .iter()
-            .find(|chain| chain.chain_id == chain_id)?;
-        let token_in = chain
-            .tokens
-            .iter()
-            .find(|token| token.address == token_in)?;
-        let token_out = chain
-            .tokens
-            .iter()
-            .find(|token| token.address == token_out)?;
-        let market = chain.markets.iter().find(|market| {
-            market.token_in == token_in.symbol && market.token_out == token_out.symbol
-        })?;
-        let token_limit = token_in
-            .max_price_deviation_bps
-            .min(token_out.max_price_deviation_bps);
-        Some(
-            market
-                .max_price_deviation_bps
-                .unwrap_or(token_limit)
-                .min(token_limit),
-        )
-    }
-
     fn validate(&self) -> Result<(), ConfigError> {
         if self.order.min_ttl_seconds == 0
             || self.order.min_ttl_seconds > self.order.default_ttl_seconds
@@ -306,6 +268,12 @@ impl AppConfig {
             if chain.name.trim().is_empty() || chain.tokens.is_empty() {
                 return Err(invalid(format!(
                     "chain {} requires a name and at least one token",
+                    chain.chain_id
+                )));
+            }
+            if chain.darkpool == Address::ZERO || chain.registry == Address::ZERO {
+                return Err(invalid(format!(
+                    "chain {} requires non-zero darkpool and registry addresses",
                     chain.chain_id
                 )));
             }
@@ -409,6 +377,10 @@ mod tests {
       "chains": [{
         "chain_id": 31337,
         "name": "local",
+        "darkpool": "0x0303030303030303030303030303030303030303",
+        "registry": "0x0404040404040404040404040404040404040404",
+        "registry_deploy_block": 100,
+        "confirmations": 0,
         "tokens": [
           {
             "symbol": "ETH",
@@ -447,21 +419,22 @@ mod tests {
         }));
         assert_eq!(config.pricing_assets(), vec!["ETH", "USDC"]);
         assert_eq!(config.order.max_order_usd_cents, 25_000);
-        assert_eq!(
-            config
-                .token(31_337, Address::repeat_byte(2))
-                .unwrap()
-                .decimals,
-            6
-        );
-        assert_eq!(
-            config.market_max_price_deviation_bps(
-                31_337,
-                Address::repeat_byte(1),
-                Address::repeat_byte(2),
-            ),
-            Some(20)
-        );
+        assert_eq!(config.chains[0].darkpool, Address::repeat_byte(3));
+        assert_eq!(config.chains[0].registry, Address::repeat_byte(4));
+        assert_eq!(config.chains[0].registry_deploy_block, 100);
+    }
+
+    #[test]
+    fn rejects_zero_contract_addresses() {
+        for byte in [3, 4] {
+            let configured = Address::repeat_byte(byte).to_string();
+            let zeroed = VALID_CONFIG.replace(&configured, &Address::ZERO.to_string());
+            assert_ne!(zeroed, VALID_CONFIG, "{configured} is not in the fixture");
+            assert!(
+                matches!(AppConfig::from_json(&zeroed), Err(ConfigError::Invalid(_))),
+                "zero address accepted in place of {configured}"
+            );
+        }
     }
 
     #[test]

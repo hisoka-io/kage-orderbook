@@ -6,16 +6,16 @@ use kage_orderbook::logging::short_id;
 use kage_types::{
     api_types::{
         EncryptedProofRequest, ExecutionStartedRequest, ORDER_COMMITMENT_HEADER,
-        SOLVER_ADDRESS_HEADER, SettlementRequest, SolverProofDeliveryV1 as SolverProofDelivery,
+        SolverProofDeliveryV1 as SolverProofDelivery,
     },
-    identifiers::{OrderId, SolverId},
+    identifiers::OrderId,
     orders::{OrderState, OrderV1 as Order},
 };
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, Response, StatusCode, header::AUTHORIZATION};
 
 use super::{
-    create_order_with_commitment, proof_transport, server,
-    support::{noise_private_key, noise_public_key, solver_address},
+    create_order_with_commitment, proof_transport, server_with_chain,
+    support::{bearer, noise_private_key, noise_public_key},
 };
 
 const ORDERS: u64 = 4;
@@ -28,10 +28,10 @@ async fn delayed_services_accept_retries_and_reject_conflicts() {
 }
 
 async fn run() {
-    let (http_url, _, server) = server().await;
+    let (http_url, chain, server) = server_with_chain().await;
     let client = Client::new();
-    let solver_id = solver_address(0x11);
-    let wrong_solver_id = solver_address(0x22);
+    let token = bearer(&http_url, 0x11).await;
+    let wrong_token = bearer(&http_url, 0x22).await;
     let noise_private_key = noise_private_key(0x33);
     let noise_public_key = noise_public_key(0x33).to_vec();
 
@@ -69,7 +69,7 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/execution-started"))
-            .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+            .header(AUTHORIZATION, &token)
             .json(&ExecutionStartedRequest {
                 tx_hash: tx_hash(first),
             })
@@ -84,12 +84,13 @@ async fn run() {
     join_all(orders.iter().enumerate().map(|(index, order_id)| {
         let client = client.clone();
         let http_url = http_url.clone();
+        let token = token.clone();
         let order_id = *order_id;
         async move {
             tokio::time::sleep(delay(index, 20)).await;
             let response = client
                 .post(format!("{http_url}/orders/{order_id}/reserve"))
-                .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+                .header(AUTHORIZATION, &token)
                 .send()
                 .await
                 .unwrap();
@@ -106,7 +107,7 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/reserve"))
-            .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+            .header(AUTHORIZATION, &token)
             .send()
             .await
             .unwrap(),
@@ -117,7 +118,7 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/reserve"))
-            .header(SOLVER_ADDRESS_HEADER, wrong_solver_id.to_string())
+            .header(AUTHORIZATION, &wrong_token)
             .send()
             .await
             .unwrap(),
@@ -194,7 +195,7 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/execution-started"))
-            .header(SOLVER_ADDRESS_HEADER, wrong_solver_id.to_string())
+            .header(AUTHORIZATION, &wrong_token)
             .json(&ExecutionStartedRequest {
                 tx_hash: tx_hash(first),
             })
@@ -206,15 +207,16 @@ async fn run() {
         first,
     );
 
-    let proofs = solver_proofs(&client, &http_url, solver_id).await;
+    let proofs = solver_proofs(&client, &http_url, &token).await;
     assert_eq!(proofs.len(), ORDERS as usize);
-    let repeated = solver_proofs(&client, &http_url, solver_id).await;
+    let repeated = solver_proofs(&client, &http_url, &token).await;
     assert_eq!(repeated.len(), proofs.len());
     harness_log("solver", "proof polling is non-destructive");
 
     join_all(proofs.into_iter().enumerate().map(|(index, delivery)| {
         let client = client.clone();
         let http_url = http_url.clone();
+        let token = token.clone();
         async move {
             tokio::time::sleep(delay(index, 25)).await;
             assert_eq!(
@@ -231,7 +233,7 @@ async fn run() {
                     "{http_url}/orders/{}/execution-started",
                     delivery.order_id
                 ))
-                .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+                .header(AUTHORIZATION, &token)
                 .json(&ExecutionStartedRequest {
                     tx_hash: tx_hash(delivery.order_id),
                 })
@@ -251,7 +253,7 @@ async fn run() {
     expect(
         client
             .post(format!("{http_url}/orders/{first}/execution-started"))
-            .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+            .header(AUTHORIZATION, &token)
             .json(&ExecutionStartedRequest {
                 tx_hash: tx_hash(first),
             })
@@ -262,63 +264,22 @@ async fn run() {
         "idempotent execution retry",
         first,
     );
-    assert!(
-        solver_proofs(&client, &http_url, solver_id)
-            .await
-            .is_empty()
-    );
+    assert!(solver_proofs(&client, &http_url, &token).await.is_empty());
 
-    expect(
-        client
-            .post(format!("{http_url}/orders/{first}/settlement"))
-            .json(&SettlementRequest {
-                tx_hash: B256::repeat_byte(0xff),
-            })
-            .send()
-            .await
-            .unwrap(),
-        StatusCode::CONFLICT,
-        "settlement with wrong transaction",
-        first,
-    );
-
-    join_all(orders.iter().enumerate().map(|(index, order_id)| {
-        let client = client.clone();
-        let http_url = http_url.clone();
-        let order_id = *order_id;
-        async move {
-            tokio::time::sleep(delay(index, 30)).await;
-            let response = client
-                .post(format!("{http_url}/orders/{order_id}/settlement"))
-                .json(&SettlementRequest {
-                    tx_hash: tx_hash(order_id),
-                })
-                .send()
-                .await
-                .unwrap();
-            expect(
-                response,
-                StatusCode::NO_CONTENT,
-                "delayed chain settlement",
-                order_id,
-            );
-        }
-    }))
-    .await;
-
-    expect(
-        client
-            .post(format!("{http_url}/orders/{first}/settlement"))
-            .json(&SettlementRequest {
-                tx_hash: tx_hash(first),
-            })
-            .send()
-            .await
-            .unwrap(),
-        StatusCode::NO_CONTENT,
-        "idempotent settlement retry",
-        first,
-    );
+    for (index, order_id) in orders.iter().enumerate() {
+        tokio::time::sleep(delay(index, 30)).await;
+        chain.settle(tx_hash(*order_id));
+    }
+    for order_id in &orders {
+        await_state(
+            &client,
+            &http_url,
+            *order_id,
+            commitments[order_id],
+            OrderState::Filled,
+        )
+        .await;
+    }
 
     for order_id in orders {
         let order = get_order(&client, &http_url, order_id, commitments[&order_id]).await;
@@ -332,7 +293,7 @@ async fn run() {
 
     let solver_jobs: Vec<Order> = client
         .get(format!("{http_url}/solver/jobs"))
-        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+        .header(AUTHORIZATION, &token)
         .send()
         .await
         .unwrap()
@@ -341,21 +302,15 @@ async fn run() {
         .json()
         .await
         .unwrap();
-    let chain_jobs: Vec<Order> = get_json(&client, format!("{http_url}/chain/jobs")).await;
     assert!(solver_jobs.is_empty());
-    assert!(chain_jobs.is_empty());
     harness_log("done", "all checks passed");
     server.abort();
 }
 
-async fn solver_proofs(
-    client: &Client,
-    http_url: &str,
-    solver_id: SolverId,
-) -> Vec<SolverProofDelivery> {
+async fn solver_proofs(client: &Client, http_url: &str, token: &str) -> Vec<SolverProofDelivery> {
     client
         .get(format!("{http_url}/solver/proofs"))
-        .header(SOLVER_ADDRESS_HEADER, solver_id.to_string())
+        .header(AUTHORIZATION, token)
         .send()
         .await
         .unwrap()
@@ -375,19 +330,6 @@ async fn get_order(
     client
         .get(format!("{http_url}/orders/{order_id}"))
         .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
-}
-
-async fn get_json<T: serde::de::DeserializeOwned>(client: &Client, url: String) -> T {
-    client
-        .get(url)
         .send()
         .await
         .unwrap()
@@ -426,4 +368,21 @@ fn tx_hash(order_id: OrderId) -> B256 {
 
 fn harness_log(stage: &str, message: impl std::fmt::Display) {
     kage_orderbook::service_log!("harness", "stage={stage} {message}");
+}
+
+async fn await_state(
+    client: &Client,
+    http_url: &str,
+    order_id: OrderId,
+    order_commitment: B256,
+    expected: OrderState,
+) {
+    for _ in 0..200 {
+        let order = get_order(client, http_url, order_id, order_commitment).await;
+        if order.state == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("order {} never reached {expected:?}", short_id(order_id));
 }
