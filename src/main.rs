@@ -67,13 +67,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     readiness.monitor_pricing(pricing, Duration::from_millis(250));
     readiness.monitor_registry(registry.clone(), Duration::from_secs(1));
     readiness.monitor_engine(orderbook.clone(), Duration::from_millis(250));
-    let app = api::router_with_readiness(
+    let app = api::router_with_readiness_and_settings(
         orderbook,
         registry,
         SolverSessions::new(domain(network, chain.chain_id)),
         config.order_policy(),
         pricing_validator,
         readiness.clone(),
+        config.api.clone(),
     );
     let listener = TcpListener::bind(&listen_address).await?;
 
@@ -88,6 +89,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.order.max_order_usd_cents % 100
     );
     readiness.report();
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

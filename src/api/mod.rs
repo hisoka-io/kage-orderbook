@@ -2,10 +2,15 @@ mod auth;
 mod error;
 mod websocket;
 
+use std::time::Duration;
+
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     response::IntoResponse,
     routing::{get, post},
 };
@@ -16,6 +21,7 @@ pub use kage_types::api_types::{
 };
 
 use crate::{
+    config::ApiSettings,
     core::{
         command::Command,
         engine::{OrderbookHandle, SolverProofDelivery},
@@ -31,6 +37,8 @@ use crate::{
 use error::{
     ApiError, api_error, api_error_for_service, status_for_error, status_for_price_validation,
 };
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -41,6 +49,7 @@ struct ApiState {
     order_policy: OrderPolicy,
     pricing_validator: Option<PricingValidator>,
     readiness: ServiceReadiness,
+    api: ApiSettings,
 }
 
 fn now_ms() -> u64 {
@@ -63,6 +72,7 @@ pub fn router_with_policy(
         order_policy,
         None,
         ServiceReadiness::always_ready(),
+        ApiSettings::default(),
     )
 }
 
@@ -79,6 +89,7 @@ pub fn router_with_pricing(
         order_policy,
         Some(pricing_validator),
         ServiceReadiness::always_ready(),
+        ApiSettings::default(),
     )
 }
 
@@ -90,6 +101,26 @@ pub fn router_with_readiness(
     pricing_validator: PricingValidator,
     readiness: ServiceReadiness,
 ) -> Router {
+    router_with_readiness_and_settings(
+        orderbook,
+        registry,
+        sessions,
+        order_policy,
+        pricing_validator,
+        readiness,
+        ApiSettings::default(),
+    )
+}
+
+pub fn router_with_readiness_and_settings(
+    orderbook: OrderbookHandle,
+    registry: SolverRegistry,
+    sessions: SolverSessions,
+    order_policy: OrderPolicy,
+    pricing_validator: PricingValidator,
+    readiness: ServiceReadiness,
+    api: ApiSettings,
+) -> Router {
     router_with_state(
         orderbook,
         registry,
@@ -97,6 +128,7 @@ pub fn router_with_readiness(
         order_policy,
         Some(pricing_validator),
         readiness,
+        api,
     )
 }
 
@@ -107,10 +139,30 @@ fn router_with_state(
     order_policy: OrderPolicy,
     pricing_validator: Option<PricingValidator>,
     readiness: ServiceReadiness,
+    api: ApiSettings,
 ) -> Router {
-    Router::new()
-        .route("/health/live", get(liveness))
-        .route("/health/ready", get(readiness_health))
+    let mut rate_limit = GovernorConfigBuilder::default();
+    rate_limit
+        .period(Duration::from_millis(api.rate_limit_replenish_ms))
+        .burst_size(api.rate_limit_burst);
+    let rate_limit = rate_limit
+        .use_headers()
+        .finish()
+        .expect("validated API rate limit settings");
+    let rate_limit_limiter = rate_limit.limiter().clone();
+    tokio::spawn(async move {
+        let mut cleanup = tokio::time::interval(Duration::from_secs(60));
+        cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            cleanup.tick().await;
+            rate_limit_limiter.retain_recent();
+        }
+    });
+    let cors = cors_layer(&api);
+    let request_timeout = Duration::from_millis(api.request_timeout_ms);
+    let max_body_bytes = api.max_body_bytes;
+
+    let versioned = Router::new()
         .route("/orders", post(create_order))
         .route("/orders/{order_id}", get(get_order))
         .route("/solver/challenge", post(solver_challenge))
@@ -129,6 +181,18 @@ fn router_with_state(
         )
         .route("/events/user/ws", get(websocket::user_events_ws))
         .route("/events/solver/ws", get(websocket::solver_events_ws))
+        .layer(GovernorLayer::new(rate_limit))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            request_timeout,
+        ))
+        .layer(RequestBodyLimitLayer::new(max_body_bytes))
+        .layer(cors);
+
+    Router::new()
+        .route("/health/live", get(liveness))
+        .route("/health/ready", get(readiness_health))
+        .nest("/v1", versioned)
         .with_state(ApiState {
             orderbook,
             registry,
@@ -136,7 +200,30 @@ fn router_with_state(
             order_policy,
             pricing_validator,
             readiness,
+            api,
         })
+}
+
+fn cors_layer(api: &ApiSettings) -> CorsLayer {
+    let mut cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([
+            AUTHORIZATION,
+            CONTENT_TYPE,
+            HeaderName::from_static(ORDER_COMMITMENT_HEADER),
+        ])
+        .max_age(Duration::from_secs(api.cors_max_age_seconds));
+    if !api.allowed_origins.is_empty() {
+        let origins = api
+            .allowed_origins
+            .iter()
+            .map(|origin| {
+                HeaderValue::from_str(origin).expect("validated API allowed origin header")
+            })
+            .collect::<Vec<_>>();
+        cors = cors.allow_origin(origins);
+    }
+    cors
 }
 
 impl From<CreateOrderRequest> for CreateOrderInput {
@@ -424,8 +511,8 @@ async fn execute(orderbook: &OrderbookHandle, command: Command) -> Result<Status
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, B256, U256};
-    use axum::http::StatusCode;
-    use tokio::net::TcpListener;
+    use axum::http::{Method, StatusCode};
+    use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
     use crate::{core::engine::start_orderbook, readiness::ServiceReadiness};
@@ -442,6 +529,160 @@ mod tests {
         }
     }
 
+    async fn spawn_api(api: ApiSettings) -> (String, JoinHandle<()>) {
+        let orderbook = start_orderbook("sqlite::memory:").await.unwrap();
+        let app = router_with_state(
+            orderbook,
+            SolverRegistry::from_profiles([]),
+            SolverSessions::new("kage-orderbook:test:0"),
+            OrderPolicy::default(),
+            None,
+            ServiceReadiness::always_ready(),
+            api,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn exposes_application_routes_only_under_v1() {
+        let (url, server) = spawn_api(ApiSettings::default()).await;
+        let client = reqwest::Client::new();
+
+        assert_eq!(
+            client
+                .post(format!("{url}/solver/challenge"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            client
+                .post(format!("{url}/v1/solver/challenge"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn enforces_body_limit_and_keeps_health_outside_rate_limit() {
+        let api = ApiSettings {
+            max_body_bytes: 128,
+            rate_limit_burst: 2,
+            rate_limit_replenish_ms: 60_000,
+            ..ApiSettings::default()
+        };
+        let (url, server) = spawn_api(api).await;
+        let client = reqwest::Client::new();
+
+        let oversized = client
+            .post(format!("{url}/v1/orders"))
+            .header("content-type", "application/json")
+            .body(vec![b' '; 129])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        assert_eq!(
+            client
+                .post(format!("{url}/v1/solver/challenge"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{url}/v1/solver/challenge"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .post(format!("{url}/v1/solver/challenge"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            client
+                .get(format!("{url}/health/live"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_uses_exact_origin_allowlist() {
+        let api = ApiSettings {
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            ..ApiSettings::default()
+        };
+        let (url, server) = spawn_api(api).await;
+        let client = reqwest::Client::new();
+
+        let allowed = client
+            .request(Method::OPTIONS, format!("{url}/v1/orders"))
+            .header("origin", "https://app.example.com")
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "content-type")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(
+            allowed
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "https://app.example.com"
+        );
+
+        let denied = client
+            .request(Method::OPTIONS, format!("{url}/v1/orders"))
+            .header("origin", "https://attacker.example")
+            .header("access-control-request-method", "POST")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            denied
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+
+        server.abort();
+    }
+
     #[tokio::test]
     async fn readiness_gates_only_new_order_admission() {
         let readiness = ServiceReadiness::new();
@@ -454,11 +695,17 @@ mod tests {
             OrderPolicy::default(),
             None,
             readiness.clone(),
+            ApiSettings::default(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
         let client = reqwest::Client::new();
         let url = format!("http://{address}");
@@ -500,7 +747,7 @@ mod tests {
         let accepted = request(1);
         assert_eq!(
             client
-                .post(format!("{url}/orders"))
+                .post(format!("{url}/v1/orders"))
                 .json(&accepted)
                 .send()
                 .await
@@ -512,7 +759,7 @@ mod tests {
         readiness.set_chain(false);
         let rejected = request(2);
         let response = client
-            .post(format!("{url}/orders"))
+            .post(format!("{url}/v1/orders"))
             .json(&rejected)
             .send()
             .await
@@ -532,7 +779,7 @@ mod tests {
         readiness.set_chain(true);
         assert_eq!(
             client
-                .post(format!("{url}/orders"))
+                .post(format!("{url}/v1/orders"))
                 .json(&rejected)
                 .send()
                 .await
@@ -544,7 +791,7 @@ mod tests {
         drop(solver);
         assert_eq!(
             client
-                .post(format!("{url}/orders"))
+                .post(format!("{url}/v1/orders"))
                 .json(&accepted)
                 .send()
                 .await
@@ -554,7 +801,7 @@ mod tests {
         );
         assert_eq!(
             client
-                .post(format!("{url}/orders"))
+                .post(format!("{url}/v1/orders"))
                 .json(&request(3))
                 .send()
                 .await

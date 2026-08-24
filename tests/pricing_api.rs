@@ -93,7 +93,12 @@ async fn spawn_orderbook(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     (format!("http://{address}"), inspection, task)
 }
@@ -150,7 +155,7 @@ async fn pricing_validation_controls_http_admission() {
 
     let accepted = request(1, 200_000_000);
     let response = client
-        .post(format!("{url}/orders"))
+        .post(format!("{url}/v1/orders"))
         .json(&accepted)
         .send()
         .await
@@ -166,7 +171,7 @@ async fn pricing_validation_controls_http_admission() {
 
     let rejected = request(2, 199_000_000);
     let response = client
-        .post(format!("{url}/orders"))
+        .post(format!("{url}/v1/orders"))
         .json(&rejected)
         .send()
         .await
@@ -185,7 +190,7 @@ async fn pricing_validation_controls_http_admission() {
     let mut oversized = request(3, 2_000_000_000);
     oversized.amount_in = U256::from(1_000_000_000_000_000_000_u64);
     let response = client
-        .post(format!("{url}/orders"))
+        .post(format!("{url}/v1/orders"))
         .json(&oversized)
         .send()
         .await
@@ -214,7 +219,7 @@ async fn stale_pricing_returns_service_unavailable_without_persisting() {
     let request = request(4, 200_000_000);
 
     let response = reqwest::Client::new()
-        .post(format!("{url}/orders"))
+        .post(format!("{url}/v1/orders"))
         .json(&request)
         .send()
         .await

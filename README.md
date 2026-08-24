@@ -5,6 +5,9 @@ The orderbook validates orders, checks market prices, routes orders to registere
 It runs independently from `kage-solver`. The services communicate through the
 orderbook HTTP and WebSocket APIs.
 
+Endpoints live under `/v1` (`POST /v1/orders`, `GET /v1/events/user/ws`).
+Health probes stay at `/health/live` and `/health/ready`.
+
 ## Layout
 
 | Path | Contents |
@@ -34,9 +37,10 @@ curl -i http://127.0.0.1:3000/health/ready
 | Source | Contents |
 | --- | --- |
 | `.env.<network>` | Runtime settings, `RUST_LOG` filtering |
-| `config/<network>.json` | Order, chain, token, market, pricing, contracts |
+| `config/<network>.json` | API limits, origins, order, chain, token, market, pricing, contracts |
 
 Localnet ships with both. Add them for any other `just run <network>`.
+
 
 ## Commands
 

@@ -78,11 +78,41 @@ impl fmt::Display for Network {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub api: ApiSettings,
     pub order: OrderSettings,
     pub database: DatabaseSettings,
     pub runtime: RuntimeSettings,
     pub pricing: PricingSettings,
     pub chains: Vec<ChainConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiSettings {
+    pub request_timeout_ms: u64,
+    pub max_body_bytes: usize,
+    pub websocket_max_message_bytes: usize,
+    pub rate_limit_replenish_ms: u64,
+    pub rate_limit_burst: u32,
+    pub cors_max_age_seconds: u64,
+    pub allowed_origins: Vec<String>,
+}
+
+impl Default for ApiSettings {
+    fn default() -> Self {
+        Self {
+            request_timeout_ms: 10_000,
+            // EncryptedProofRequest serializes bytes as a JSON array, which is larger
+            // than the 900 KiB encrypted transport payload it carries.
+            max_body_bytes: 5_000_000,
+            websocket_max_message_bytes: 16 * 1024,
+            rate_limit_replenish_ms: 100,
+            rate_limit_burst: 100,
+            cors_max_age_seconds: 600,
+            allowed_origins: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -228,6 +258,33 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.api.request_timeout_ms == 0
+            || self.api.max_body_bytes == 0
+            || self.api.websocket_max_message_bytes == 0
+            || self.api.rate_limit_replenish_ms == 0
+            || self.api.rate_limit_burst == 0
+            || self.api.cors_max_age_seconds == 0
+        {
+            return Err(invalid(
+                "API limits and durations must be greater than zero",
+            ));
+        }
+        let mut origins = HashSet::new();
+        for origin in &self.api.allowed_origins {
+            let parsed = reqwest::Url::parse(origin)
+                .map_err(|_| invalid(format!("invalid API allowed origin {origin}")))?;
+            let normalized = parsed.origin().ascii_serialization();
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host_str().is_none()
+                || parsed.path() != "/"
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || normalized != *origin
+                || !origins.insert(origin)
+            {
+                return Err(invalid(format!("invalid API allowed origin {origin}")));
+            }
+        }
         if self.order.min_ttl_seconds == 0
             || self.order.min_ttl_seconds > self.order.default_ttl_seconds
             || self.order.default_ttl_seconds > self.order.max_ttl_seconds
@@ -422,6 +479,40 @@ mod tests {
         assert_eq!(config.chains[0].darkpool, Address::repeat_byte(3));
         assert_eq!(config.chains[0].registry, Address::repeat_byte(4));
         assert_eq!(config.chains[0].registry_deploy_block, 100);
+        assert_eq!(config.api.request_timeout_ms, 10_000);
+        assert_eq!(config.api.max_body_bytes, 5_000_000);
+        assert!(config.api.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn validates_api_limits_and_exact_origins() {
+        let api = r#""api": {
+          "request_timeout_ms": 10000,
+          "max_body_bytes": 5000000,
+          "websocket_max_message_bytes": 16384,
+          "rate_limit_replenish_ms": 100,
+          "rate_limit_burst": 100,
+          "cors_max_age_seconds": 600,
+          "allowed_origins": ["https://app.example.com"]
+        },
+        "order":"#;
+        let configured = VALID_CONFIG.replace("\"order\":", api);
+        let config = AppConfig::from_json(&configured).unwrap();
+        assert_eq!(config.api.allowed_origins, vec!["https://app.example.com"]);
+
+        let zero_limit =
+            configured.replace("\"request_timeout_ms\": 10000", "\"request_timeout_ms\": 0");
+        assert!(matches!(
+            AppConfig::from_json(&zero_limit),
+            Err(ConfigError::Invalid(_))
+        ));
+
+        let origin_with_path =
+            configured.replace("https://app.example.com", "https://app.example.com/path");
+        assert!(matches!(
+            AppConfig::from_json(&origin_with_path),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]
