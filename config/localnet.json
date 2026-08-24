@@ -1,4 +1,13 @@
 {
+  "api": {
+    "request_timeout_ms": 10000,
+    "max_body_bytes": 5000000,
+    "websocket_max_message_bytes": 16384,
+    "rate_limit_replenish_ms": 100,
+    "rate_limit_burst": 100,
+    "cors_max_age_seconds": 600,
+    "allowed_origins": []
+  },
   "order": {
     "default_ttl_seconds": 60,
     "min_ttl_seconds": 5,

@@ -34,7 +34,7 @@ pub async fn run(
     let (mut socket, _) = connect_async(request).await.unwrap();
 
     let jobs: Vec<Order> = client
-        .get(format!("{http_url}/solver/jobs"))
+        .get(format!("{http_url}/v1/solver/jobs"))
         .header(AUTHORIZATION, &token)
         .send()
         .await
@@ -85,7 +85,7 @@ async fn reserve(
     token: &str,
 ) {
     let response = client
-        .post(format!("{http_url}/orders/{order_id}/reserve"))
+        .post(format!("{http_url}/v1/orders/{order_id}/reserve"))
         .header(AUTHORIZATION, token)
         .send()
         .await
@@ -107,7 +107,7 @@ async fn execute_proofs(
     noise_private_key: &[u8; 32],
 ) {
     let deliveries: Vec<SolverProofDelivery> = client
-        .get(format!("{http_url}/solver/proofs"))
+        .get(format!("{http_url}/v1/solver/proofs"))
         .header(AUTHORIZATION, token)
         .send()
         .await
@@ -132,7 +132,7 @@ async fn execute_proofs(
 
         client
             .post(format!(
-                "{http_url}/orders/{}/execution-started",
+                "{http_url}/v1/orders/{}/execution-started",
                 delivery.order_id
             ))
             .header(AUTHORIZATION, token)

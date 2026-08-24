@@ -79,7 +79,7 @@ pub async fn run(
                 proof_transport::encrypt_for_solver(order_id, &noise_public_key, &proof).unwrap();
 
             client
-                .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
+                .post(format!("{http_url}/v1/orders/{order_id}/encrypted-proof"))
                 .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
                 .json(&EncryptedProofRequest { ciphertext })
                 .send()

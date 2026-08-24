@@ -5,13 +5,14 @@ use axum::{
         State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::ORIGIN},
     response::IntoResponse,
 };
 use serde::Serialize;
 
 use super::{ApiState, UserEventClientMessage, UserEventServerMessage, auth};
 use crate::{
+    config::ApiSettings,
     core::{engine::OrderbookHandle, events::OrderEvent},
     order::SolverId,
 };
@@ -19,9 +20,14 @@ use crate::{
 pub(super) async fn user_events_ws(
     ws: WebSocketUpgrade,
     State(state): State<ApiState>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    ensure_allowed_origin(&state.api, &headers)?;
     let events = state.orderbook.subscribe();
-    ws.on_upgrade(move |socket| forward_user_events(socket, events, state.orderbook))
+    Ok(ws
+        .max_message_size(state.api.websocket_max_message_bytes)
+        .max_frame_size(state.api.websocket_max_message_bytes)
+        .on_upgrade(move |socket| forward_user_events(socket, events, state.orderbook)))
 }
 
 pub(super) async fn solver_events_ws(
@@ -29,25 +35,44 @@ pub(super) async fn solver_events_ws(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
+    ensure_allowed_origin(&state.api, &headers)?;
     let solver_id = auth::authenticated_solver(&state, &headers)?;
     auth::active_solver(&state, solver_id)?;
     let events = state.orderbook.subscribe();
     let readiness = state.readiness.clone();
-    Ok(ws.on_upgrade(move |socket| async move {
-        let connection = readiness.solver_connection();
-        tracing::debug!(target: "orderbook", %solver_id, "solver connected");
-        forward_service_events(
-            socket,
-            events,
-            SolverStream {
-                solver_id,
-                orderbook: state.orderbook,
-            },
-        )
-        .await;
-        drop(connection);
-        tracing::debug!(target: "orderbook", %solver_id, "solver disconnected");
-    }))
+    Ok(ws
+        .max_message_size(state.api.websocket_max_message_bytes)
+        .max_frame_size(state.api.websocket_max_message_bytes)
+        .on_upgrade(move |socket| async move {
+            let connection = readiness.solver_connection();
+            tracing::debug!(target: "orderbook", %solver_id, "solver connected");
+            forward_service_events(
+                socket,
+                events,
+                SolverStream {
+                    solver_id,
+                    orderbook: state.orderbook,
+                },
+            )
+            .await;
+            drop(connection);
+            tracing::debug!(target: "orderbook", %solver_id, "solver disconnected");
+        }))
+}
+
+fn ensure_allowed_origin(api: &ApiSettings, headers: &HeaderMap) -> Result<(), StatusCode> {
+    let Some(origin) = headers.get(ORIGIN) else {
+        return Ok(());
+    };
+    if api
+        .allowed_origins
+        .iter()
+        .any(|allowed| origin.as_bytes() == allowed.as_bytes())
+    {
+        return Ok(());
+    }
+
+    Err(StatusCode::FORBIDDEN)
 }
 
 async fn forward_user_events(
@@ -173,4 +198,34 @@ async fn send_json(socket: &mut WebSocket, value: &impl Serialize) -> Result<(),
         .send(Message::Text(json.into()))
         .await
         .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderMap, HeaderValue, header::ORIGIN};
+
+    use super::*;
+
+    fn headers(origin: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(origin) = origin {
+            headers.insert(ORIGIN, HeaderValue::from_str(origin).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn websocket_origin_policy_allows_non_browser_and_allowlist_only() {
+        let api = ApiSettings {
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            ..ApiSettings::default()
+        };
+
+        assert!(ensure_allowed_origin(&api, &headers(None)).is_ok());
+        assert!(ensure_allowed_origin(&api, &headers(Some("https://app.example.com")),).is_ok());
+        assert_eq!(
+            ensure_allowed_origin(&api, &headers(Some("https://attacker.example")),),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
 }

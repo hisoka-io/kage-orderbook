@@ -100,7 +100,7 @@ async fn run() -> Result<(), BoxError> {
     };
 
     let response = reqwest::Client::new()
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&request)
         .send()
         .await?;

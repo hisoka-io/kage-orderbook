@@ -27,7 +27,7 @@ pub async fn bearer(http_url: &str, n: u8) -> String {
 
     let client = reqwest::Client::new();
     let challenge: Challenge = client
-        .post(format!("{http_url}/solver/challenge"))
+        .post(format!("{http_url}/v1/solver/challenge"))
         .send()
         .await
         .unwrap()
@@ -44,7 +44,7 @@ pub async fn bearer(http_url: &str, n: u8) -> String {
     bytes[64] = 27 + recovery.to_byte();
 
     let session: Session = client
-        .post(format!("{http_url}/solver/session"))
+        .post(format!("{http_url}/v1/solver/session"))
         .json(&serde_json::json!({
             "nonce": challenge.nonce,
             "signature": format!("0x{}", alloy_primitives::hex::encode(bytes)),

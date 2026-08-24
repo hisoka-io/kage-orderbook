@@ -54,7 +54,7 @@ impl Config {
             http_url: std::env::var("ORDERBOOK_HTTP_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned()),
             ws_url: std::env::var("ORDERBOOK_WS_URL")
-                .unwrap_or_else(|_| "ws://127.0.0.1:3000/events/user/ws".to_owned()),
+                .unwrap_or_else(|_| "ws://127.0.0.1:3000/v1/events/user/ws".to_owned()),
         };
 
         let mut args = std::env::args().skip(1);
@@ -257,7 +257,7 @@ async fn main() -> Result<(), BoxError> {
             ttl_seconds: None,
         };
         let response = client
-            .post(format!("{}/orders", options.http_url))
+            .post(format!("{}/v1/orders", options.http_url))
             .json(&request)
             .send()
             .await?
@@ -326,7 +326,7 @@ async fn main() -> Result<(), BoxError> {
 
     for (order_id, submitted) in &orders {
         let order = client
-            .get(format!("{}/orders/{order_id}", options.http_url))
+            .get(format!("{}/v1/orders/{order_id}", options.http_url))
             .header(ORDER_COMMITMENT_HEADER, submitted.commitment.to_string())
             .send()
             .await?
@@ -379,7 +379,7 @@ async fn wait_for_filled(
 
         for (order_id, submitted) in orders {
             let order = client
-                .get(format!("{http_url}/orders/{order_id}"))
+                .get(format!("{http_url}/v1/orders/{order_id}"))
                 .header(ORDER_COMMITMENT_HEADER, submitted.commitment.to_string())
                 .send()
                 .await
@@ -543,7 +543,7 @@ async fn send_proof(
         .map_err(io::Error::other)?;
     let ciphertext_bytes = ciphertext.len();
     client
-        .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
+        .post(format!("{http_url}/v1/orders/{order_id}/encrypted-proof"))
         .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
         .json(&EncryptedProofRequest { ciphertext })
         .send()

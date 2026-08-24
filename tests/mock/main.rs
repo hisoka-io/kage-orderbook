@@ -47,9 +47,13 @@ pub async fn server_with_chain() -> (String, MockChain, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
-        axum::serve(listener, api::router(orderbook, registry()))
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            api::router(orderbook, registry())
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let chain = MockChain::new(alloy_primitives::Address::repeat_byte(0xda));
@@ -67,14 +71,18 @@ async fn server_with_database(database_url: &str) -> (String, String, JoinHandle
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
-        axum::serve(listener, api::router(orderbook, registry()))
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            api::router(orderbook, registry())
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     (
         format!("http://{address}"),
-        format!("ws://{address}/events/user/ws"),
+        format!("ws://{address}/v1/events/user/ws"),
         task,
     )
 }
@@ -103,7 +111,7 @@ async fn create_order_with_commitment(
 ) -> (OrderId, alloy_primitives::B256) {
     let request = create_order_request(n, None);
     let order_id = client
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&request)
         .send()
         .await
@@ -144,7 +152,7 @@ async fn retries_return_the_existing_order() {
     let request = create_order_request(1, None);
 
     let first_response = client
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&request)
         .send()
         .await
@@ -153,7 +161,7 @@ async fn retries_return_the_existing_order() {
     let first = first_response.json::<CreateOrderResponse>().await.unwrap();
 
     let retry_response = client
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&request)
         .send()
         .await
@@ -165,7 +173,7 @@ async fn retries_return_the_existing_order() {
     assert_eq!(retry.expires_at_ms, first.expires_at_ms);
 
     let jobs = client
-        .get(format!("{http_url}/solver/jobs"))
+        .get(format!("{http_url}/v1/solver/jobs"))
         .header(AUTHORIZATION, &token_11)
         .send()
         .await
@@ -187,7 +195,7 @@ async fn retry_with_a_different_ttl_keeps_the_original_expiry() {
     let request = create_order_request(1, Some(30));
 
     let first_response = client
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&request)
         .send()
         .await
@@ -198,7 +206,7 @@ async fn retry_with_a_different_ttl_keeps_the_original_expiry() {
     let mut retry_request = request.clone();
     retry_request.ttl_seconds = Some(120);
     let retry_response = client
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&retry_request)
         .send()
         .await
@@ -210,7 +218,7 @@ async fn retry_with_a_different_ttl_keeps_the_original_expiry() {
     assert_eq!(retry.expires_at_ms, first.expires_at_ms);
 
     let stored = client
-        .get(format!("{http_url}/orders/{}", first.order_id))
+        .get(format!("{http_url}/v1/orders/{}", first.order_id))
         .header(
             ORDER_COMMITMENT_HEADER,
             request.order_commitment.to_string(),
@@ -234,7 +242,7 @@ async fn rejects_a_commitment_reused_for_different_terms() {
     let client = reqwest::Client::new();
     let request = create_order_request(1, None);
     client
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&request)
         .send()
         .await
@@ -245,7 +253,7 @@ async fn rejects_a_commitment_reused_for_different_terms() {
     let mut conflicting = request;
     conflicting.amount_out = alloy_primitives::U256::from(999);
     let response = client
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&conflicting)
         .send()
         .await
@@ -263,7 +271,7 @@ async fn concurrent_retries_create_only_one_order() {
     let request = create_order_request(1, None);
     let responses = futures_util::future::join_all((0..8).map(|_| {
         let client = client.clone();
-        let url = format!("{http_url}/orders");
+        let url = format!("{http_url}/v1/orders");
         let request = request.clone();
         async move { client.post(url).json(&request).send().await.unwrap() }
     }))
@@ -284,7 +292,7 @@ async fn concurrent_retries_create_only_one_order() {
     assert_eq!(created, 1);
 
     let jobs = client
-        .get(format!("{http_url}/solver/jobs"))
+        .get(format!("{http_url}/v1/solver/jobs"))
         .header(AUTHORIZATION, &token_11)
         .send()
         .await
@@ -312,7 +320,7 @@ async fn retry_after_restart_returns_the_original_order() {
     let (http_url, _, first_server) = server_with_database(&database_url).await;
     let token_11 = bearer(&http_url, 0x11).await;
     let first_response = client
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&request)
         .send()
         .await
@@ -326,7 +334,7 @@ async fn retry_after_restart_returns_the_original_order() {
     let (http_url, _, restarted_server) = server_with_database(&database_url).await;
     assert_eq!(
         client
-            .get(format!("{http_url}/solver/jobs"))
+            .get(format!("{http_url}/v1/solver/jobs"))
             .header(AUTHORIZATION, &token_11)
             .send()
             .await
@@ -337,7 +345,7 @@ async fn retry_after_restart_returns_the_original_order() {
     let token_11 = bearer(&http_url, 0x11).await;
 
     let retry_response = client
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&request)
         .send()
         .await
@@ -348,7 +356,7 @@ async fn retry_after_restart_returns_the_original_order() {
     assert_eq!(retry.expires_at_ms, first.expires_at_ms);
 
     let jobs = client
-        .get(format!("{http_url}/solver/jobs"))
+        .get(format!("{http_url}/v1/solver/jobs"))
         .header(AUTHORIZATION, &token_11)
         .send()
         .await
@@ -369,7 +377,7 @@ async fn applies_default_ttl_and_rejects_out_of_range_ttl() {
     let client = reqwest::Client::new();
     let before = chrono::Utc::now().timestamp_millis();
     let created = client
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&create_order_request(1, None))
         .send()
         .await
@@ -390,7 +398,7 @@ async fn applies_default_ttl_and_rejects_out_of_range_ttl() {
         (3, MAX_ORDER_TTL_SECONDS + 1),
     ] {
         let response = client
-            .post(format!("{http_url}/orders"))
+            .post(format!("{http_url}/v1/orders"))
             .json(&create_order_request(n, Some(ttl_seconds)))
             .send()
             .await
@@ -409,7 +417,7 @@ async fn rejects_unsupported_chains_and_token_markets() {
     let mut unsupported_chain = create_order_request(1, None);
     unsupported_chain.chain_id = 1;
     let response = client
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&unsupported_chain)
         .send()
         .await
@@ -419,7 +427,7 @@ async fn rejects_unsupported_chains_and_token_markets() {
     let mut unsupported_market = create_order_request(2, None);
     unsupported_market.token_out = alloy_primitives::Address::repeat_byte(3);
     let response = client
-        .post(format!("{http_url}/orders"))
+        .post(format!("{http_url}/v1/orders"))
         .json(&unsupported_market)
         .send()
         .await
@@ -435,7 +443,7 @@ async fn protects_user_order_access_with_the_commitment() {
     let (http_url, _, server) = server().await;
     let client = reqwest::Client::new();
     let (order_id, order_commitment) = create_order_with_commitment(&client, &http_url, 1).await;
-    let order_url = format!("{http_url}/orders/{order_id}");
+    let order_url = format!("{http_url}/v1/orders/{order_id}");
 
     let missing = client.get(&order_url).send().await.unwrap();
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
@@ -504,7 +512,7 @@ async fn user_event_stream_is_private_and_reconnectable() {
     ));
 
     client
-        .post(format!("{http_url}/orders/{second_id}/reserve"))
+        .post(format!("{http_url}/v1/orders/{second_id}/reserve"))
         .header(AUTHORIZATION, &token_22)
         .send()
         .await
@@ -518,7 +526,7 @@ async fn user_event_stream_is_private_and_reconnectable() {
     );
 
     client
-        .post(format!("{http_url}/orders/{first_id}/reserve"))
+        .post(format!("{http_url}/v1/orders/{first_id}/reserve"))
         .header(AUTHORIZATION, &token_11)
         .send()
         .await
@@ -541,7 +549,7 @@ async fn user_event_stream_is_private_and_reconnectable() {
     ));
 
     let restored: Order = client
-        .get(format!("{http_url}/orders/{first_id}"))
+        .get(format!("{http_url}/v1/orders/{first_id}"))
         .header(ORDER_COMMITMENT_HEADER, first_commitment.to_string())
         .send()
         .await
@@ -567,7 +575,7 @@ async fn orders_wait_for_an_external_solver() {
     }
 
     let orders: Vec<Order> = client
-        .get(format!("{http_url}/solver/jobs"))
+        .get(format!("{http_url}/v1/solver/jobs"))
         .header(AUTHORIZATION, &token_11)
         .send()
         .await
@@ -597,7 +605,7 @@ async fn assigned_solver_can_decline_and_requeue_an_order() {
     let (order_id, order_commitment) = create_order_with_commitment(&client, &http_url, 1).await;
 
     client
-        .post(format!("{http_url}/orders/{order_id}/reserve"))
+        .post(format!("{http_url}/v1/orders/{order_id}/reserve"))
         .header(AUTHORIZATION, &token_11)
         .send()
         .await
@@ -606,7 +614,7 @@ async fn assigned_solver_can_decline_and_requeue_an_order() {
         .unwrap();
 
     let wrong_solver = client
-        .post(format!("{http_url}/orders/{order_id}/decline"))
+        .post(format!("{http_url}/v1/orders/{order_id}/decline"))
         .header(AUTHORIZATION, &token_22)
         .send()
         .await
@@ -614,7 +622,7 @@ async fn assigned_solver_can_decline_and_requeue_an_order() {
     assert_eq!(wrong_solver.status(), reqwest::StatusCode::FORBIDDEN);
 
     let declined = client
-        .post(format!("{http_url}/orders/{order_id}/decline"))
+        .post(format!("{http_url}/v1/orders/{order_id}/decline"))
         .header(AUTHORIZATION, &token_11)
         .send()
         .await
@@ -622,7 +630,7 @@ async fn assigned_solver_can_decline_and_requeue_an_order() {
     assert_eq!(declined.status(), reqwest::StatusCode::NO_CONTENT);
 
     let order = client
-        .get(format!("{http_url}/orders/{order_id}"))
+        .get(format!("{http_url}/v1/orders/{order_id}"))
         .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
         .send()
         .await
@@ -645,13 +653,17 @@ async fn external_services_drive_orders_to_filled() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let http_url = format!("http://{address}");
-    let user_ws_url = format!("ws://{address}/events/user/ws");
-    let solver_ws_url = format!("ws://{address}/events/solver/ws");
+    let user_ws_url = format!("ws://{address}/v1/events/user/ws");
+    let solver_ws_url = format!("ws://{address}/v1/events/solver/ws");
     let watched = orderbook.clone();
     let server = tokio::spawn(async move {
-        axum::serve(listener, api::router(orderbook, registry()))
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            api::router(orderbook, registry())
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     let chain = MockChain::new(alloy_primitives::Address::repeat_byte(0xda));
@@ -754,10 +766,10 @@ async fn solver_endpoints_reject_unproved_identities() {
     let (order_id, _) = create_order_with_commitment(&client, &http_url, 1).await;
 
     let unauthenticated = [
-        format!("{http_url}/solver/jobs"),
-        format!("{http_url}/solver/proofs"),
-        format!("{http_url}/orders/{order_id}/reserve"),
-        format!("{http_url}/orders/{order_id}/decline"),
+        format!("{http_url}/v1/solver/jobs"),
+        format!("{http_url}/v1/solver/proofs"),
+        format!("{http_url}/v1/orders/{order_id}/reserve"),
+        format!("{http_url}/v1/orders/{order_id}/decline"),
     ];
     for url in &unauthenticated {
         for header in [None, Some("Bearer not-a-real-token")] {
@@ -776,7 +788,7 @@ async fn solver_endpoints_reject_unproved_identities() {
     let token = bearer(&http_url, 0x11).await;
     assert_eq!(
         client
-            .post(format!("{http_url}/orders/{order_id}/reserve"))
+            .post(format!("{http_url}/v1/orders/{order_id}/reserve"))
             .header(AUTHORIZATION, &token)
             .send()
             .await
@@ -821,7 +833,7 @@ async fn a_reverted_settlement_requeues_the_order() {
         let mut requeued = false;
         for _ in 0..200 {
             let jobs = client
-                .get(format!("{http_url}/solver/jobs"))
+                .get(format!("{http_url}/v1/solver/jobs"))
                 .header(AUTHORIZATION, &token)
                 .send()
                 .await
@@ -849,7 +861,7 @@ async fn drive_to_executing(
     tx_hash: alloy_primitives::B256,
 ) {
     client
-        .post(format!("{http_url}/orders/{order_id}/reserve"))
+        .post(format!("{http_url}/v1/orders/{order_id}/reserve"))
         .header(AUTHORIZATION, token)
         .send()
         .await
@@ -857,7 +869,7 @@ async fn drive_to_executing(
         .error_for_status()
         .unwrap();
     client
-        .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
+        .post(format!("{http_url}/v1/orders/{order_id}/encrypted-proof"))
         .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
         .json(&EncryptedProofRequest {
             ciphertext: vec![1, 2, 3],
@@ -868,7 +880,7 @@ async fn drive_to_executing(
         .error_for_status()
         .unwrap();
     client
-        .post(format!("{http_url}/orders/{order_id}/execution-started"))
+        .post(format!("{http_url}/v1/orders/{order_id}/execution-started"))
         .header(AUTHORIZATION, token)
         .json(&ExecutionStartedRequest { tx_hash })
         .send()

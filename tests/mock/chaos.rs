@@ -54,7 +54,7 @@ async fn run() {
     let first = orders[0];
     expect(
         client
-            .post(format!("{http_url}/orders/{first}/encrypted-proof"))
+            .post(format!("{http_url}/v1/orders/{first}/encrypted-proof"))
             .header(ORDER_COMMITMENT_HEADER, commitments[&first].to_string())
             .json(&EncryptedProofRequest {
                 ciphertext: vec![1],
@@ -68,7 +68,7 @@ async fn run() {
     );
     expect(
         client
-            .post(format!("{http_url}/orders/{first}/execution-started"))
+            .post(format!("{http_url}/v1/orders/{first}/execution-started"))
             .header(AUTHORIZATION, &token)
             .json(&ExecutionStartedRequest {
                 tx_hash: tx_hash(first),
@@ -89,7 +89,7 @@ async fn run() {
         async move {
             tokio::time::sleep(delay(index, 20)).await;
             let response = client
-                .post(format!("{http_url}/orders/{order_id}/reserve"))
+                .post(format!("{http_url}/v1/orders/{order_id}/reserve"))
                 .header(AUTHORIZATION, &token)
                 .send()
                 .await
@@ -106,7 +106,7 @@ async fn run() {
 
     expect(
         client
-            .post(format!("{http_url}/orders/{first}/reserve"))
+            .post(format!("{http_url}/v1/orders/{first}/reserve"))
             .header(AUTHORIZATION, &token)
             .send()
             .await
@@ -117,7 +117,7 @@ async fn run() {
     );
     expect(
         client
-            .post(format!("{http_url}/orders/{first}/reserve"))
+            .post(format!("{http_url}/v1/orders/{first}/reserve"))
             .header(AUTHORIZATION, &wrong_token)
             .send()
             .await
@@ -147,7 +147,7 @@ async fn run() {
         async move {
             tokio::time::sleep(delay(index, 15)).await;
             let response = client
-                .post(format!("{http_url}/orders/{order_id}/encrypted-proof"))
+                .post(format!("{http_url}/v1/orders/{order_id}/encrypted-proof"))
                 .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
                 .json(&EncryptedProofRequest { ciphertext })
                 .send()
@@ -166,7 +166,7 @@ async fn run() {
     let first_ciphertext = encrypted_proofs[&first].clone();
     expect(
         client
-            .post(format!("{http_url}/orders/{first}/encrypted-proof"))
+            .post(format!("{http_url}/v1/orders/{first}/encrypted-proof"))
             .header(ORDER_COMMITMENT_HEADER, commitments[&first].to_string())
             .json(&EncryptedProofRequest {
                 ciphertext: first_ciphertext,
@@ -180,7 +180,7 @@ async fn run() {
     );
     expect(
         client
-            .post(format!("{http_url}/orders/{first}/encrypted-proof"))
+            .post(format!("{http_url}/v1/orders/{first}/encrypted-proof"))
             .header(ORDER_COMMITMENT_HEADER, commitments[&first].to_string())
             .json(&EncryptedProofRequest {
                 ciphertext: vec![1],
@@ -194,7 +194,7 @@ async fn run() {
     );
     expect(
         client
-            .post(format!("{http_url}/orders/{first}/execution-started"))
+            .post(format!("{http_url}/v1/orders/{first}/execution-started"))
             .header(AUTHORIZATION, &wrong_token)
             .json(&ExecutionStartedRequest {
                 tx_hash: tx_hash(first),
@@ -230,7 +230,7 @@ async fn run() {
             );
             let response = client
                 .post(format!(
-                    "{http_url}/orders/{}/execution-started",
+                    "{http_url}/v1/orders/{}/execution-started",
                     delivery.order_id
                 ))
                 .header(AUTHORIZATION, &token)
@@ -252,7 +252,7 @@ async fn run() {
 
     expect(
         client
-            .post(format!("{http_url}/orders/{first}/execution-started"))
+            .post(format!("{http_url}/v1/orders/{first}/execution-started"))
             .header(AUTHORIZATION, &token)
             .json(&ExecutionStartedRequest {
                 tx_hash: tx_hash(first),
@@ -292,7 +292,7 @@ async fn run() {
     }
 
     let solver_jobs: Vec<Order> = client
-        .get(format!("{http_url}/solver/jobs"))
+        .get(format!("{http_url}/v1/solver/jobs"))
         .header(AUTHORIZATION, &token)
         .send()
         .await
@@ -309,7 +309,7 @@ async fn run() {
 
 async fn solver_proofs(client: &Client, http_url: &str, token: &str) -> Vec<SolverProofDelivery> {
     client
-        .get(format!("{http_url}/solver/proofs"))
+        .get(format!("{http_url}/v1/solver/proofs"))
         .header(AUTHORIZATION, token)
         .send()
         .await
@@ -328,7 +328,7 @@ async fn get_order(
     order_commitment: B256,
 ) -> Order {
     client
-        .get(format!("{http_url}/orders/{order_id}"))
+        .get(format!("{http_url}/v1/orders/{order_id}"))
         .header(ORDER_COMMITMENT_HEADER, order_commitment.to_string())
         .send()
         .await
