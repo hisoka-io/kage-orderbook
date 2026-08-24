@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use snow::params::NoiseParams;
 use uuid::Uuid;
 use x25519_dalek::{X25519_BASEPOINT_BYTES, x25519};

@@ -1,7 +1,6 @@
-#[path = "../src/bin/mock_support/proof_transport.rs"]
-mod proof_transport;
-
-use proof_transport::{ProofTransportError, decrypt_from_user, encrypt_for_solver, public_key};
+use kage_orderbook::proof::transport::{
+    ProofTransportError, decrypt_from_user, encrypt_for_solver, public_key,
+};
 use uuid::Uuid;
 
 const MOCK_PRIVATE_KEY: [u8; 32] = [0x33; 32];

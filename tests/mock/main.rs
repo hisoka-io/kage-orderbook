@@ -1,8 +1,6 @@
 mod chain;
 mod chaos;
 mod expiry;
-#[path = "../../src/bin/mock_support/proof_transport.rs"]
-mod proof_transport;
 mod recovery;
 mod solver;
 mod support;
@@ -21,6 +19,7 @@ use kage_orderbook::{
             DEFAULT_ORDER_TTL_SECONDS, MAX_ORDER_TTL_SECONDS, MIN_ORDER_TTL_SECONDS, MOCK_CHAIN_ID,
         },
     },
+    proof::transport as proof_transport,
 };
 use kage_types::{
     api_types::{

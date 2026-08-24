@@ -1,42 +1,37 @@
-use std::collections::HashSet;
+mod auth;
+mod error;
+mod websocket;
 
 use axum::{
     Json, Router,
-    extract::{
-        Path, State, WebSocketUpgrade,
-        ws::{Message, WebSocket},
-    },
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
-};
-use axum_extra::headers::{
-    Header,
-    authorization::{Authorization, Bearer},
 };
 pub use kage_types::api_types::{
     ApiErrorResponse, CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest,
     ExecutionStartedRequest, ORDER_COMMITMENT_HEADER, UserEventClientMessage,
     UserEventServerMessage,
 };
-use serde::Serialize;
-use uuid::Uuid;
 
 use crate::{
     core::{
         command::Command,
-        engine::{OrderError, OrderbookHandle, ServiceError, SolverProofDelivery},
-        events::OrderEvent,
+        engine::{OrderbookHandle, SolverProofDelivery},
         guards::{CreateOrderInput, OrderPolicy, validate_create_order},
     },
     logging::short_id,
-    order::{OrderCommitment, OrderId, OrderV1, SolverId},
+    order::{OrderId, OrderV1},
     pricing::{PriceValidationError, PricingValidator},
     readiness::{ReadinessSnapshot, ServiceReadiness},
-    registry::{SolverProfile, SolverRegistry},
+    registry::SolverRegistry,
     session::{ChallengeResponse, SessionRequest, SessionResponse, SolverSessions, domain},
-    storage::RepositoryError,
 };
+use error::{
+    ApiError, api_error, api_error_for_service, status_for_error, status_for_price_validation,
+};
+use uuid::Uuid;
 
 #[derive(Clone)]
 struct ApiState {
@@ -51,22 +46,6 @@ struct ApiState {
 fn now_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
 }
-
-impl From<CreateOrderRequest> for CreateOrderInput {
-    fn from(request: CreateOrderRequest) -> Self {
-        Self {
-            order_commitment: request.order_commitment,
-            chain_id: request.chain_id,
-            token_in: request.token_in,
-            token_out: request.token_out,
-            amount_in: request.amount_in,
-            amount_out: request.amount_out,
-            ttl_seconds: request.ttl_seconds,
-        }
-    }
-}
-
-type ApiError = (StatusCode, Json<ApiErrorResponse>);
 
 pub fn router(orderbook: OrderbookHandle, registry: SolverRegistry) -> Router {
     router_with_policy(orderbook, registry, OrderPolicy::default())
@@ -148,8 +127,8 @@ fn router_with_state(
             "/orders/{order_id}/execution-started",
             post(execution_started),
         )
-        .route("/events/user/ws", get(user_events_ws))
-        .route("/events/solver/ws", get(solver_events_ws))
+        .route("/events/user/ws", get(websocket::user_events_ws))
+        .route("/events/solver/ws", get(websocket::solver_events_ws))
         .with_state(ApiState {
             orderbook,
             registry,
@@ -158,6 +137,20 @@ fn router_with_state(
             pricing_validator,
             readiness,
         })
+}
+
+impl From<CreateOrderRequest> for CreateOrderInput {
+    fn from(request: CreateOrderRequest) -> Self {
+        Self {
+            order_commitment: request.order_commitment,
+            chain_id: request.chain_id,
+            token_in: request.token_in,
+            token_out: request.token_out,
+            amount_in: request.amount_in,
+            amount_out: request.amount_out,
+            ttl_seconds: request.ttl_seconds,
+        }
+    }
 }
 
 async fn solver_challenge(State(state): State<ApiState>) -> Json<ChallengeResponse> {
@@ -173,7 +166,7 @@ async fn solver_session(
         crate::service_warn!("orderbook", "solver authentication failed reason={error}");
         StatusCode::UNAUTHORIZED
     })?;
-    active_solver(&state, solver_id)?;
+    auth::active_solver(&state, solver_id)?;
 
     tracing::debug!(target: "orderbook", %solver_id, "solver authenticated");
     Ok(Json(state.sessions.open(solver_id, now)))
@@ -302,7 +295,7 @@ async fn get_order(
     Path(order_id): Path<OrderId>,
     headers: HeaderMap,
 ) -> Result<Json<OrderV1>, StatusCode> {
-    let order_commitment = commitment_from_headers(&headers)?;
+    let order_commitment = auth::commitment_from_headers(&headers)?;
     let order = state
         .orderbook
         .get_order_by_commitment(order_id, order_commitment)
@@ -316,7 +309,7 @@ async fn reserving_orders(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<OrderV1>>, StatusCode> {
-    authenticated_solver(&state, &headers)?;
+    auth::authenticated_solver(&state, &headers)?;
     state
         .orderbook
         .reserving_orders()
@@ -329,7 +322,7 @@ async fn take_solver_proofs(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SolverProofDelivery>>, StatusCode> {
-    let solver_id = authenticated_solver(&state, &headers)?;
+    let solver_id = auth::authenticated_solver(&state, &headers)?;
     state
         .orderbook
         .take_solver_proofs(solver_id)
@@ -343,8 +336,8 @@ async fn reserve_order(
     Path(order_id): Path<OrderId>,
     headers: HeaderMap,
 ) -> Result<StatusCode, StatusCode> {
-    let solver_id = authenticated_solver(&state, &headers)?;
-    let profile = active_solver(&state, solver_id)?;
+    let solver_id = auth::authenticated_solver(&state, &headers)?;
+    let profile = auth::active_solver(&state, solver_id)?;
     execute(
         &state.orderbook,
         Command::SolverReserved {
@@ -361,7 +354,7 @@ async fn decline_order(
     Path(order_id): Path<OrderId>,
     headers: HeaderMap,
 ) -> Result<StatusCode, StatusCode> {
-    let solver_id = authenticated_solver(&state, &headers)?;
+    let solver_id = auth::authenticated_solver(&state, &headers)?;
     let order = state
         .orderbook
         .get_order(order_id)
@@ -393,7 +386,7 @@ async fn relay_encrypted_proof(
     headers: HeaderMap,
     Json(request): Json<EncryptedProofRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let order_commitment = commitment_from_headers(&headers)?;
+    let order_commitment = auth::commitment_from_headers(&headers)?;
     state
         .orderbook
         .relay_encrypted_proof(order_id, order_commitment, request.ciphertext)
@@ -408,7 +401,7 @@ async fn execution_started(
     headers: HeaderMap,
     Json(request): Json<ExecutionStartedRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let solver_id = authenticated_solver(&state, &headers)?;
+    let solver_id = auth::authenticated_solver(&state, &headers)?;
     execute(
         &state.orderbook,
         Command::ExecutionStarted {
@@ -428,255 +421,10 @@ async fn execute(orderbook: &OrderbookHandle, command: Command) -> Result<Status
         .map_err(status_for_error)
 }
 
-async fn user_events_ws(ws: WebSocketUpgrade, State(state): State<ApiState>) -> impl IntoResponse {
-    let events = state.orderbook.subscribe();
-    ws.on_upgrade(move |socket| forward_user_events(socket, events, state.orderbook))
-}
-
-async fn solver_events_ws(
-    ws: WebSocketUpgrade,
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    let solver_id = authenticated_solver(&state, &headers)?;
-    active_solver(&state, solver_id)?;
-    let events = state.orderbook.subscribe();
-    let readiness = state.readiness.clone();
-    Ok(ws.on_upgrade(move |socket| async move {
-        let connection = readiness.solver_connection();
-        tracing::debug!(target: "orderbook", %solver_id, "solver connected");
-        forward_service_events(
-            socket,
-            events,
-            SolverStream {
-                solver_id,
-                orderbook: state.orderbook,
-            },
-        )
-        .await;
-        drop(connection);
-        tracing::debug!(target: "orderbook", %solver_id, "solver disconnected");
-    }))
-}
-
-async fn forward_user_events(
-    mut socket: WebSocket,
-    mut events: tokio::sync::broadcast::Receiver<OrderEvent>,
-    orderbook: OrderbookHandle,
-) {
-    let mut subscriptions = HashSet::new();
-
-    loop {
-        tokio::select! {
-            message = socket.recv() => {
-                let Some(Ok(message)) = message else {
-                    return;
-                };
-                let Message::Text(text) = message else {
-                    if matches!(message, Message::Close(_)) {
-                        return;
-                    }
-                    continue;
-                };
-                let Ok(UserEventClientMessage::Subscribe {
-                    order_id,
-                    order_commitment,
-                }) = serde_json::from_str(&text) else {
-                    continue;
-                };
-
-                let authorized = match orderbook
-                    .get_order_by_commitment(order_id, order_commitment)
-                    .await
-                {
-                    Ok(Some(_)) => true,
-                    Ok(None) => false,
-                    Err(_) => return,
-                };
-                let response = if authorized {
-                    subscriptions.insert(order_id);
-                    UserEventServerMessage::Subscribed { order_id }
-                } else {
-                    UserEventServerMessage::Rejected { order_id }
-                };
-                if send_json(&mut socket, &response).await.is_err() {
-                    return;
-                }
-            }
-            event = events.recv(), if !subscriptions.is_empty() => {
-                let event = match event {
-                    Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                };
-                if subscriptions.contains(&event.order_id())
-                    && send_json(&mut socket, &UserEventServerMessage::Event { event })
-                        .await
-                        .is_err()
-                {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-struct SolverStream {
-    solver_id: SolverId,
-    orderbook: OrderbookHandle,
-}
-
-async fn forward_service_events(
-    mut socket: WebSocket,
-    mut events: tokio::sync::broadcast::Receiver<OrderEvent>,
-    stream: SolverStream,
-) {
-    loop {
-        tokio::select! {
-            message = socket.recv() => match message {
-                Some(Ok(Message::Ping(payload))) => {
-                    if socket.send(Message::Pong(payload)).await.is_err() {
-                        return;
-                    }
-                }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
-                Some(Ok(_)) => {}
-            },
-            event = events.recv() => {
-                let event = match event {
-                    Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                };
-
-                let SolverStream {
-                    solver_id,
-                    orderbook,
-                } = &stream;
-                let relevant = match &event {
-                        OrderEvent::SolverReservationRequested { .. } => true,
-                        OrderEvent::ProofRelayed {
-                            solver_id: assigned,
-                            ..
-                        } => assigned == solver_id,
-                        OrderEvent::OrderFilled { order_id, .. }
-                        | OrderEvent::OrderExpired { order_id } => orderbook
-                            .get_order(*order_id)
-                            .await
-                            .ok()
-                            .flatten()
-                            .is_some_and(|order| order.solver == Some(*solver_id)),
-                    _ => false,
-                };
-                if relevant && send_json(&mut socket, &event).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-async fn send_json(socket: &mut WebSocket, value: &impl Serialize) -> Result<(), ()> {
-    let json = serde_json::to_string(value).map_err(|_| ())?;
-    socket
-        .send(Message::Text(json.into()))
-        .await
-        .map_err(|_| ())
-}
-
-fn commitment_from_headers(headers: &HeaderMap) -> Result<OrderCommitment, StatusCode> {
-    headers
-        .get(ORDER_COMMITMENT_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-        .ok_or(StatusCode::NOT_FOUND)
-}
-
-fn active_solver(state: &ApiState, solver_id: SolverId) -> Result<SolverProfile, StatusCode> {
-    state.registry.health().map_err(|error| {
-        crate::service_warn!(
-            "orderbook",
-            "solver lookup deferred solver={solver_id} {error}"
-        );
-        StatusCode::SERVICE_UNAVAILABLE
-    })?;
-    let profile = state
-        .registry
-        .get(solver_id)
-        .filter(|profile| profile.active)
-        .ok_or(StatusCode::FORBIDDEN)?;
-    if profile.noise_public_key == alloy_primitives::B256::ZERO {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    Ok(profile)
-}
-
-fn authenticated_solver(state: &ApiState, headers: &HeaderMap) -> Result<SolverId, StatusCode> {
-    let Authorization(bearer) = Authorization::<Bearer>::decode(
-        &mut headers.get_all(axum::http::header::AUTHORIZATION).iter(),
-    )
-    .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    state
-        .sessions
-        .resolve(bearer.token(), now_ms())
-        .ok_or(StatusCode::UNAUTHORIZED)
-}
-
-fn status_for_error(error: ServiceError) -> StatusCode {
-    match error {
-        ServiceError::Repository(RepositoryError::DuplicateOrderCommitment) => StatusCode::CONFLICT,
-        ServiceError::Closed | ServiceError::Repository(_) => StatusCode::SERVICE_UNAVAILABLE,
-        ServiceError::Order(OrderError::InvalidTerms | OrderError::InvalidPayload) => {
-            StatusCode::UNPROCESSABLE_ENTITY
-        }
-        ServiceError::Order(OrderError::NotFound) => StatusCode::NOT_FOUND,
-        ServiceError::Order(OrderError::AlreadyExists | OrderError::InvalidState) => {
-            StatusCode::CONFLICT
-        }
-    }
-}
-
-fn status_for_price_validation(error: &PriceValidationError) -> StatusCode {
-    match error {
-        PriceValidationError::Pricing(_) => StatusCode::SERVICE_UNAVAILABLE,
-        PriceValidationError::UnsupportedMarket
-        | PriceValidationError::Arithmetic
-        | PriceValidationError::DeviationExceeded { .. }
-        | PriceValidationError::OrderValueExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-    }
-}
-
-fn api_error(
-    status: StatusCode,
-    code: impl Into<String>,
-    message: impl Into<String>,
-    missing: Vec<String>,
-) -> ApiError {
-    (
-        status,
-        Json(ApiErrorResponse {
-            code: code.into(),
-            message: message.into(),
-            missing,
-        }),
-    )
-}
-
-fn api_error_for_service(error: ServiceError) -> ApiError {
-    let status = status_for_error(error);
-    let message = match status {
-        StatusCode::SERVICE_UNAVAILABLE => "order service is unavailable",
-        StatusCode::UNPROCESSABLE_ENTITY => "order failed lifecycle validation",
-        StatusCode::NOT_FOUND => "order was not found",
-        StatusCode::CONFLICT => "order conflicts with its current state",
-        _ => "order request failed",
-    };
-    api_error(status, "order_service_error", message, Vec::new())
-}
-
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, B256, U256};
+    use axum::http::StatusCode;
     use tokio::net::TcpListener;
 
     use super::*;

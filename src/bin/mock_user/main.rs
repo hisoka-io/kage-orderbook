@@ -11,6 +11,7 @@ use kage_orderbook::{
     config::{AppConfig, Network},
     logging::short_id,
     pricing::{self, PricePoint, PricingConfig, PricingHandle},
+    proof::transport as proof_transport,
 };
 use kage_types::{
     api_types::{
@@ -25,9 +26,6 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use uuid::Uuid;
 
-#[path = "../mock_support/proof_transport.rs"]
-mod proof_transport;
-#[path = "../mock_support/proof_validation.rs"]
 mod proof_validation;
 mod prover_worker;
 
