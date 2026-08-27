@@ -24,7 +24,4 @@ wrong-quote:
 test-intent-proof:
     bash ./scripts/test-intent-proof.sh
 
-test-prover-worker:
-    cargo test --bin mock_user prover_worker::tests::generates_a_real_proof_through_the_worker -- --ignored --nocapture
-
 ci: fmt-check lint test

@@ -1,8 +1,10 @@
 use alloy_primitives::{Address, B256, U256};
-use kage_orderbook::{core::guards::MOCK_CHAIN_ID, registry::SolverRegistry};
-use kage_types::{orders::TradeTerms, registry::SolverProfile};
-
-use super::proof_transport;
+use kage_orderbook::{
+    assignment::AssignmentIssuer,
+    core::guards::MOCK_CHAIN_ID,
+    registry::{SolverProfile, SolverRegistry},
+};
+use kage_types::orders::TradeTerms;
 
 pub fn solver_key(n: u8) -> k256::ecdsa::SigningKey {
     k256::ecdsa::SigningKey::from_slice(&[n; 32]).expect("valid scalar")
@@ -28,13 +30,15 @@ pub async fn bearer(http_url: &str, n: u8) -> String {
     let client = reqwest::Client::new();
     let challenge: Challenge = client
         .post(format!("{http_url}/v1/solver/challenge"))
+        .json(&serde_json::json!({
+            "solver_endpoint": format!("http://127.0.0.1:{}", 3100 + u16::from(n))
+        }))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-
     let hash = alloy_primitives::eip191_hash_message(&challenge.message);
     let (signature, recovery) = solver_key(n)
         .sign_prehash_recoverable(hash.as_slice())
@@ -52,18 +56,12 @@ pub async fn bearer(http_url: &str, n: u8) -> String {
         .send()
         .await
         .unwrap()
+        .error_for_status()
+        .unwrap()
         .json()
         .await
         .unwrap();
     format!("Bearer {}", session.token)
-}
-
-pub fn noise_private_key(n: u8) -> [u8; 32] {
-    [n; 32]
-}
-
-pub fn noise_public_key(n: u8) -> B256 {
-    B256::from(proof_transport::public_key(&noise_private_key(n)).unwrap())
 }
 
 pub fn registry() -> SolverRegistry {
@@ -71,18 +69,25 @@ pub fn registry() -> SolverRegistry {
         (
             solver_address(0x11),
             SolverProfile {
-                noise_public_key: noise_public_key(0x33),
+                noise_public_key: B256::repeat_byte(0x33),
                 active: true,
             },
         ),
         (
             solver_address(0x22),
             SolverProfile {
-                noise_public_key: noise_public_key(0x44),
+                noise_public_key: B256::repeat_byte(0x44),
                 active: true,
             },
         ),
     ])
+}
+
+pub fn assignment_issuer() -> AssignmentIssuer {
+    AssignmentIssuer::for_test(
+        alloy::signers::local::PrivateKeySigner::from_slice(&[7; 32]).unwrap(),
+        60_000,
+    )
 }
 
 pub fn commitment(n: u64) -> B256 {

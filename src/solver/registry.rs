@@ -1,10 +1,16 @@
 use std::{collections::HashMap, sync::Arc};
 
+use alloy_primitives::B256;
 use kage_registry::{RegistryIndexer, SyncState};
-pub use kage_types::registry::SolverProfile;
 use thiserror::Error;
 
 use crate::order::SolverId;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SolverProfile {
+    pub noise_public_key: B256,
+    pub active: bool,
+}
 
 #[derive(Clone)]
 pub struct SolverRegistry {
@@ -64,7 +70,7 @@ impl SolverRegistry {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{Address, B256};
+    use alloy_primitives::Address;
 
     use super::*;
 

@@ -1,6 +1,6 @@
 use std::{str::FromStr, time::Duration};
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, U256};
 use sqlx::{
     Row, SqlitePool,
     sqlite::{
@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     config::Network,
-    order::{Order, OrderCommitment, OrderId, OrderState, SolverId},
+    order::{Order, OrderCommitment, OrderId, OrderState},
 };
 
 #[derive(Debug, Error)]
@@ -34,12 +34,6 @@ pub enum RepositoryError {
 #[derive(Debug, Clone)]
 pub(crate) struct PersistedOrder {
     pub order: Order,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ProofPayload {
-    pub order_id: OrderId,
-    pub ciphertext: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -107,9 +101,9 @@ impl OrderRepository {
         let result = sqlx::query(
             "INSERT INTO orders (
                 id, chain_id, state, version, token_in, token_out, amount_in, amount_out,
-                solver_noise_public_key, tx_hash, created_at_ms, updated_at_ms,
+                solver_noise_public_key, created_at_ms, updated_at_ms,
                 expires_at_ms, order_commitment, solver_address
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(order.id.to_string())
         .bind(u64_to_i64("chain_id", order.chain_id)?)
@@ -120,7 +114,6 @@ impl OrderRepository {
         .bind(order.amount_in.to_string())
         .bind(order.amount_out.to_string())
         .bind(order.solver_noise_public_key.as_deref())
-        .bind(order.tx_hash.map(|hash| hash.to_vec()))
         .bind(created_at_ms)
         .bind(created_at_ms)
         .bind(order.expires_at_ms)
@@ -147,15 +140,12 @@ impl OrderRepository {
         order: &Order,
         expected_version: u64,
         timestamp_ms: i64,
-        proof: Option<(SolverId, &[u8])>,
-        delete_proof: bool,
     ) -> Result<(), RepositoryError> {
-        let mut transaction = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE orders SET
                 state = ?, version = ?, token_in = ?, token_out = ?,
                 amount_in = ?, amount_out = ?, solver_address = ?,
-                solver_noise_public_key = ?, tx_hash = ?, updated_at_ms = ?
+                solver_noise_public_key = ?, updated_at_ms = ?
              WHERE id = ? AND version = ?",
         )
         .bind(state_name(order.state))
@@ -166,44 +156,16 @@ impl OrderRepository {
         .bind(order.amount_out.to_string())
         .bind(order.solver.map(|address| address.to_vec()))
         .bind(order.solver_noise_public_key.as_deref())
-        .bind(order.tx_hash.map(|hash| hash.to_vec()))
         .bind(timestamp_ms)
         .bind(order.id.to_string())
         .bind(version_to_i64(expected_version)?)
-        .execute(&mut *transaction)
+        .execute(&self.pool)
         .await?;
 
         if result.rows_affected() != 1 {
             return Err(RepositoryError::VersionConflict);
         }
 
-        if let Some((solver_id, ciphertext)) = proof {
-            sqlx::query(
-                "INSERT INTO proof_payloads (
-                    order_id, solver_address, ciphertext, created_at_ms, delivered_at_ms
-                 ) VALUES (?, ?, ?, ?, NULL)
-                 ON CONFLICT(order_id) DO UPDATE SET
-                    solver_address = excluded.solver_address,
-                    ciphertext = excluded.ciphertext,
-                    created_at_ms = excluded.created_at_ms,
-                    delivered_at_ms = NULL",
-            )
-            .bind(order.id.to_string())
-            .bind(solver_id.as_slice())
-            .bind(ciphertext)
-            .bind(timestamp_ms)
-            .execute(&mut *transaction)
-            .await?;
-        }
-
-        if delete_proof {
-            sqlx::query("DELETE FROM proof_payloads WHERE order_id = ?")
-                .bind(order.id.to_string())
-                .execute(&mut *transaction)
-                .await?;
-        }
-
-        transaction.commit().await?;
         Ok(())
     }
 
@@ -248,48 +210,19 @@ impl OrderRepository {
         row.map(decode_order).transpose()
     }
 
-    pub(crate) async fn get_proof(
-        &self,
-        order_id: OrderId,
-    ) -> Result<Option<ProofPayload>, RepositoryError> {
-        let row = sqlx::query(
-            "SELECT order_id, ciphertext
-             FROM proof_payloads WHERE order_id = ?",
-        )
-        .bind(order_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(decode_proof).transpose()
-    }
-
     pub(crate) async fn load_non_terminal_orders(
         &self,
     ) -> Result<Vec<PersistedOrder>, RepositoryError> {
         let rows = sqlx::query(
             "SELECT * FROM orders
-             WHERE state NOT IN ('filled', 'expired', 'cancelled', 'failed')
+             WHERE state IN (
+                'created', 'validated', 'reserving', 'assigned', 'awaiting_user_proof'
+             )
              ORDER BY created_at_ms, id",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(decode_order).collect()
-    }
-
-    pub(crate) async fn load_solver_proofs(
-        &self,
-        solver_id: SolverId,
-    ) -> Result<Vec<ProofPayload>, RepositoryError> {
-        let rows = sqlx::query(
-            "SELECT proof_payloads.order_id, proof_payloads.ciphertext
-             FROM proof_payloads
-             JOIN orders ON orders.id = proof_payloads.order_id
-             WHERE proof_payloads.solver_address = ? AND orders.state = 'proof_relayed'
-             ORDER BY proof_payloads.created_at_ms, proof_payloads.order_id",
-        )
-        .bind(solver_id.as_slice())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(decode_proof).collect()
     }
 }
 
@@ -308,10 +241,6 @@ fn decode_order(row: SqliteRow) -> Result<PersistedOrder, RepositoryError> {
         .map(|value| parse_fixed::<20>("solver_address", value).map(Address::from))
         .transpose()?;
     let noise_public_key = row.try_get("solver_noise_public_key")?;
-    let tx_hash = row
-        .try_get::<Option<Vec<u8>>, _>("tx_hash")?
-        .map(|value| parse_fixed::<32>("tx_hash", value).map(B256::from))
-        .transpose()?;
     let expires_at_ms = row.try_get("expires_at_ms")?;
     Ok(PersistedOrder {
         order: Order {
@@ -326,15 +255,7 @@ fn decode_order(row: SqliteRow) -> Result<PersistedOrder, RepositoryError> {
             expires_at_ms,
             solver,
             solver_noise_public_key: noise_public_key,
-            tx_hash,
         },
-    })
-}
-
-fn decode_proof(row: SqliteRow) -> Result<ProofPayload, RepositoryError> {
-    Ok(ProofPayload {
-        order_id: parse_uuid("order_id", row.try_get("order_id")?)?,
-        ciphertext: row.try_get("ciphertext")?,
     })
 }
 
@@ -345,12 +266,7 @@ fn state_name(state: OrderState) -> &'static str {
         OrderState::Reserving => "reserving",
         OrderState::Assigned => "assigned",
         OrderState::AwaitingUserProof => "awaiting_user_proof",
-        OrderState::ProofRelayed => "proof_relayed",
-        OrderState::Executing => "executing",
-        OrderState::Filled => "filled",
         OrderState::Expired => "expired",
-        OrderState::Cancelled => "cancelled",
-        OrderState::Failed => "failed",
     }
 }
 
@@ -361,12 +277,7 @@ fn parse_state(value: &str) -> Result<OrderState, RepositoryError> {
         "reserving" => Ok(OrderState::Reserving),
         "assigned" => Ok(OrderState::Assigned),
         "awaiting_user_proof" => Ok(OrderState::AwaitingUserProof),
-        "proof_relayed" => Ok(OrderState::ProofRelayed),
-        "executing" => Ok(OrderState::Executing),
-        "filled" => Ok(OrderState::Filled),
         "expired" => Ok(OrderState::Expired),
-        "cancelled" => Ok(OrderState::Cancelled),
-        "failed" => Ok(OrderState::Failed),
         _ => Err(invalid("state", value)),
     }
 }
@@ -428,8 +339,9 @@ mod tests {
     }
 
     fn order(state: OrderState, version: u64) -> Order {
+        let id = Uuid::new_v4();
         Order {
-            id: Uuid::new_v4(),
+            id,
             chain_id: 31_337,
             state,
             version,
@@ -440,7 +352,6 @@ mod tests {
             expires_at_ms: Some(5000),
             solver: Some(Address::repeat_byte(3)),
             solver_noise_public_key: Some(vec![7; 32]),
-            tx_hash: Some(B256::repeat_byte(9)),
         }
     }
 
@@ -451,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn stores_and_loads_an_order() {
         let repository = repository().await;
-        let order = order(OrderState::Executing, 7);
+        let order = order(OrderState::AwaitingUserProof, 5);
         let commitment = B256::repeat_byte(1);
         repository
             .insert_order(&order, commitment, 1000)
@@ -461,11 +372,10 @@ mod tests {
         let stored = repository.get_order(order.id).await.unwrap().unwrap();
         assert_eq!(stored.order.id, order.id);
         assert_eq!(stored.order.chain_id, order.chain_id);
-        assert_eq!(stored.order.state, OrderState::Executing);
-        assert_eq!(stored.order.version, 7);
+        assert_eq!(stored.order.state, OrderState::AwaitingUserProof);
+        assert_eq!(stored.order.version, 5);
         assert_eq!(stored.order.amount_in, order.amount_in);
         assert_eq!(stored.order.solver, order.solver);
-        assert_eq!(stored.order.tx_hash, order.tx_hash);
     }
 
     #[tokio::test]
@@ -480,12 +390,12 @@ mod tests {
         order.state = OrderState::AwaitingUserProof;
         order.version = 4;
         repository
-            .persist_transition(&order, 3, 2000, None, false)
+            .persist_transition(&order, 3, 2000)
             .await
             .unwrap();
 
         let error = repository
-            .persist_transition(&order, 3, 3000, None, false)
+            .persist_transition(&order, 3, 3000)
             .await
             .unwrap_err();
         assert!(matches!(error, RepositoryError::VersionConflict));
@@ -494,42 +404,19 @@ mod tests {
     #[tokio::test]
     async fn loads_only_non_terminal_orders() {
         let repository = repository().await;
-        let active = order(OrderState::ProofRelayed, 5);
-        let filled = order(OrderState::Filled, 8);
+        let active = order(OrderState::AwaitingUserProof, 5);
+        let expired = order(OrderState::Expired, 6);
         repository
             .insert_order(&active, B256::repeat_byte(1), 1000)
             .await
             .unwrap();
         repository
-            .insert_order(&filled, B256::repeat_byte(2), 1001)
+            .insert_order(&expired, B256::repeat_byte(2), 1001)
             .await
             .unwrap();
 
         let orders = repository.load_non_terminal_orders().await.unwrap();
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].order.id, active.id);
-    }
-
-    #[tokio::test]
-    async fn proof_fetch_is_non_destructive() {
-        let repository = repository().await;
-        let mut order = order(OrderState::AwaitingUserProof, 4);
-        let solver_id = order.solver.unwrap();
-        repository
-            .insert_order(&order, B256::repeat_byte(1), 1000)
-            .await
-            .unwrap();
-        order.state = OrderState::ProofRelayed;
-        order.version = 5;
-        repository
-            .persist_transition(&order, 4, 1100, Some((solver_id, &[1, 2, 3])), false)
-            .await
-            .unwrap();
-
-        let first = repository.load_solver_proofs(solver_id).await.unwrap();
-        let second = repository.load_solver_proofs(solver_id).await.unwrap();
-        assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
-        assert_eq!(first[0].ciphertext, vec![1, 2, 3]);
     }
 }

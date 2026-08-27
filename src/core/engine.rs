@@ -9,11 +9,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use super::{command::Command, events::OrderEvent};
 use crate::{
     logging::short_id,
-    order::{Order, OrderCommitment, OrderId, OrderState, SolverId, TradeTerms},
+    order::{Order, OrderCommitment, OrderId, OrderState, TradeTerms},
     storage::{OrderRepository, RepositoryError},
 };
-
-pub use kage_types::api_types::SolverProofDeliveryV1 as SolverProofDelivery;
 
 #[derive(Debug, Clone)]
 pub struct CreateOrderOutcome {
@@ -21,14 +19,8 @@ pub struct CreateOrderOutcome {
     pub created: bool,
 }
 
-pub struct SolverDelivery {
-    solver_id: SolverId,
-    proof: SolverProofDelivery,
-}
-
 pub struct Transition {
     pub events: Vec<OrderEvent>,
-    pub deliveries: Vec<SolverDelivery>,
 }
 
 #[derive(Default)]
@@ -72,7 +64,6 @@ pub fn handle(order: Option<&Order>, command: Command) -> Result<Transition, Ord
                     OrderEvent::OrderValidated { order_id },
                     OrderEvent::SolverReservationRequested { order_id, terms },
                 ],
-                deliveries: vec![],
             })
         }
 
@@ -101,7 +92,6 @@ pub fn handle(order: Option<&Order>, command: Command) -> Result<Transition, Ord
                         noise_public_key,
                     },
                 ],
-                deliveries: vec![],
             })
         }
 
@@ -113,7 +103,7 @@ pub fn handle(order: Option<&Order>, command: Command) -> Result<Transition, Ord
             if order.solver != Some(solver_id)
                 || !matches!(
                     order.state,
-                    OrderState::Assigned | OrderState::AwaitingUserProof | OrderState::ProofRelayed
+                    OrderState::Assigned | OrderState::AwaitingUserProof
                 )
             {
                 return Err(OrderError::InvalidState);
@@ -130,107 +120,17 @@ pub fn handle(order: Option<&Order>, command: Command) -> Result<Transition, Ord
 
             Ok(Transition {
                 events: vec![OrderEvent::SolverReservationRequested { order_id, terms }],
-                deliveries: vec![],
-            })
-        }
-
-        Command::RelayEncryptedProof {
-            order_id,
-            ciphertext,
-        } => {
-            let order = order.ok_or(OrderError::NotFound)?;
-            if order.state != OrderState::AwaitingUserProof {
-                return Err(OrderError::InvalidState);
-            }
-            if ciphertext.is_empty() || ciphertext.len() > 1024 * 1024 {
-                return Err(OrderError::InvalidPayload);
-            }
-            let solver_id = order.solver.ok_or(OrderError::InvalidState)?;
-
-            Ok(Transition {
-                events: vec![OrderEvent::ProofRelayed {
-                    order_id,
-                    solver_id,
-                }],
-                deliveries: vec![SolverDelivery {
-                    solver_id,
-                    proof: SolverProofDelivery {
-                        order_id,
-                        ciphertext,
-                    },
-                }],
-            })
-        }
-
-        Command::ExecutionStarted {
-            order_id,
-            solver_id,
-            tx_hash,
-        } => {
-            let order = order.ok_or(OrderError::NotFound)?;
-            if order.state != OrderState::ProofRelayed || order.solver != Some(solver_id) {
-                return Err(OrderError::InvalidState);
-            }
-            if tx_hash == B256::ZERO {
-                return Err(OrderError::InvalidPayload);
-            }
-
-            Ok(Transition {
-                events: vec![OrderEvent::ExecutionStarted { order_id, tx_hash }],
-                deliveries: vec![],
-            })
-        }
-
-        Command::SettlementObserved { order_id, tx_hash } => {
-            let order = order.ok_or(OrderError::NotFound)?;
-            if order.state != OrderState::Executing || order.tx_hash != Some(tx_hash) {
-                return Err(OrderError::InvalidState);
-            }
-
-            Ok(Transition {
-                events: vec![OrderEvent::OrderFilled { order_id, tx_hash }],
-                deliveries: vec![],
-            })
-        }
-
-        Command::ExecutionFailed { order_id, tx_hash } => {
-            let order = order.ok_or(OrderError::NotFound)?;
-            if order.state != OrderState::Executing || order.tx_hash != Some(tx_hash) {
-                return Err(OrderError::InvalidState);
-            }
-            let expires_at_ms = order.expires_at_ms.ok_or(OrderError::InvalidState)?;
-
-            Ok(Transition {
-                events: vec![OrderEvent::SolverReservationRequested {
-                    order_id,
-                    terms: TradeTerms {
-                        chain_id: order.chain_id,
-                        token_in: order.token_in,
-                        token_out: order.token_out,
-                        amount_in: order.amount_in,
-                        amount_out: order.amount_out,
-                        expires_at_ms,
-                    },
-                }],
-                deliveries: vec![],
             })
         }
 
         Command::ExpireOrder { order_id } => {
             let order = order.ok_or(OrderError::NotFound)?;
-            if matches!(
-                order.state,
-                OrderState::Filled
-                    | OrderState::Expired
-                    | OrderState::Cancelled
-                    | OrderState::Failed
-            ) {
+            if order.state == OrderState::Expired {
                 return Err(OrderError::InvalidState);
             }
 
             Ok(Transition {
                 events: vec![OrderEvent::OrderExpired { order_id }],
-                deliveries: vec![],
             })
         }
     }
@@ -246,7 +146,6 @@ impl Orderbook {
     fn prepare(
         &self,
         command: Command,
-        stored_proof: Option<&[u8]>,
         timestamp_ms: i64,
     ) -> Result<Option<PreparedTransition>, OrderError> {
         let order_commitment = match &command {
@@ -267,18 +166,10 @@ impl Orderbook {
         {
             return Err(OrderError::InvalidState);
         }
-        if is_idempotent(current, &command, stored_proof) {
+        if is_idempotent(current, &command) {
             return Ok(None);
         }
         let expected_version = current.map(|order| order.version);
-        let delete_proof = matches!(
-            &command,
-            Command::ExecutionStarted { .. }
-                | Command::SolverDeclined { .. }
-                | Command::SettlementObserved { .. }
-                | Command::ExecutionFailed { .. }
-                | Command::ExpireOrder { .. }
-        );
         let transition = handle(current, command)?;
         let mut order = match current {
             Some(order) => order.clone(),
@@ -291,13 +182,11 @@ impl Orderbook {
         for event in &transition.events {
             order.apply(event);
         }
-
         Ok(Some(PreparedTransition {
             order,
             order_commitment,
             expected_version,
             transition,
-            delete_proof,
         }))
     }
 
@@ -307,7 +196,7 @@ impl Orderbook {
     }
 
     pub fn process(&mut self, command: Command) -> Result<Vec<OrderEvent>, OrderError> {
-        let Some(prepared) = self.prepare(command, None, now_ms())? else {
+        let Some(prepared) = self.prepare(command, now_ms())? else {
             return Ok(vec![]);
         };
         let events = prepared.transition.events.clone();
@@ -316,7 +205,7 @@ impl Orderbook {
     }
 }
 
-fn is_idempotent(order: Option<&Order>, command: &Command, stored_proof: Option<&[u8]>) -> bool {
+fn is_idempotent(order: Option<&Order>, command: &Command) -> bool {
     let Some(order) = order else {
         return false;
     };
@@ -327,31 +216,11 @@ fn is_idempotent(order: Option<&Order>, command: &Command, stored_proof: Option<
             noise_public_key,
             ..
         } => {
-            matches!(
-                order.state,
-                OrderState::AwaitingUserProof
-                    | OrderState::ProofRelayed
-                    | OrderState::Executing
-                    | OrderState::Filled
-            ) && order.solver == Some(*solver_id)
+            order.state == OrderState::AwaitingUserProof
+                && order.solver == Some(*solver_id)
                 && order.solver_noise_public_key.as_deref() == Some(noise_public_key)
         }
-        Command::RelayEncryptedProof { ciphertext, .. } => {
-            order.state == OrderState::Executing
-                || (order.state == OrderState::ProofRelayed && stored_proof == Some(ciphertext))
-        }
         Command::SolverDeclined { .. } => order.state == OrderState::Reserving,
-        Command::ExecutionStarted {
-            solver_id, tx_hash, ..
-        } => {
-            matches!(order.state, OrderState::Executing | OrderState::Filled)
-                && order.solver == Some(*solver_id)
-                && order.tx_hash == Some(*tx_hash)
-        }
-        Command::SettlementObserved { tx_hash, .. } => {
-            order.state == OrderState::Filled && order.tx_hash == Some(*tx_hash)
-        }
-        Command::ExecutionFailed { .. } => order.state == OrderState::Reserving,
         Command::CreateOrder { .. } | Command::ExpireOrder { .. } => false,
     }
 }
@@ -361,7 +230,6 @@ struct PreparedTransition {
     order_commitment: Option<OrderCommitment>,
     expected_version: Option<u64>,
     transition: Transition,
-    delete_proof: bool,
 }
 
 enum Request {
@@ -388,20 +256,8 @@ enum Request {
         order_commitment: OrderCommitment,
         reply: oneshot::Sender<Result<Option<Order>, RepositoryError>>,
     },
-    ExecuteAuthorized {
-        command: Command,
-        order_commitment: OrderCommitment,
-        reply: oneshot::Sender<Result<(), ServiceError>>,
-    },
     ReservingOrders {
         reply: oneshot::Sender<Vec<Order>>,
-    },
-    ExecutingOrders {
-        reply: oneshot::Sender<Vec<Order>>,
-    },
-    TakeSolverProofs {
-        solver_id: SolverId,
-        reply: oneshot::Sender<Result<Vec<SolverProofDelivery>, RepositoryError>>,
     },
 }
 
@@ -506,28 +362,6 @@ impl OrderbookHandle {
             .map_err(ServiceError::Repository)
     }
 
-    pub async fn relay_encrypted_proof(
-        &self,
-        order_id: OrderId,
-        order_commitment: OrderCommitment,
-        ciphertext: Vec<u8>,
-    ) -> Result<(), ServiceError> {
-        let (reply, result) = oneshot::channel();
-        self.requests
-            .send(Request::ExecuteAuthorized {
-                command: Command::RelayEncryptedProof {
-                    order_id,
-                    ciphertext,
-                },
-                order_commitment,
-                reply,
-            })
-            .await
-            .map_err(|_| ServiceError::Closed)?;
-
-        result.await.map_err(|_| ServiceError::Closed)?
-    }
-
     pub async fn reserving_orders(&self) -> Result<Vec<Order>, ServiceError> {
         let (reply, result) = oneshot::channel();
         self.requests
@@ -536,32 +370,6 @@ impl OrderbookHandle {
             .map_err(|_| ServiceError::Closed)?;
 
         result.await.map_err(|_| ServiceError::Closed)
-    }
-
-    pub async fn executing_orders(&self) -> Result<Vec<Order>, ServiceError> {
-        let (reply, result) = oneshot::channel();
-        self.requests
-            .send(Request::ExecutingOrders { reply })
-            .await
-            .map_err(|_| ServiceError::Closed)?;
-
-        result.await.map_err(|_| ServiceError::Closed)
-    }
-
-    pub async fn take_solver_proofs(
-        &self,
-        solver_id: SolverId,
-    ) -> Result<Vec<SolverProofDelivery>, ServiceError> {
-        let (reply, result) = oneshot::channel();
-        self.requests
-            .send(Request::TakeSolverProofs { solver_id, reply })
-            .await
-            .map_err(|_| ServiceError::Closed)?;
-
-        result
-            .await
-            .map_err(|_| ServiceError::Closed)?
-            .map_err(ServiceError::Repository)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<OrderEvent> {
@@ -664,24 +472,6 @@ pub async fn start_orderbook_with_repository(
                         .map(|stored| stored.map(|stored| stored.order));
                     let _ = reply.send(result);
                 }
-                Request::ExecuteAuthorized {
-                    command,
-                    order_commitment,
-                    reply,
-                } => {
-                    let order_id = command.order_id();
-                    let result = match repository
-                        .get_order_by_commitment(order_id, order_commitment)
-                        .await
-                    {
-                        Ok(Some(_)) => {
-                            execute_command(&mut orderbook, &repository, &events, command).await
-                        }
-                        Ok(None) => Err(ServiceError::Order(OrderError::NotFound)),
-                        Err(error) => Err(ServiceError::Repository(error)),
-                    };
-                    let _ = reply.send(result);
-                }
                 Request::ReservingOrders { reply } => {
                     let orders = orderbook
                         .orders
@@ -690,30 +480,6 @@ pub async fn start_orderbook_with_repository(
                         .cloned()
                         .collect();
                     let _ = reply.send(orders);
-                }
-                Request::ExecutingOrders { reply } => {
-                    let orders = orderbook
-                        .orders
-                        .values()
-                        .filter(|order| order.state == OrderState::Executing)
-                        .cloned()
-                        .collect();
-                    let _ = reply.send(orders);
-                }
-                Request::TakeSolverProofs { solver_id, reply } => {
-                    let proofs = repository
-                        .load_solver_proofs(solver_id)
-                        .await
-                        .map(|proofs| {
-                            proofs
-                                .into_iter()
-                                .map(|proof| SolverProofDelivery {
-                                    order_id: proof.order_id,
-                                    ciphertext: proof.ciphertext,
-                                })
-                                .collect()
-                        });
-                    let _ = reply.send(proofs);
                 }
             }
         }
@@ -819,35 +585,16 @@ async fn execute_command(
             orderbook.orders.entry(order_id).or_insert(stored_order);
         }
 
-        let stored_proof = if matches!(&command, Command::RelayEncryptedProof { .. }) {
-            repository
-                .get_proof(order_id)
-                .await
-                .map_err(ServiceError::Repository)?
-                .map(|proof| proof.ciphertext)
-        } else {
-            None
-        };
         let timestamp_ms = now_ms();
 
         match orderbook
-            .prepare(command, stored_proof.as_deref(), timestamp_ms)
+            .prepare(command, timestamp_ms)
             .map_err(ServiceError::Order)?
         {
             Some(prepared) => {
                 let persisted = if let Some(expected_version) = prepared.expected_version {
-                    let proof =
-                        prepared.transition.deliveries.first().map(|delivery| {
-                            (delivery.solver_id, delivery.proof.ciphertext.as_slice())
-                        });
                     repository
-                        .persist_transition(
-                            &prepared.order,
-                            expected_version,
-                            timestamp_ms,
-                            proof,
-                            prepared.delete_proof,
-                        )
+                        .persist_transition(&prepared.order, expected_version, timestamp_ms)
                         .await
                 } else {
                     repository
@@ -908,23 +655,6 @@ fn log_order_event(event: &OrderEvent) {
         } => crate::service_log!(
             "orderbook",
             "order assigned order_id={} solver={solver_id}",
-            short_id(*order_id)
-        ),
-        OrderEvent::ProofRelayed { order_id, .. } => {
-            crate::service_log!(
-                "orderbook",
-                "proof received order_id={}",
-                short_id(*order_id)
-            )
-        }
-        OrderEvent::ExecutionStarted { order_id, tx_hash } => crate::service_log!(
-            "orderbook",
-            "execution submitted order_id={} tx_hash={tx_hash}",
-            short_id(*order_id)
-        ),
-        OrderEvent::OrderFilled { order_id, tx_hash } => crate::service_log!(
-            "orderbook",
-            "order filled order_id={} tx_hash={tx_hash}",
             short_id(*order_id)
         ),
         OrderEvent::OrderExpired { order_id } => {
@@ -994,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn drives_an_order_from_created_to_filled() {
+    fn drives_an_order_from_created_to_direct_assignment() {
         let mut book = Orderbook::default();
         let order_id = Uuid::new_v4();
         let trade_terms = terms();
@@ -1023,45 +753,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(book.orders[&order_id].state, OrderState::AwaitingUserProof);
-        book.process(Command::RelayEncryptedProof {
-            order_id,
-            ciphertext: vec![1, 2, 3],
-        })
-        .unwrap();
-        let tx_hash = B256::repeat_byte(9);
-        book.process(Command::ExecutionStarted {
-            order_id,
-            solver_id,
-            tx_hash,
-        })
-        .unwrap();
-        book.process(Command::SettlementObserved { order_id, tx_hash })
-            .unwrap();
-
-        assert_eq!(book.orders[&order_id].state, OrderState::Filled);
-        assert_eq!(book.orders[&order_id].version, 8);
-    }
-
-    #[test]
-    fn rejects_proof_before_solver_assignment() {
-        let mut book = Orderbook::default();
-        let order_id = Uuid::new_v4();
-
-        book.process(Command::CreateOrder {
-            order_id,
-            order_commitment: B256::repeat_byte(1),
-            terms: terms(),
-        })
-        .unwrap();
-
-        let error = book
-            .process(Command::RelayEncryptedProof {
-                order_id,
-                ciphertext: vec![1],
-            })
-            .unwrap_err();
-
-        assert!(matches!(error, OrderError::InvalidState));
+        assert_eq!(book.orders[&order_id].state, OrderState::AwaitingUserProof);
+        assert_eq!(book.orders[&order_id].version, 5);
     }
 
     #[tokio::test]

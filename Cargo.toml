@@ -11,25 +11,22 @@ chrono = "0.4"
 dotenvy = "0.15"
 futures-util = "0.3"
 kage-registry = { git = "https://github.com/hisoka-io/kage-registry", branch = "main" }
-kage-types = { git = "https://github.com/hisoka-io/kage-types", branch = "feat/types" }
+kage-types = { git = "https://github.com/hisoka-io/kage-types", rev = "4e3c2c7affd812fa05277e5a98fbd7616628f94a" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
-snow = "0.10.0"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 thiserror = "2"
-tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-tokio-tungstenite = "0.29"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tower_governor = { version = "0.8", default-features = false, features = ["axum", "tracing"] }
 tower-http = { version = "0.6", features = ["cors", "limit", "timeout"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
-x25519-dalek = "2.0.1"
-alloy = { version = "2", features = ["contract", "provider-http", "rpc-types"] }
+alloy = { version = "2", features = ["signer-local"] }
 alloy-primitives = { version = "1", features = ["serde", "k256", "getrandom"] }
 
 [dev-dependencies]
 k256 = "0.13"
-tempfile = "3"
-tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = "0.29"

@@ -1,10 +1,9 @@
 pub mod api;
-pub mod chain;
+pub mod assignment;
 pub mod config;
 pub mod core;
 pub mod logging;
 pub mod pricing;
-pub mod proof;
 pub mod readiness;
 pub mod solver;
 pub mod storage;

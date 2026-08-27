@@ -7,12 +7,7 @@ CREATE TABLE orders (
         'reserving',
         'assigned',
         'awaiting_user_proof',
-        'proof_relayed',
-        'executing',
-        'filled',
-        'expired',
-        'cancelled',
-        'failed'
+        'expired'
     )),
     version INTEGER NOT NULL CHECK (version >= 0),
     token_in BLOB NOT NULL CHECK (length(token_in) = 20),
@@ -24,7 +19,6 @@ CREATE TABLE orders (
         solver_address IS NULL OR length(solver_address) = 20
     ),
     solver_noise_public_key BLOB,
-    tx_hash BLOB CHECK (tx_hash IS NULL OR length(tx_hash) = 32),
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
     expires_at_ms INTEGER
@@ -38,15 +32,3 @@ CREATE INDEX orders_solver_address_state_idx
     ON orders (solver_address, state);
 CREATE INDEX orders_expires_at_idx ON orders (expires_at_ms)
     WHERE expires_at_ms IS NOT NULL;
-
-CREATE TABLE proof_payloads (
-    order_id TEXT PRIMARY KEY NOT NULL,
-    solver_address BLOB NOT NULL CHECK (length(solver_address) = 20),
-    ciphertext BLOB NOT NULL CHECK (length(ciphertext) > 0),
-    created_at_ms INTEGER NOT NULL,
-    delivered_at_ms INTEGER,
-    FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
-) STRICT;
-
-CREATE INDEX proof_payloads_solver_address_idx
-    ON proof_payloads (solver_address, delivered_at_ms);

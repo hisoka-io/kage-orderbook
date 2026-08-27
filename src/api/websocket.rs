@@ -171,12 +171,7 @@ async fn forward_service_events(
                 } = &stream;
                 let relevant = match &event {
                     OrderEvent::SolverReservationRequested { .. } => true,
-                    OrderEvent::ProofRelayed {
-                        solver_id: assigned,
-                        ..
-                    } => assigned == solver_id,
-                    OrderEvent::OrderFilled { order_id, .. }
-                    | OrderEvent::OrderExpired { order_id } => orderbook
+                    OrderEvent::OrderExpired { order_id } => orderbook
                         .get_order(*order_id)
                         .await
                         .ok()

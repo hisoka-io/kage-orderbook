@@ -217,7 +217,6 @@ mod tests {
               "chains": [{
                 "chain_id": 31337,
                 "name": "local",
-                "darkpool": "0x0303030303030303030303030303030303030303",
                 "registry": "0x0404040404040404040404040404040404040404",
                 "registry_deploy_block": 100,
                 "confirmations": 0,

@@ -4,7 +4,7 @@ use kage_registry::{Config as RegistryConfig, RegistryIndexer};
 
 use kage_orderbook::{
     api,
-    chain::SettlementWatcher,
+    assignment::AssignmentIssuer,
     config::{AppConfig, Network},
     core::engine::start_orderbook_with_repository,
     pricing::{self, PricingConfig, PricingValidator},
@@ -25,6 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rpc_url = std::env::var("KAGE_RPC_URL")?;
     let pricing_feed_url = std::env::var("KAGE_PRICING_FEED_URL")?;
     let pricing_token = std::env::var("KAGE_PRICING_FEED_TOKEN")?;
+    let assignment_issuer = AssignmentIssuer::from_env()?;
 
     let [chain] = config.chains.as_slice() else {
         return Err("exactly one chain must be configured".into());
@@ -55,26 +56,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let registry = SolverRegistry::chain(indexer);
     let readiness = ServiceReadiness::new();
-    SettlementWatcher::connect(
-        &rpc_url,
-        chain.darkpool,
-        chain.confirmations,
-        orderbook.clone(),
-    )
-    .await?
-    .spawn();
     readiness.set_chain(true);
     readiness.monitor_pricing(pricing, Duration::from_millis(250));
     readiness.monitor_registry(registry.clone(), Duration::from_secs(1));
     readiness.monitor_engine(orderbook.clone(), Duration::from_millis(250));
-    let app = api::router_with_readiness_and_settings(
+    kage_orderbook::service_log!(
+        "orderbook",
+        "direct assignment enabled signer={}",
+        assignment_issuer.signer_address()
+    );
+    let app = api::router_with_assignment(
         orderbook,
         registry,
-        SolverSessions::new(domain(network, chain.chain_id)),
+        SolverSessions::new(domain(network, chain.chain_id), network),
         config.order_policy(),
         pricing_validator,
         readiness.clone(),
         config.api.clone(),
+        assignment_issuer,
     );
     let listener = TcpListener::bind(&listen_address).await?;
 

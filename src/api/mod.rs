@@ -4,38 +4,40 @@ mod websocket;
 
 use std::time::Duration;
 
+use crate::{
+    assignment::{AssignmentIssueError, AssignmentIssuer},
+    config::ApiSettings,
+    core::{
+        command::Command,
+        engine::OrderbookHandle,
+        guards::{CreateOrderInput, OrderPolicy, validate_create_order},
+    },
+    logging::short_id,
+    order::{OrderId, OrderV1, SolverJobV1},
+    pricing::{PriceValidationError, PricingValidator},
+    readiness::{ReadinessSnapshot, ServiceReadiness},
+    registry::SolverRegistry,
+    session::{
+        ChallengeRequest, ChallengeResponse, SessionRequest, SessionResponse, SolverSessions,
+        domain,
+    },
+};
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
     },
     response::IntoResponse,
     routing::{get, post},
 };
-pub use kage_types::api_types::{
-    ApiErrorResponse, CreateOrderRequest, CreateOrderResponse, EncryptedProofRequest,
-    ExecutionStartedRequest, ORDER_COMMITMENT_HEADER, UserEventClientMessage,
-    UserEventServerMessage,
-};
-
-use crate::{
-    config::ApiSettings,
-    core::{
-        command::Command,
-        engine::{OrderbookHandle, SolverProofDelivery},
-        guards::{CreateOrderInput, OrderPolicy, validate_create_order},
-    },
-    logging::short_id,
-    order::{OrderId, OrderV1},
-    pricing::{PriceValidationError, PricingValidator},
-    readiness::{ReadinessSnapshot, ServiceReadiness},
-    registry::SolverRegistry,
-    session::{ChallengeResponse, SessionRequest, SessionResponse, SolverSessions, domain},
-};
 use error::{
     ApiError, api_error, api_error_for_service, status_for_error, status_for_price_validation,
+};
+pub use kage_types::api_types::{
+    ApiErrorResponse, CreateOrderRequest, CreateOrderResponse, ORDER_COMMITMENT_HEADER,
+    UserEventClientMessage, UserEventServerMessage,
 };
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
@@ -43,6 +45,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 struct ApiState {
+    assignment_issuer: AssignmentIssuer,
     orderbook: OrderbookHandle,
     registry: SolverRegistry,
     sessions: SolverSessions,
@@ -56,23 +59,37 @@ fn now_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
 }
 
-pub fn router(orderbook: OrderbookHandle, registry: SolverRegistry) -> Router {
-    router_with_policy(orderbook, registry, OrderPolicy::default())
+pub fn router(
+    orderbook: OrderbookHandle,
+    registry: SolverRegistry,
+    assignment_issuer: AssignmentIssuer,
+) -> Router {
+    router_with_policy(
+        orderbook,
+        registry,
+        OrderPolicy::default(),
+        assignment_issuer,
+    )
 }
 
 pub fn router_with_policy(
     orderbook: OrderbookHandle,
     registry: SolverRegistry,
     order_policy: OrderPolicy,
+    assignment_issuer: AssignmentIssuer,
 ) -> Router {
     router_with_state(
         orderbook,
         registry,
-        SolverSessions::new(domain(crate::config::Network::Localnet, 0)),
+        SolverSessions::new(
+            domain(crate::config::Network::Localnet, 0),
+            crate::config::Network::Localnet,
+        ),
         order_policy,
         None,
         ServiceReadiness::always_ready(),
         ApiSettings::default(),
+        assignment_issuer,
     )
 }
 
@@ -81,38 +98,25 @@ pub fn router_with_pricing(
     registry: SolverRegistry,
     order_policy: OrderPolicy,
     pricing_validator: PricingValidator,
+    assignment_issuer: AssignmentIssuer,
 ) -> Router {
     router_with_state(
         orderbook,
         registry,
-        SolverSessions::new(domain(crate::config::Network::Localnet, 0)),
+        SolverSessions::new(
+            domain(crate::config::Network::Localnet, 0),
+            crate::config::Network::Localnet,
+        ),
         order_policy,
         Some(pricing_validator),
         ServiceReadiness::always_ready(),
         ApiSettings::default(),
+        assignment_issuer,
     )
 }
 
-pub fn router_with_readiness(
-    orderbook: OrderbookHandle,
-    registry: SolverRegistry,
-    sessions: SolverSessions,
-    order_policy: OrderPolicy,
-    pricing_validator: PricingValidator,
-    readiness: ServiceReadiness,
-) -> Router {
-    router_with_readiness_and_settings(
-        orderbook,
-        registry,
-        sessions,
-        order_policy,
-        pricing_validator,
-        readiness,
-        ApiSettings::default(),
-    )
-}
-
-pub fn router_with_readiness_and_settings(
+#[allow(clippy::too_many_arguments)]
+pub fn router_with_assignment(
     orderbook: OrderbookHandle,
     registry: SolverRegistry,
     sessions: SolverSessions,
@@ -120,6 +124,7 @@ pub fn router_with_readiness_and_settings(
     pricing_validator: PricingValidator,
     readiness: ServiceReadiness,
     api: ApiSettings,
+    assignment_issuer: AssignmentIssuer,
 ) -> Router {
     router_with_state(
         orderbook,
@@ -129,9 +134,11 @@ pub fn router_with_readiness_and_settings(
         Some(pricing_validator),
         readiness,
         api,
+        assignment_issuer,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn router_with_state(
     orderbook: OrderbookHandle,
     registry: SolverRegistry,
@@ -140,6 +147,7 @@ fn router_with_state(
     pricing_validator: Option<PricingValidator>,
     readiness: ServiceReadiness,
     api: ApiSettings,
+    assignment_issuer: AssignmentIssuer,
 ) -> Router {
     let mut rate_limit = GovernorConfigBuilder::default();
     rate_limit
@@ -165,20 +173,12 @@ fn router_with_state(
     let versioned = Router::new()
         .route("/orders", post(create_order))
         .route("/orders/{order_id}", get(get_order))
+        .route("/orders/{order_id}/assignment", get(get_assignment))
         .route("/solver/challenge", post(solver_challenge))
         .route("/solver/session", post(solver_session))
         .route("/solver/jobs", get(reserving_orders))
-        .route("/solver/proofs", get(take_solver_proofs))
         .route("/orders/{order_id}/reserve", post(reserve_order))
         .route("/orders/{order_id}/decline", post(decline_order))
-        .route(
-            "/orders/{order_id}/encrypted-proof",
-            post(relay_encrypted_proof),
-        )
-        .route(
-            "/orders/{order_id}/execution-started",
-            post(execution_started),
-        )
         .route("/events/user/ws", get(websocket::user_events_ws))
         .route("/events/solver/ws", get(websocket::solver_events_ws))
         .layer(GovernorLayer::new(rate_limit))
@@ -194,6 +194,7 @@ fn router_with_state(
         .route("/health/ready", get(readiness_health))
         .nest("/v1", versioned)
         .with_state(ApiState {
+            assignment_issuer,
             orderbook,
             registry,
             sessions,
@@ -240,8 +241,15 @@ impl From<CreateOrderRequest> for CreateOrderInput {
     }
 }
 
-async fn solver_challenge(State(state): State<ApiState>) -> Json<ChallengeResponse> {
-    Json(state.sessions.issue_challenge(now_ms()))
+async fn solver_challenge(
+    State(state): State<ApiState>,
+    Json(request): Json<ChallengeRequest>,
+) -> Result<Json<ChallengeResponse>, StatusCode> {
+    state
+        .sessions
+        .issue_challenge(request.solver_endpoint, now_ms())
+        .map(Json)
+        .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)
 }
 
 async fn solver_session(
@@ -249,14 +257,14 @@ async fn solver_session(
     Json(request): Json<SessionRequest>,
 ) -> Result<Json<SessionResponse>, StatusCode> {
     let now = now_ms();
-    let solver_id = state.sessions.recover(&request, now).map_err(|error| {
+    let solver = state.sessions.recover(&request, now).map_err(|error| {
         crate::service_warn!("orderbook", "solver authentication failed reason={error}");
         StatusCode::UNAUTHORIZED
     })?;
-    auth::active_solver(&state, solver_id)?;
+    auth::active_solver(&state, solver.solver_id)?;
 
-    tracing::debug!(target: "orderbook", %solver_id, "solver authenticated");
-    Ok(Json(state.sessions.open(solver_id, now)))
+    tracing::debug!(target: "orderbook", solver_id = %solver.solver_id, "solver authenticated");
+    Ok(Json(state.sessions.open(solver, now)))
 }
 
 async fn liveness() -> StatusCode {
@@ -392,29 +400,84 @@ async fn get_order(
     Ok(Json(OrderV1::from(&order)))
 }
 
+async fn get_assignment(
+    State(state): State<ApiState>,
+    Path(order_id): Path<OrderId>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let order_commitment = auth::commitment_from_headers(&headers).map_err(|_| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            "order_not_found",
+            "order was not found",
+            Vec::new(),
+        )
+    })?;
+    let order = state
+        .orderbook
+        .get_order_by_commitment(order_id, order_commitment)
+        .await
+        .map_err(api_error_for_service)?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "order_not_found",
+                "order was not found",
+                Vec::new(),
+            )
+        })?;
+    let solver_id = order.solver.ok_or_else(|| {
+        api_error(
+            StatusCode::CONFLICT,
+            "assignment_not_ready",
+            "order is not assigned to a solver",
+            Vec::new(),
+        )
+    })?;
+    let solver_endpoint = state
+        .sessions
+        .solver_endpoint(solver_id, now_ms())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "solver_endpoint_unavailable",
+                "assigned solver must reconnect before proof delivery",
+                Vec::new(),
+            )
+        })?;
+    let assignment = state
+        .assignment_issuer
+        .issue(&order, &solver_endpoint, now_ms())
+        .map_err(|error| {
+            let (status, code) = match error {
+                AssignmentIssueError::NotReady => (StatusCode::CONFLICT, "assignment_not_ready"),
+                AssignmentIssueError::Expired => (StatusCode::GONE, "order_expired"),
+                AssignmentIssueError::Signing => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "assignment_signing_unavailable",
+                ),
+            };
+            api_error(status, code, error.to_string(), Vec::new())
+        })?;
+    tracing::debug!(
+        target: "orderbook",
+        order_id = %short_id(order_id),
+        solver_id = %assignment.ticket.claims.solver_id,
+        "direct assignment issued"
+    );
+    Ok(([(CACHE_CONTROL, "no-store")], Json(assignment)))
+}
+
 async fn reserving_orders(
     State(state): State<ApiState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<OrderV1>>, StatusCode> {
+) -> Result<Json<Vec<SolverJobV1>>, StatusCode> {
     auth::authenticated_solver(&state, &headers)?;
     state
         .orderbook
         .reserving_orders()
         .await
-        .map(|orders| Json(orders.iter().map(OrderV1::from).collect()))
-        .map_err(status_for_error)
-}
-
-async fn take_solver_proofs(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<SolverProofDelivery>>, StatusCode> {
-    let solver_id = auth::authenticated_solver(&state, &headers)?;
-    state
-        .orderbook
-        .take_solver_proofs(solver_id)
-        .await
-        .map(Json)
+        .map(|orders| Json(orders.iter().map(SolverJobV1::from).collect()))
         .map_err(status_for_error)
 }
 
@@ -467,39 +530,6 @@ async fn decline_order(
     .await
 }
 
-async fn relay_encrypted_proof(
-    State(state): State<ApiState>,
-    Path(order_id): Path<OrderId>,
-    headers: HeaderMap,
-    Json(request): Json<EncryptedProofRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let order_commitment = auth::commitment_from_headers(&headers)?;
-    state
-        .orderbook
-        .relay_encrypted_proof(order_id, order_commitment, request.ciphertext)
-        .await
-        .map(|_| StatusCode::NO_CONTENT)
-        .map_err(status_for_error)
-}
-
-async fn execution_started(
-    State(state): State<ApiState>,
-    Path(order_id): Path<OrderId>,
-    headers: HeaderMap,
-    Json(request): Json<ExecutionStartedRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let solver_id = auth::authenticated_solver(&state, &headers)?;
-    execute(
-        &state.orderbook,
-        Command::ExecutionStarted {
-            order_id,
-            solver_id,
-            tx_hash: request.tx_hash,
-        },
-    )
-    .await
-}
-
 async fn execute(orderbook: &OrderbookHandle, command: Command) -> Result<StatusCode, StatusCode> {
     orderbook
         .execute(command)
@@ -510,8 +540,10 @@ async fn execute(orderbook: &OrderbookHandle, command: Command) -> Result<Status
 
 #[cfg(test)]
 mod tests {
+    use alloy::signers::local::PrivateKeySigner;
     use alloy_primitives::{Address, B256, U256};
     use axum::http::{Method, StatusCode};
+    use kage_types::assignment::SolverAssignmentV1;
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
@@ -529,16 +561,21 @@ mod tests {
         }
     }
 
+    fn assignment_issuer() -> AssignmentIssuer {
+        AssignmentIssuer::for_test(PrivateKeySigner::from_slice(&[7; 32]).unwrap(), 60_000)
+    }
+
     async fn spawn_api(api: ApiSettings) -> (String, JoinHandle<()>) {
         let orderbook = start_orderbook("sqlite::memory:").await.unwrap();
         let app = router_with_state(
             orderbook,
             SolverRegistry::from_profiles([]),
-            SolverSessions::new("kage-orderbook:test:0"),
+            SolverSessions::new("kage-orderbook:test:0", crate::config::Network::Localnet),
             OrderPolicy::default(),
             None,
             ServiceReadiness::always_ready(),
             api,
+            assignment_issuer(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -570,11 +607,131 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{url}/v1/solver/challenge"))
+                .json(&serde_json::json!({
+                    "solver_endpoint": "http://127.0.0.1:3100"
+                }))
                 .send()
                 .await
                 .unwrap()
                 .status(),
             StatusCode::OK
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn assignment_ticket_is_exposed_only_to_the_order_owner_when_ready() {
+        let orderbook = start_orderbook("sqlite::memory:").await.unwrap();
+        let inspection = orderbook.clone();
+        let ticket_signer = PrivateKeySigner::from_slice(&[7; 32]).unwrap();
+        let solver_id = Address::repeat_byte(3);
+        let issuer = AssignmentIssuer::for_test(ticket_signer.clone(), 60_000);
+        let sessions =
+            SolverSessions::new("kage-orderbook:test:0", crate::config::Network::Localnet);
+        sessions.open(
+            crate::session::AuthenticatedSolver {
+                solver_id,
+                solver_endpoint: "https://solver.kage.test".to_owned(),
+            },
+            now_ms(),
+        );
+        let app = router_with_state(
+            orderbook,
+            SolverRegistry::from_profiles([]),
+            sessions,
+            OrderPolicy::default(),
+            None,
+            ServiceReadiness::always_ready(),
+            ApiSettings::default(),
+            issuer,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let commitment = B256::repeat_byte(8);
+        let mut create = request(8);
+        create.order_commitment = commitment;
+        let created = client
+            .post(format!("http://{address}/v1/orders"))
+            .json(&create)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<CreateOrderResponse>()
+            .await
+            .unwrap();
+        let assignment_url = format!("http://{address}/v1/orders/{}/assignment", created.order_id);
+
+        assert_eq!(
+            client.get(&assignment_url).send().await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            client
+                .get(&assignment_url)
+                .header(ORDER_COMMITMENT_HEADER, commitment.to_string())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        inspection
+            .execute(Command::SolverReserved {
+                order_id: created.order_id,
+                solver_id,
+                noise_public_key: vec![9; 32],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            client
+                .get(&assignment_url)
+                .header(ORDER_COMMITMENT_HEADER, B256::repeat_byte(7).to_string(),)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let response = client
+            .get(&assignment_url)
+            .header(ORDER_COMMITMENT_HEADER, commitment.to_string())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        let body = response.text().await.unwrap();
+        assert!(!body.contains(&commitment.to_string()));
+        let assignment: SolverAssignmentV1 = serde_json::from_str(&body).unwrap();
+        assert_eq!(assignment.ticket.claims.order_id, created.order_id);
+        assert_eq!(assignment.ticket.claims.solver_id, solver_id);
+        assert_eq!(
+            assignment.ticket.claims.solver_endpoint,
+            "https://solver.kage.test"
+        );
+        let signature =
+            alloy_primitives::Signature::try_from(assignment.ticket.signature.as_slice()).unwrap();
+        assert_eq!(
+            signature
+                .recover_address_from_msg(assignment.ticket.claims.signing_bytes())
+                .unwrap(),
+            ticket_signer.address()
         );
 
         server.abort();
@@ -603,6 +760,9 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{url}/v1/solver/challenge"))
+                .json(&serde_json::json!({
+                    "solver_endpoint": "http://127.0.0.1:3100"
+                }))
                 .send()
                 .await
                 .unwrap()
@@ -612,6 +772,9 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{url}/v1/solver/challenge"))
+                .json(&serde_json::json!({
+                    "solver_endpoint": "http://127.0.0.1:3100"
+                }))
                 .send()
                 .await
                 .unwrap()
@@ -621,6 +784,9 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{url}/v1/solver/challenge"))
+                .json(&serde_json::json!({
+                    "solver_endpoint": "http://127.0.0.1:3100"
+                }))
                 .send()
                 .await
                 .unwrap()
@@ -691,11 +857,12 @@ mod tests {
         let app = router_with_state(
             orderbook,
             SolverRegistry::from_profiles([]),
-            SolverSessions::new("kage-orderbook:test:0"),
+            SolverSessions::new("kage-orderbook:test:0", crate::config::Network::Localnet),
             OrderPolicy::default(),
             None,
             readiness.clone(),
             ApiSettings::default(),
+            assignment_issuer(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

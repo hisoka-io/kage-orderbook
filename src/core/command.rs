@@ -1,4 +1,4 @@
-use crate::order::{OrderCommitment, OrderId, SolverId, TradeTerms, TxHash};
+use crate::order::{OrderCommitment, OrderId, SolverId, TradeTerms};
 
 pub enum Command {
     CreateOrder {
@@ -18,27 +18,6 @@ pub enum Command {
         solver_id: SolverId,
     },
 
-    RelayEncryptedProof {
-        order_id: OrderId,
-        ciphertext: Vec<u8>,
-    },
-
-    ExecutionStarted {
-        order_id: OrderId,
-        solver_id: SolverId,
-        tx_hash: TxHash,
-    },
-
-    SettlementObserved {
-        order_id: OrderId,
-        tx_hash: TxHash,
-    },
-
-    ExecutionFailed {
-        order_id: OrderId,
-        tx_hash: TxHash,
-    },
-
     ExpireOrder {
         order_id: OrderId,
     },
@@ -50,10 +29,6 @@ impl Command {
             Command::CreateOrder { order_id, .. }
             | Command::SolverReserved { order_id, .. }
             | Command::SolverDeclined { order_id, .. }
-            | Command::RelayEncryptedProof { order_id, .. }
-            | Command::ExecutionStarted { order_id, .. }
-            | Command::SettlementObserved { order_id, .. }
-            | Command::ExecutionFailed { order_id, .. }
             | Command::ExpireOrder { order_id } => *order_id,
         }
     }
@@ -63,10 +38,6 @@ impl Command {
             Command::CreateOrder { .. } => "CreateOrder",
             Command::SolverReserved { .. } => "SolverReserved",
             Command::SolverDeclined { .. } => "SolverDeclined",
-            Command::RelayEncryptedProof { .. } => "RelayEncryptedProof",
-            Command::ExecutionStarted { .. } => "ExecutionStarted",
-            Command::SettlementObserved { .. } => "SettlementObserved",
-            Command::ExecutionFailed { .. } => "ExecutionFailed",
             Command::ExpireOrder { .. } => "ExpireOrder",
         }
     }

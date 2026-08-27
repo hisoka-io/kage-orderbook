@@ -1,7 +1,7 @@
 use alloy_primitives::U256;
 pub use kage_types::{
-    identifiers::{OrderCommitment, OrderId, SolverId, TokenAddress, TxHash},
-    orders::{OrderState, OrderV1, TradeTerms},
+    identifiers::{OrderCommitment, OrderId, SolverId, TokenAddress},
+    orders::{OrderState, OrderV1, SolverJobV1, TradeTerms},
 };
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +23,6 @@ pub struct Order {
 
     pub solver: Option<SolverId>,
     pub solver_noise_public_key: Option<Vec<u8>>,
-    pub tx_hash: Option<TxHash>,
 }
 
 impl Order {
@@ -40,7 +39,6 @@ impl Order {
             expires_at_ms: Some(terms.expires_at_ms),
             solver: None,
             solver_noise_public_key: None,
-            tx_hash: None,
         }
     }
 
@@ -62,7 +60,6 @@ impl Order {
             OrderEvent::SolverReservationRequested { .. } => {
                 self.solver = None;
                 self.solver_noise_public_key = None;
-                self.tx_hash = None;
                 self.state = OrderState::Reserving;
             }
             OrderEvent::SolverAssigned { solver_id, .. } => {
@@ -74,16 +71,6 @@ impl Order {
             } => {
                 self.solver_noise_public_key = Some(noise_public_key.clone());
                 self.state = OrderState::AwaitingUserProof;
-            }
-            OrderEvent::ProofRelayed { .. } => {
-                self.state = OrderState::ProofRelayed;
-            }
-            OrderEvent::ExecutionStarted { tx_hash, .. } => {
-                self.tx_hash = Some(*tx_hash);
-                self.state = OrderState::Executing;
-            }
-            OrderEvent::OrderFilled { .. } => {
-                self.state = OrderState::Filled;
             }
             OrderEvent::OrderExpired { .. } => {
                 self.state = OrderState::Expired;
@@ -107,7 +94,20 @@ impl From<&Order> for OrderV1 {
             expires_at_ms: order.expires_at_ms,
             solver: order.solver,
             solver_noise_public_key: order.solver_noise_public_key.clone(),
-            tx_hash: order.tx_hash,
+        }
+    }
+}
+
+impl From<&Order> for SolverJobV1 {
+    fn from(order: &Order) -> Self {
+        Self {
+            id: order.id,
+            chain_id: order.chain_id,
+            token_in: order.token_in,
+            token_out: order.token_out,
+            amount_in: order.amount_in,
+            amount_out: order.amount_out,
+            expires_at_ms: order.expires_at_ms,
         }
     }
 }

@@ -8,6 +8,7 @@ use axum::{
 use futures_util::{StreamExt, stream};
 use kage_orderbook::{
     api,
+    assignment::AssignmentIssuer,
     config::AppConfig,
     core::engine::{OrderbookHandle, start_orderbook},
     pricing::{self, PricingConfig, PricingStatus, PricingValidator},
@@ -26,7 +27,6 @@ const CONFIG: &str = r#"{
   "chains": [{
     "chain_id": 31337,
     "name": "local",
-    "darkpool": "0x0303030303030303030303030303030303030303",
     "registry": "0x0404040404040404040404040404040404040404",
     "registry_deploy_block": 100,
     "confirmations": 0,
@@ -89,6 +89,10 @@ async fn spawn_orderbook(
         SolverRegistry::from_profiles([]),
         config.order_policy(),
         pricing_validator,
+        AssignmentIssuer::for_test(
+            alloy::signers::local::PrivateKeySigner::from_slice(&[7; 32]).unwrap(),
+            60_000,
+        ),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

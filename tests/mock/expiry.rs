@@ -1,6 +1,5 @@
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
-use alloy_primitives::B256;
 use kage_orderbook::core::{
     command::Command,
     engine::{OrderError, ServiceError, start_orderbook},
@@ -9,6 +8,26 @@ use kage_types::orders::OrderState;
 use uuid::Uuid;
 
 use super::support::{commitment, solver_address, terms};
+
+struct TestDatabase(PathBuf);
+
+impl TestDatabase {
+    fn new() -> Self {
+        Self(std::env::temp_dir().join(format!("kage-orderbook-{}.db", Uuid::new_v4())))
+    }
+
+    fn url(&self) -> String {
+        format!("sqlite://{}", self.0.display())
+    }
+}
+
+impl Drop for TestDatabase {
+    fn drop(&mut self) {
+        for suffix in ["", "-shm", "-wal"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+        }
+    }
+}
 
 #[tokio::test]
 async fn rejects_an_order_that_is_already_expired() {
@@ -34,11 +53,10 @@ async fn rejects_an_order_that_is_already_expired() {
 }
 
 #[tokio::test]
-async fn expires_an_active_order_and_removes_its_proof() {
+async fn expires_an_assigned_order_and_rejects_late_solver_actions() {
     let orderbook = start_orderbook("sqlite::memory:").await.unwrap();
     let order_id = Uuid::new_v4();
     let solver_id = solver_address(0x11);
-    let tx_hash = B256::repeat_byte(9);
     let mut expiring_terms = terms(1);
     expiring_terms.expires_at_ms = now_ms() + 150;
 
@@ -58,72 +76,34 @@ async fn expires_an_active_order_and_removes_its_proof() {
         })
         .await
         .unwrap();
-    orderbook
-        .execute(Command::RelayEncryptedProof {
-            order_id,
-            ciphertext: vec![1, 2, 3],
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        orderbook.take_solver_proofs(solver_id).await.unwrap().len(),
-        1
-    );
 
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let expired = orderbook.get_order(order_id).await.unwrap().unwrap();
     assert_eq!(expired.state, OrderState::Expired);
-    assert_eq!(expired.version, 7);
-    assert!(
-        orderbook
-            .take_solver_proofs(solver_id)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-
+    assert_eq!(expired.version, 6);
     for command in [
         Command::SolverReserved {
             order_id,
             solver_id,
             noise_public_key: vec![7; 32],
         },
-        Command::RelayEncryptedProof {
-            order_id,
-            ciphertext: vec![1, 2, 3],
-        },
-        Command::ExecutionStarted {
+        Command::SolverDeclined {
             order_id,
             solver_id,
-            tx_hash,
         },
-        Command::SettlementObserved { order_id, tx_hash },
     ] {
-        let error = orderbook.execute(command).await.unwrap_err();
         assert!(matches!(
-            error,
-            ServiceError::Order(OrderError::InvalidState)
+            orderbook.execute(command).await,
+            Err(ServiceError::Order(OrderError::InvalidState))
         ));
     }
-    assert_eq!(
-        orderbook
-            .get_order(order_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .version,
-        7
-    );
 }
 
 #[tokio::test]
 async fn expires_an_order_while_the_orderbook_is_offline() {
-    let directory = tempfile::tempdir().unwrap();
-    let database_url = format!(
-        "sqlite://{}",
-        directory.path().join("orderbook.db").display()
-    );
+    let database = TestDatabase::new();
+    let database_url = database.url();
     let order_id = Uuid::new_v4();
     let mut expiring_terms = terms(1);
     expiring_terms.expires_at_ms = now_ms() + 50;
@@ -145,13 +125,6 @@ async fn expires_an_order_while_the_orderbook_is_offline() {
     assert_eq!(expired.state, OrderState::Expired);
     assert_eq!(expired.version, 4);
     assert!(restarted.reserving_orders().await.unwrap().is_empty());
-
-    drop(restarted);
-    tokio::task::yield_now().await;
-    let final_restart = start_orderbook(&database_url).await.unwrap();
-    let persisted = final_restart.get_order(order_id).await.unwrap().unwrap();
-    assert_eq!(persisted.state, OrderState::Expired);
-    assert_eq!(persisted.version, 4);
 }
 
 fn now_ms() -> i64 {

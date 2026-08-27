@@ -103,9 +103,7 @@ impl Default for ApiSettings {
     fn default() -> Self {
         Self {
             request_timeout_ms: 10_000,
-            // EncryptedProofRequest serializes bytes as a JSON array, which is larger
-            // than the 900 KiB encrypted transport payload it carries.
-            max_body_bytes: 5_000_000,
+            max_body_bytes: 64 * 1024,
             websocket_max_message_bytes: 16 * 1024,
             rate_limit_replenish_ms: 100,
             rate_limit_burst: 100,
@@ -150,7 +148,6 @@ pub struct PricingSettings {
 pub struct ChainConfig {
     pub chain_id: u64,
     pub name: String,
-    pub darkpool: Address,
     pub registry: Address,
     pub registry_deploy_block: u64,
     pub confirmations: u64,
@@ -328,9 +325,9 @@ impl AppConfig {
                     chain.chain_id
                 )));
             }
-            if chain.darkpool == Address::ZERO || chain.registry == Address::ZERO {
+            if chain.registry == Address::ZERO {
                 return Err(invalid(format!(
-                    "chain {} requires non-zero darkpool and registry addresses",
+                    "chain {} requires a non-zero registry address",
                     chain.chain_id
                 )));
             }
@@ -434,7 +431,6 @@ mod tests {
       "chains": [{
         "chain_id": 31337,
         "name": "local",
-        "darkpool": "0x0303030303030303030303030303030303030303",
         "registry": "0x0404040404040404040404040404040404040404",
         "registry_deploy_block": 100,
         "confirmations": 0,
@@ -476,11 +472,10 @@ mod tests {
         }));
         assert_eq!(config.pricing_assets(), vec!["ETH", "USDC"]);
         assert_eq!(config.order.max_order_usd_cents, 25_000);
-        assert_eq!(config.chains[0].darkpool, Address::repeat_byte(3));
         assert_eq!(config.chains[0].registry, Address::repeat_byte(4));
         assert_eq!(config.chains[0].registry_deploy_block, 100);
         assert_eq!(config.api.request_timeout_ms, 10_000);
-        assert_eq!(config.api.max_body_bytes, 5_000_000);
+        assert_eq!(config.api.max_body_bytes, 64 * 1024);
         assert!(config.api.allowed_origins.is_empty());
     }
 
@@ -488,7 +483,7 @@ mod tests {
     fn validates_api_limits_and_exact_origins() {
         let api = r#""api": {
           "request_timeout_ms": 10000,
-          "max_body_bytes": 5000000,
+          "max_body_bytes": 65536,
           "websocket_max_message_bytes": 16384,
           "rate_limit_replenish_ms": 100,
           "rate_limit_burst": 100,
@@ -517,15 +512,13 @@ mod tests {
 
     #[test]
     fn rejects_zero_contract_addresses() {
-        for byte in [3, 4] {
-            let configured = Address::repeat_byte(byte).to_string();
-            let zeroed = VALID_CONFIG.replace(&configured, &Address::ZERO.to_string());
-            assert_ne!(zeroed, VALID_CONFIG, "{configured} is not in the fixture");
-            assert!(
-                matches!(AppConfig::from_json(&zeroed), Err(ConfigError::Invalid(_))),
-                "zero address accepted in place of {configured}"
-            );
-        }
+        let configured = Address::repeat_byte(4).to_string();
+        let zeroed = VALID_CONFIG.replace(&configured, &Address::ZERO.to_string());
+        assert_ne!(zeroed, VALID_CONFIG, "{configured} is not in the fixture");
+        assert!(matches!(
+            AppConfig::from_json(&zeroed),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -564,6 +557,7 @@ mod tests {
         let config = AppConfig::load_from(path).unwrap();
 
         assert_eq!(config.pricing_assets(), vec!["ETH", "USDC", "USDT"]);
+        assert_eq!(config.chains[0].markets.len(), 6);
     }
 
     #[test]
