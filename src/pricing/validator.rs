@@ -260,6 +260,7 @@ mod tests {
             PricePoint {
                 price_e18: eth_price,
                 observed_at_ms,
+                valid_until_ms: observed_at_ms.saturating_add(1_000),
                 sequence: 1,
             },
         )]);
@@ -269,12 +270,13 @@ mod tests {
                 PricePoint {
                     price_e18: U256::from(10_u64).pow(U256::from(18_u8)),
                     observed_at_ms,
+                    valid_until_ms: observed_at_ms.saturating_add(1_000),
                     sequence: 1,
                 },
             );
         }
         let mut snapshot = PricingSnapshot::new(vec!["ETH".into(), "USDC".into()]);
-        snapshot.replace_prices(prices);
+        snapshot.replace_prices(prices, NOW_MS);
         let (_, receiver) = watch::channel(Arc::new(snapshot));
         let handle = PricingHandle {
             receiver,

@@ -23,6 +23,7 @@ struct FeedRequest {
 struct WirePoint {
     price_e18: String,
     observed_at_ms: u64,
+    valid_until_ms: u64,
     sequence: u64,
 }
 
@@ -31,6 +32,7 @@ struct WireTick {
     asset: String,
     price_e18: String,
     observed_at_ms: u64,
+    valid_until_ms: u64,
     sequence: u64,
 }
 
@@ -128,6 +130,7 @@ fn apply_event(
 ) -> Result<(), ClientError> {
     match event.name.as_str() {
         "snapshot" => {
+            let received_at_ms = now_ms();
             let wire: HashMap<String, Option<WirePoint>> = serde_json::from_str(&event.data)
                 .map_err(|error| ClientError::Invalid(error.to_string()))?;
             let prices = wire
@@ -135,19 +138,23 @@ fn apply_event(
                 .filter_map(|(asset, point)| point.map(|point| (asset, point)))
                 .map(|(asset, point)| Ok((asset.to_uppercase(), parse_point(point)?)))
                 .collect::<Result<HashMap<_, _>, ClientError>>()?;
-            update(sender, |snapshot| snapshot.replace_prices(prices));
+            update(sender, |snapshot| {
+                snapshot.replace_prices(prices, received_at_ms)
+            });
         }
         "tick" => {
+            let received_at_ms = now_ms();
             let tick: WireTick = serde_json::from_str(&event.data)
                 .map_err(|error| ClientError::Invalid(error.to_string()))?;
             let asset = tick.asset.to_uppercase();
             let point = parse_point(WirePoint {
                 price_e18: tick.price_e18,
                 observed_at_ms: tick.observed_at_ms,
+                valid_until_ms: tick.valid_until_ms,
                 sequence: tick.sequence,
             })?;
             update(sender, |snapshot| {
-                snapshot.apply_tick(asset, point);
+                snapshot.apply_tick(asset, point, received_at_ms);
             });
         }
         _ => {}
@@ -161,9 +168,15 @@ fn parse_point(wire: WirePoint) -> Result<PricePoint, ClientError> {
     if price_e18 == U256::ZERO {
         return Err(ClientError::Invalid("price_e18 must be positive".into()));
     }
+    if wire.valid_until_ms < wire.observed_at_ms {
+        return Err(ClientError::Invalid(
+            "valid_until_ms must not precede observed_at_ms".into(),
+        ));
+    }
     Ok(PricePoint {
         price_e18,
         observed_at_ms: wire.observed_at_ms,
+        valid_until_ms: wire.valid_until_ms,
         sequence: wire.sequence,
     })
 }
@@ -270,15 +283,20 @@ mod tests {
         }
         assert_eq!(request.assets, vec!["ETH"]);
         let observed_at_ms = now_ms();
+        let valid_until_ms = observed_at_ms + 15_000;
         let body = concat!(
             "event: snapshot\n",
             "data: {\"ETH\":{\"price_e18\":\"3200000000000000000000\",",
-            "\"observed_at_ms\":$TIME,\"sequence\":1}}\n\n",
+            "\"observed_at_ms\":$OBSERVED,\"valid_until_ms\":$VALID,\"sequence\":1}}\n\n",
             "event: tick\n",
             "data: {\"asset\":\"ETH\",\"price_e18\":\"3201000000000000000000\",",
-            "\"observed_at_ms\":$TIME,\"sequence\":2}\n\n"
+            "\"observed_at_ms\":$OBSERVED,\"valid_until_ms\":$VALID,\"sequence\":2}\n\n"
         )
-        .replace("$TIME", &observed_at_ms.to_string());
+        .replace(
+            "$OBSERVED",
+            &observed_at_ms.saturating_sub(60_000).to_string(),
+        )
+        .replace("$VALID", &valid_until_ms.to_string());
         let stream = stream::once(async move { Ok::<Bytes, Infallible>(Bytes::from(body)) })
             .chain(stream::pending());
         Response::builder()

@@ -48,15 +48,16 @@ async fn feed(
     Json(request): Json<FeedRequest>,
 ) -> Response {
     assert_eq!(request.assets, vec!["ETH", "USDC"]);
+    let valid_until_ms = observed_at_ms.saturating_add(5_000);
     let body = format!(
         concat!(
             "event: snapshot\n",
             "data: {{\"ETH\":{{\"price_e18\":\"2000000000000000000000\",",
-            "\"observed_at_ms\":{0},\"sequence\":1}},",
+            "\"observed_at_ms\":{0},\"valid_until_ms\":{1},\"sequence\":1}},",
             "\"USDC\":{{\"price_e18\":\"1000000000000000000\",",
-            "\"observed_at_ms\":{0},\"sequence\":1}}}}\n\n"
+            "\"observed_at_ms\":{0},\"valid_until_ms\":{1},\"sequence\":1}}}}\n\n"
         ),
-        observed_at_ms
+        observed_at_ms, valid_until_ms
     );
     let body = stream::once(async move { Ok::<Bytes, Infallible>(Bytes::from(body)) })
         .chain(stream::pending());
