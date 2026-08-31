@@ -1,6 +1,143 @@
 use super::{rows::*, *};
 
+pub(super) const MAINTENANCE_BATCH_SIZE: i64 = 64;
+
+#[derive(Clone, Copy)]
+enum CandidateSelection {
+    Automatic,
+    Selected(Option<Address>),
+}
+
 impl ProofOrderRepository {
+    pub async fn routing_terms(
+        &self,
+        order_id: OrderId,
+    ) -> Result<Option<(TradeTerms, u16)>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT chain_id, token_in, token_out, amount_in, amount_out,
+                    proof_expires_at_ms, fee_bps
+             FROM proof_orders WHERE order_id = ?",
+        )
+        .bind(order_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let terms = terms_from_row(&row)?;
+            let fee_bps_value: i64 = row.try_get("fee_bps")?;
+            let fee_bps =
+                u16::try_from(fee_bps_value).map_err(|_| invalid("fee_bps", fee_bps_value))?;
+            Ok((terms, fee_bps))
+        })
+        .transpose()
+    }
+
+    pub async fn untried_reservation_candidates(
+        &self,
+        order_id: OrderId,
+    ) -> Result<Vec<ReservationCandidate>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT c.solver_id, c.key_id, r.encryption_public_key
+             FROM proof_order_candidates c
+             JOIN proof_orders p ON p.order_id = c.order_id
+             LEFT JOIN proof_order_preview_routes r
+               ON r.preview_id = p.preview_id
+              AND r.category_id = p.category_id
+              AND r.solver_id = c.solver_id
+             WHERE c.order_id = ? AND NOT EXISTS (
+                 SELECT 1 FROM proof_order_reservation_attempts a
+                 WHERE a.order_id = c.order_id AND a.solver_id = c.solver_id
+             )
+             ORDER BY c.position",
+        )
+        .bind(order_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ReservationCandidate {
+                    solver_id: Address::from(parse_fixed::<20>(
+                        "solver_id",
+                        row.try_get("solver_id")?,
+                    )?),
+                    key_id: parse_b256("key_id", row.try_get("key_id")?)?,
+                    encryption_public_key: row
+                        .try_get::<Option<Vec<u8>>, _>("encryption_public_key")?
+                        .map(|key| {
+                            parse_fixed::<32>("encryption_public_key", key).map(|key| key.to_vec())
+                        })
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn due_reservation_attempts(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<(OrderId, Address)>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT a.order_id, a.solver_id
+             FROM proof_order_reservation_attempts a
+             JOIN proof_orders p ON p.order_id = a.order_id
+             WHERE a.outcome = 'pending' AND a.deadline_ms <= ?
+               AND p.state = 'reservation_pending'
+             ORDER BY p.updated_at_ms, a.deadline_ms, a.id
+             LIMIT ?",
+        )
+        .bind(now_ms)
+        .bind(MAINTENANCE_BATCH_SIZE)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    parse_order_id(row.try_get("order_id")?)?,
+                    Address::from(parse_fixed::<20>("solver_id", row.try_get("solver_id")?)?),
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn rotate_maintenance_retry(
+        &self,
+        order_id: OrderId,
+        now_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        let updated = sqlx::query(
+            "UPDATE proof_orders
+             SET updated_at_ms = MAX(updated_at_ms + 1, ?)
+             WHERE order_id = ? AND state = 'reservation_pending'",
+        )
+        .bind(now_ms)
+        .bind(order_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(RepositoryError::VersionConflict);
+        }
+        Ok(())
+    }
+
+    pub async fn awaiting_capacity_order_ids(&self) -> Result<Vec<OrderId>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT p.order_id
+             FROM proof_orders p
+             WHERE p.state = 'reservation_pending'
+               AND NOT EXISTS (
+                   SELECT 1 FROM proof_order_reservation_attempts a
+                   WHERE a.order_id = p.order_id AND a.outcome = 'pending'
+               )
+             ORDER BY p.updated_at_ms, p.order_id
+             LIMIT ?",
+        )
+        .bind(MAINTENANCE_BATCH_SIZE)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| parse_order_id(row.try_get("order_id")?))
+            .collect()
+    }
+
     pub async fn targeted_order_ids(
         &self,
         solver_id: Address,
@@ -40,9 +177,33 @@ impl ProofOrderRepository {
         Ok(found.is_some())
     }
 
+    pub async fn is_live_target(
+        &self,
+        order_id: OrderId,
+        solver_id: Address,
+        now_ms: i64,
+    ) -> Result<bool, RepositoryError> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1
+             FROM proof_order_reservation_attempts a
+             JOIN proof_orders p ON p.order_id = a.order_id
+             WHERE a.order_id = ? AND a.solver_id = ? AND a.outcome = 'pending'
+               AND p.state = 'reservation_pending'
+               AND a.deadline_ms > ? AND p.proof_expires_at_ms > ?",
+        )
+        .bind(order_id.to_string())
+        .bind(solver_id.as_slice())
+        .bind(now_ms)
+        .bind(now_ms)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
+    }
+
     pub async fn pending_reservations(
         &self,
         solver_id: Address,
+        now_ms: i64,
     ) -> Result<Vec<PendingReservation>, RepositoryError> {
         let rows = sqlx::query(
             "SELECT p.order_id, p.preview_id, p.category_id, p.chain_id,
@@ -55,9 +216,12 @@ impl ProofOrderRepository {
              JOIN proof_orders p ON p.order_id = a.order_id
              WHERE a.solver_id = ? AND a.outcome = 'pending'
                AND p.state = 'reservation_pending'
+               AND a.deadline_ms > ? AND p.proof_expires_at_ms > ?
              ORDER BY a.requested_at_ms, a.order_id",
         )
         .bind(solver_id.as_slice())
+        .bind(now_ms)
+        .bind(now_ms)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -140,7 +304,7 @@ impl ProofOrderRepository {
             .transpose()
     }
 
-    pub async fn assign_and_disclose(
+    pub(crate) async fn assign_and_disclose(
         &self,
         order: &Order,
         expected_order_version: u64,
@@ -210,7 +374,7 @@ impl ProofOrderRepository {
             transaction.rollback().await?;
             return Ok(false);
         }
-        sqlx::query(
+        let finished = sqlx::query(
             "UPDATE proof_order_reservation_attempts
              SET outcome = 'accepted', reservation_ack = ?, responded_at_ms = ?
              WHERE order_id = ? AND solver_id = ? AND outcome = 'pending'",
@@ -221,6 +385,10 @@ impl ProofOrderRepository {
         .bind(solver_id.as_slice())
         .execute(&mut *transaction)
         .await?;
+        if finished.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
         sqlx::query(
             "INSERT INTO proof_order_assignments (
                 order_id, solver_id, key_id, assignment_ticket,
@@ -264,7 +432,7 @@ impl ProofOrderRepository {
         Ok(true)
     }
 
-    pub async fn decline_and_advance(
+    pub(crate) async fn decline_and_advance(
         &self,
         order_id: OrderId,
         solver_id: Address,
@@ -281,6 +449,53 @@ impl ProofOrderRepository {
             now_ms,
             reservation_attempt_timeout_ms,
             minimum_remaining_seconds,
+            CandidateSelection::Automatic,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn decline_and_advance_to(
+        &self,
+        order_id: OrderId,
+        solver_id: Address,
+        signed_decline: Option<&[u8]>,
+        now_ms: i64,
+        reservation_attempt_timeout_ms: u64,
+        minimum_remaining_seconds: u32,
+        next_solver: Option<Address>,
+    ) -> Result<Option<AdvanceOutcome>, RepositoryError> {
+        self.finish_attempt_and_advance(
+            order_id,
+            solver_id,
+            "declined",
+            signed_decline,
+            now_ms,
+            reservation_attempt_timeout_ms,
+            minimum_remaining_seconds,
+            CandidateSelection::Selected(next_solver),
+        )
+        .await
+    }
+
+    pub(crate) async fn timeout_and_advance_to(
+        &self,
+        order_id: OrderId,
+        solver_id: Address,
+        now_ms: i64,
+        reservation_attempt_timeout_ms: u64,
+        minimum_remaining_seconds: u32,
+        next_solver: Option<Address>,
+    ) -> Result<Option<AdvanceOutcome>, RepositoryError> {
+        self.finish_attempt_and_advance(
+            order_id,
+            solver_id,
+            "timed_out",
+            None,
+            now_ms,
+            reservation_attempt_timeout_ms,
+            minimum_remaining_seconds,
+            CandidateSelection::Selected(next_solver),
         )
         .await
     }
@@ -295,6 +510,7 @@ impl ProofOrderRepository {
         now_ms: i64,
         reservation_attempt_timeout_ms: u64,
         minimum_remaining_seconds: u32,
+        selection: CandidateSelection,
     ) -> Result<Option<AdvanceOutcome>, RepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let current = sqlx::query(
@@ -314,7 +530,7 @@ impl ProofOrderRepository {
         };
         let attempt_number: i64 = current.try_get("attempt_number")?;
         let proof_expires_at_ms: i64 = current.try_get("proof_expires_at_ms")?;
-        sqlx::query(
+        let finished = sqlx::query(
             "UPDATE proof_order_reservation_attempts
              SET outcome = ?, signed_decline = ?, responded_at_ms = ?
              WHERE order_id = ? AND solver_id = ? AND outcome = 'pending'",
@@ -326,60 +542,171 @@ impl ProofOrderRepository {
         .bind(solver_id.as_slice())
         .execute(&mut *transaction)
         .await?;
-        let next = sqlx::query(
-            "SELECT c.solver_id, c.key_id
-             FROM proof_order_candidates c
+        if finished.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        let has_untried: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM proof_order_candidates c
              WHERE c.order_id = ? AND NOT EXISTS (
                  SELECT 1 FROM proof_order_reservation_attempts a
                  WHERE a.order_id = c.order_id AND a.solver_id = c.solver_id
              )
-             ORDER BY c.position LIMIT 1",
+             LIMIT 1",
         )
         .bind(order_id.to_string())
         .fetch_optional(&mut *transaction)
         .await?;
+        let next = match selection {
+            CandidateSelection::Automatic => {
+                sqlx::query(
+                    "SELECT c.solver_id, c.key_id
+                 FROM proof_order_candidates c
+                 WHERE c.order_id = ? AND NOT EXISTS (
+                     SELECT 1 FROM proof_order_reservation_attempts a
+                     WHERE a.order_id = c.order_id AND a.solver_id = c.solver_id
+                 )
+                 ORDER BY c.position LIMIT 1",
+                )
+                .bind(order_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+            }
+            CandidateSelection::Selected(Some(next_solver)) => {
+                sqlx::query(
+                    "SELECT c.solver_id, c.key_id
+                 FROM proof_order_candidates c
+                 WHERE c.order_id = ? AND c.solver_id = ? AND NOT EXISTS (
+                     SELECT 1 FROM proof_order_reservation_attempts a
+                     WHERE a.order_id = c.order_id AND a.solver_id = c.solver_id
+                 )
+                 LIMIT 1",
+                )
+                .bind(order_id.to_string())
+                .bind(next_solver.as_slice())
+                .fetch_optional(&mut *transaction)
+                .await?
+            }
+            CandidateSelection::Selected(None) => None,
+        };
         let minimum_remaining_ms = i64::from(minimum_remaining_seconds).saturating_mul(1_000);
         let has_routing_time = proof_expires_at_ms.saturating_sub(now_ms) > minimum_remaining_ms;
         let result = if let Some(next) = next.filter(|_| has_routing_time) {
             let next_solver =
                 Address::from(parse_fixed::<20>("solver_id", next.try_get("solver_id")?)?);
             let key_id = parse_b256("key_id", next.try_get("key_id")?)?;
+            let next_attempt_number = attempt_number
+                .checked_add(1)
+                .ok_or_else(|| invalid("attempt_number", "overflow"))?;
             insert_attempt(
                 &mut transaction,
                 order_id,
-                attempt_number.saturating_add(1),
+                next_attempt_number,
                 next_solver,
                 key_id,
                 now_ms,
                 reservation_attempt_timeout_ms,
             )
             .await?;
-            sqlx::query(
-                "UPDATE proof_orders SET version = version + 1, updated_at_ms = ?
-                 WHERE order_id = ? AND state = 'reservation_pending'",
-            )
-            .bind(now_ms)
-            .bind(order_id.to_string())
-            .execute(&mut *transaction)
-            .await?;
+            bump_reservation_version(&mut transaction, order_id, now_ms).await?;
             AdvanceOutcome::Advanced(next_solver)
+        } else if matches!(selection, CandidateSelection::Selected(_))
+            && has_untried.is_some()
+            && has_routing_time
+        {
+            bump_reservation_version(&mut transaction, order_id, now_ms).await?;
+            AdvanceOutcome::AwaitingCapacity
         } else {
-            let core = sqlx::query(
-                "UPDATE orders
-                 SET state = 'expired', version = version + 1, updated_at_ms = ?
-                 WHERE id = ? AND state = 'reservation_pending'",
+            close_reservation_order(&mut transaction, order_id, now_ms).await?;
+            AdvanceOutcome::Exhausted
+        };
+        transaction.commit().await?;
+        Ok(Some(result))
+    }
+
+    pub(crate) async fn advance_awaiting_to(
+        &self,
+        order_id: OrderId,
+        now_ms: i64,
+        reservation_attempt_timeout_ms: u64,
+        minimum_remaining_seconds: u32,
+        next_solver: Option<Address>,
+    ) -> Result<Option<AdvanceOutcome>, RepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let current = sqlx::query(
+            "SELECT p.proof_expires_at_ms,
+                    COALESCE(MAX(a.attempt_number), -1) AS attempt_number
+             FROM proof_orders p
+             LEFT JOIN proof_order_reservation_attempts a ON a.order_id = p.order_id
+             WHERE p.order_id = ? AND p.state = 'reservation_pending'
+               AND NOT EXISTS (
+                   SELECT 1 FROM proof_order_reservation_attempts pending
+                   WHERE pending.order_id = p.order_id AND pending.outcome = 'pending'
+               )
+             GROUP BY p.order_id, p.proof_expires_at_ms",
+        )
+        .bind(order_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(current) = current else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+        let attempt_number: i64 = current.try_get("attempt_number")?;
+        let proof_expires_at_ms: i64 = current.try_get("proof_expires_at_ms")?;
+        let has_untried: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM proof_order_candidates c
+             WHERE c.order_id = ? AND NOT EXISTS (
+                 SELECT 1 FROM proof_order_reservation_attempts a
+                 WHERE a.order_id = c.order_id AND a.solver_id = c.solver_id
+             )
+             LIMIT 1",
+        )
+        .bind(order_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let next = if let Some(next_solver) = next_solver {
+            sqlx::query(
+                "SELECT c.solver_id, c.key_id
+                 FROM proof_order_candidates c
+                 WHERE c.order_id = ? AND c.solver_id = ? AND NOT EXISTS (
+                     SELECT 1 FROM proof_order_reservation_attempts a
+                     WHERE a.order_id = c.order_id AND a.solver_id = c.solver_id
+                 )
+                 LIMIT 1",
             )
-            .bind(now_ms)
             .bind(order_id.to_string())
-            .execute(&mut *transaction)
+            .bind(next_solver.as_slice())
+            .fetch_optional(&mut *transaction)
+            .await?
+        } else {
+            None
+        };
+        let minimum_remaining_ms = i64::from(minimum_remaining_seconds).saturating_mul(1_000);
+        let has_routing_time = proof_expires_at_ms.saturating_sub(now_ms) > minimum_remaining_ms;
+        let result = if let Some(next) = next.filter(|_| has_routing_time) {
+            let next_solver =
+                Address::from(parse_fixed::<20>("solver_id", next.try_get("solver_id")?)?);
+            let key_id = parse_b256("key_id", next.try_get("key_id")?)?;
+            let attempt_number = attempt_number
+                .checked_add(1)
+                .ok_or_else(|| invalid("attempt_number", "overflow"))?;
+            insert_attempt(
+                &mut transaction,
+                order_id,
+                attempt_number,
+                next_solver,
+                key_id,
+                now_ms,
+                reservation_attempt_timeout_ms,
+            )
             .await?;
-            if core.rows_affected() != 1 {
-                transaction.rollback().await?;
-                return Err(RepositoryError::VersionConflict);
-            }
+            bump_reservation_version(&mut transaction, order_id, now_ms).await?;
+            AdvanceOutcome::Advanced(next_solver)
+        } else if has_untried.is_some() && has_routing_time {
             let updated = sqlx::query(
                 "UPDATE proof_orders
-                 SET state = 'closed', version = version + 1, updated_at_ms = ?
+                 SET updated_at_ms = MAX(updated_at_ms + 1, ?)
                  WHERE order_id = ? AND state = 'reservation_pending'",
             )
             .bind(now_ms)
@@ -388,15 +715,19 @@ impl ProofOrderRepository {
             .await?;
             if updated.rows_affected() != 1 {
                 transaction.rollback().await?;
-                return Ok(None);
+                return Err(RepositoryError::VersionConflict);
             }
+            transaction.commit().await?;
+            return Ok(Some(AdvanceOutcome::AwaitingCapacity));
+        } else {
+            close_reservation_order(&mut transaction, order_id, now_ms).await?;
             AdvanceOutcome::Exhausted
         };
         transaction.commit().await?;
         Ok(Some(result))
     }
 
-    pub async fn expire_due_attempts(
+    pub(crate) async fn expire_due_attempts(
         &self,
         now_ms: i64,
         reservation_attempt_timeout_ms: u64,
@@ -408,9 +739,11 @@ impl ProofOrderRepository {
              JOIN proof_orders p ON p.order_id = a.order_id
              WHERE a.outcome = 'pending' AND a.deadline_ms <= ?
                AND p.state = 'reservation_pending'
-             ORDER BY a.deadline_ms, a.id",
+             ORDER BY a.deadline_ms, a.id
+             LIMIT ?",
         )
         .bind(now_ms)
+        .bind(MAINTENANCE_BATCH_SIZE)
         .fetch_all(&self.pool)
         .await?;
         let mut outcomes = Vec::with_capacity(rows.len());
@@ -427,6 +760,7 @@ impl ProofOrderRepository {
                     now_ms,
                     reservation_attempt_timeout_ms,
                     minimum_remaining_seconds,
+                    CandidateSelection::Automatic,
                 )
                 .await?
             {
@@ -435,4 +769,55 @@ impl ProofOrderRepository {
         }
         Ok(outcomes)
     }
+}
+
+async fn bump_reservation_version(
+    transaction: &mut Transaction<'_, Sqlite>,
+    order_id: OrderId,
+    now_ms: i64,
+) -> Result<(), RepositoryError> {
+    let updated = sqlx::query(
+        "UPDATE proof_orders SET version = version + 1, updated_at_ms = ?
+         WHERE order_id = ? AND state = 'reservation_pending'",
+    )
+    .bind(now_ms)
+    .bind(order_id.to_string())
+    .execute(&mut **transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(RepositoryError::VersionConflict);
+    }
+    Ok(())
+}
+
+async fn close_reservation_order(
+    transaction: &mut Transaction<'_, Sqlite>,
+    order_id: OrderId,
+    now_ms: i64,
+) -> Result<(), RepositoryError> {
+    let core = sqlx::query(
+        "UPDATE orders
+         SET state = 'expired', version = version + 1, updated_at_ms = ?
+         WHERE id = ? AND state = 'reservation_pending'",
+    )
+    .bind(now_ms)
+    .bind(order_id.to_string())
+    .execute(&mut **transaction)
+    .await?;
+    if core.rows_affected() != 1 {
+        return Err(RepositoryError::VersionConflict);
+    }
+    let proof = sqlx::query(
+        "UPDATE proof_orders
+         SET state = 'closed', version = version + 1, updated_at_ms = ?
+         WHERE order_id = ? AND state = 'reservation_pending'",
+    )
+    .bind(now_ms)
+    .bind(order_id.to_string())
+    .execute(&mut **transaction)
+    .await?;
+    if proof.rows_affected() != 1 {
+        return Err(RepositoryError::VersionConflict);
+    }
+    Ok(())
 }

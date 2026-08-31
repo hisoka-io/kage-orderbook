@@ -56,6 +56,10 @@ fn terms() -> TradeTerms {
 
 fn core_order(order_id: OrderId) -> Order {
     let terms = terms();
+    core_order_with_terms(order_id, &terms)
+}
+
+fn core_order_with_terms(order_id: OrderId, terms: &TradeTerms) -> Order {
     Order {
         id: order_id,
         state: ProofOrderState::ReservationPending,
@@ -221,6 +225,404 @@ async fn admission_is_atomic_and_exactly_idempotent() {
     );
     assert!(repository.get_order(failed_id).await.unwrap().is_none());
     assert!(store.state(failed_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn capacity_usage_moves_holds_on_reroute_and_keeps_accepted_liquidity() {
+    let database = TemporaryDatabase::new("capacity-restart");
+    let repository = OrderRepository::connect(&database.url()).await.unwrap();
+    let store = repository.proof_orders();
+    let order_id = OrderId::from_u128(90);
+    let input = input(order_id);
+    let first_solver = input.candidates[0].solver_id;
+    let second_solver = input.candidates[1].solver_id;
+    let token_out = input.terms.token_out;
+    store
+        .insert_authoritative(&core_order(order_id), &input)
+        .await
+        .unwrap();
+
+    let pending_usage = store.capacity_usage(1_000).await.unwrap();
+    assert_eq!(pending_usage.active_workload(first_solver), 1);
+    assert_eq!(pending_usage.active_workload(second_solver), 0);
+    assert_eq!(
+        pending_usage.held_output_amount(first_solver, input.terms.chain_id, token_out),
+        input.terms.amount_out
+    );
+
+    assert_eq!(
+        store
+            .decline_and_advance(order_id, first_solver, None, 2_000, 2_000, 1)
+            .await
+            .unwrap(),
+        Some(AdvanceOutcome::Advanced(second_solver))
+    );
+    let rerouted_usage = store.capacity_usage(2_000).await.unwrap();
+    assert_eq!(rerouted_usage.active_workload(first_solver), 0);
+    assert_eq!(
+        rerouted_usage.held_output_amount(first_solver, input.terms.chain_id, token_out),
+        U256::ZERO
+    );
+    assert_eq!(rerouted_usage.active_workload(second_solver), 1);
+    assert_eq!(
+        rerouted_usage.held_output_amount(second_solver, input.terms.chain_id, token_out),
+        input.terms.amount_out
+    );
+
+    let pending = store
+        .pending_reservation(order_id, second_solver)
+        .await
+        .unwrap()
+        .unwrap();
+    let assignment_ticket = ticket(&pending, 91);
+    assert!(
+        store
+            .assign_and_disclose(
+                &assigned_order(order_id, second_solver),
+                3,
+                second_solver,
+                &reservation_ack(&pending, 92),
+                &assignment_ticket,
+                2_500,
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.active_workload(second_solver, 2_500).await.unwrap(),
+        1
+    );
+
+    let accepted = SignedProofDecision::Accepted(ProofAcceptanceAck {
+        claims: ProofAcceptanceClaims {
+            bindings: pending.claims.bindings,
+            assignment_ticket_digest: assignment_ticket_digest(&assignment_ticket),
+            settlement_commitment: input.settlement_commitment,
+            accepted_at_ms: 3_000,
+        },
+        signature: vec![93; 65],
+    });
+    assert!(
+        store
+            .update_result(order_id, second_solver, &accepted, 3_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.active_workload(second_solver, 3_000).await.unwrap(),
+        0
+    );
+    let accepted_usage = store.capacity_usage(3_000).await.unwrap();
+    assert_eq!(accepted_usage.active_workload(second_solver), 0);
+    assert_eq!(
+        accepted_usage.held_output_amount(second_solver, input.terms.chain_id, token_out),
+        input.terms.amount_out
+    );
+
+    store.pool.close().await;
+    drop(store);
+    drop(repository);
+
+    let restarted = OrderRepository::connect(&database.url()).await.unwrap();
+    let restarted_store = restarted.proof_orders();
+    assert_eq!(
+        restarted_store
+            .held_output_amount(second_solver, input.terms.chain_id, token_out, 3_000)
+            .await
+            .unwrap(),
+        input.terms.amount_out
+    );
+    assert_eq!(
+        restarted_store
+            .capacity_usage(input.terms.expires_at_ms)
+            .await
+            .unwrap(),
+        CapacityUsage::default()
+    );
+    restarted_store.pool.close().await;
+}
+
+#[tokio::test]
+async fn capacity_usage_aggregates_large_outputs_by_solver_chain_and_token() {
+    let repository = OrderRepository::connect("sqlite::memory:").await.unwrap();
+    let store = repository.proof_orders();
+    let solver_id = Address::repeat_byte(3);
+    let main_token = Address::repeat_byte(2);
+    let other_token = Address::repeat_byte(22);
+    let large_amount = U256::from(u128::MAX);
+
+    for (offset, amount, token_out) in [
+        (0_u8, large_amount, main_token),
+        (1, U256::from(7), main_token),
+        (2, U256::from(5), other_token),
+    ] {
+        let order_id = OrderId::from_u128(100 + u128::from(offset));
+        let mut input = input(order_id);
+        input.access_token_hash = B256::repeat_byte(100 + offset);
+        input.terms.amount_out = amount;
+        input.terms.token_out = token_out;
+        store
+            .insert_authoritative(&core_order_with_terms(order_id, &input.terms), &input)
+            .await
+            .unwrap();
+    }
+
+    let usage = store.capacity_usage(1_000).await.unwrap();
+    assert_eq!(usage.active_workload(solver_id), 3);
+    assert_eq!(
+        usage.held_output_amount(solver_id, 31_337, main_token),
+        large_amount + U256::from(7)
+    );
+    assert_eq!(
+        usage.held_output_amount(solver_id, 31_337, other_token),
+        U256::from(5)
+    );
+    assert_eq!(
+        store
+            .held_output_amount(solver_id, 31_337, main_token, 1_000)
+            .await
+            .unwrap(),
+        large_amount + U256::from(7)
+    );
+}
+
+#[tokio::test]
+async fn capacity_usage_rejects_output_liquidity_overflow() {
+    let repository = OrderRepository::connect("sqlite::memory:").await.unwrap();
+    let store = repository.proof_orders();
+
+    for (offset, amount) in [(0_u8, U256::MAX), (1, U256::from(1))] {
+        let order_id = OrderId::from_u128(110 + u128::from(offset));
+        let mut input = input(order_id);
+        input.access_token_hash = B256::repeat_byte(110 + offset);
+        input.terms.amount_out = amount;
+        store
+            .insert_authoritative(&core_order_with_terms(order_id, &input.terms), &input)
+            .await
+            .unwrap();
+    }
+
+    assert!(matches!(
+        store.capacity_usage(1_000).await,
+        Err(RepositoryError::InvalidData {
+            field: "output_liquidity",
+            ..
+        })
+    ));
+    assert!(matches!(
+        store
+            .held_output_amount(
+                Address::repeat_byte(3),
+                31_337,
+                Address::repeat_byte(2),
+                1_000,
+            )
+            .await,
+        Err(RepositoryError::InvalidData {
+            field: "output_liquidity",
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn awaiting_capacity_releases_holds_survives_restart_and_resumes() {
+    let database = TemporaryDatabase::new("awaiting-capacity-restart");
+    let repository = OrderRepository::connect(&database.url()).await.unwrap();
+    let store = repository.proof_orders();
+    let order_id = OrderId::from_u128(120);
+    let mut input = input(order_id);
+    input.access_token_hash = B256::repeat_byte(120);
+    let first_solver = input.candidates[0].solver_id;
+    let second_solver = input.candidates[1].solver_id;
+    store
+        .insert_authoritative(&core_order(order_id), &input)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .decline_and_advance_to(
+                order_id,
+                first_solver,
+                Some(&[121; 65]),
+                2_000,
+                2_000,
+                1,
+                None,
+            )
+            .await
+            .unwrap(),
+        Some(AdvanceOutcome::AwaitingCapacity)
+    );
+    assert_eq!(store.active_workload(first_solver, 2_000).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .held_output_amount(
+                first_solver,
+                input.terms.chain_id,
+                input.terms.token_out,
+                2_000,
+            )
+            .await
+            .unwrap(),
+        U256::ZERO
+    );
+    assert!(
+        store
+            .pending_reservations(first_solver, 2_000)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.awaiting_capacity_order_ids().await.unwrap(),
+        vec![order_id]
+    );
+    assert_eq!(
+        store
+            .advance_awaiting_to(order_id, 2_100, 2_000, 1, Some(first_solver))
+            .await
+            .unwrap(),
+        Some(AdvanceOutcome::AwaitingCapacity)
+    );
+    let updated_at_ms: i64 =
+        sqlx::query_scalar("SELECT updated_at_ms FROM proof_orders WHERE order_id = ?")
+            .bind(order_id.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(updated_at_ms, 2_100);
+
+    store.pool.close().await;
+    drop(store);
+    drop(repository);
+
+    let restarted = OrderRepository::connect(&database.url()).await.unwrap();
+    let restarted_store = restarted.proof_orders();
+    assert_eq!(
+        restarted_store.awaiting_capacity_order_ids().await.unwrap(),
+        vec![order_id]
+    );
+    assert_eq!(
+        restarted_store
+            .advance_awaiting_to(order_id, 2_500, 2_000, 1, Some(second_solver))
+            .await
+            .unwrap(),
+        Some(AdvanceOutcome::Advanced(second_solver))
+    );
+    assert!(
+        restarted_store
+            .pending_reservation(order_id, second_solver)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        restarted_store
+            .awaiting_capacity_order_ids()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    restarted_store.pool.close().await;
+}
+
+#[tokio::test]
+async fn bounded_awaiting_scan_rotates_retried_orders() {
+    let repository = OrderRepository::connect("sqlite::memory:").await.unwrap();
+    let store = repository.proof_orders();
+    let count = usize::try_from(super::reservations::MAINTENANCE_BATCH_SIZE).unwrap() + 1;
+    let mut order_ids = Vec::with_capacity(count);
+
+    for index in 0..count {
+        let order_id = OrderId::from_u128(200 + index as u128);
+        let mut input = input(order_id);
+        input.access_token_hash = B256::repeat_byte(u8::try_from(index + 1).unwrap());
+        let first_solver = input.candidates[0].solver_id;
+        store
+            .insert_authoritative(&core_order(order_id), &input)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .decline_and_advance_to(order_id, first_solver, None, 2_000, 2_000, 1, None)
+                .await
+                .unwrap(),
+            Some(AdvanceOutcome::AwaitingCapacity)
+        );
+        order_ids.push(order_id);
+    }
+
+    let first_page = store.awaiting_capacity_order_ids().await.unwrap();
+    assert_eq!(
+        first_page.len(),
+        usize::try_from(super::reservations::MAINTENANCE_BATCH_SIZE).unwrap()
+    );
+    let retried = first_page[0];
+    let initially_deferred = *order_ids
+        .iter()
+        .find(|order_id| !first_page.contains(order_id))
+        .unwrap();
+    assert_eq!(
+        store
+            .advance_awaiting_to(retried, 2_100, 2_000, 1, Some(Address::repeat_byte(3)),)
+            .await
+            .unwrap(),
+        Some(AdvanceOutcome::AwaitingCapacity)
+    );
+
+    let second_page = store.awaiting_capacity_order_ids().await.unwrap();
+    assert!(second_page.contains(&initially_deferred));
+    assert!(!second_page.contains(&retried));
+}
+
+#[tokio::test]
+async fn expired_reservation_attempts_are_not_jobs_or_capacity_holds() {
+    let repository = OrderRepository::connect("sqlite::memory:").await.unwrap();
+    let store = repository.proof_orders();
+    let order_id = OrderId::from_u128(121);
+    let mut input = input(order_id);
+    input.access_token_hash = B256::repeat_byte(121);
+    let solver_id = input.candidates[0].solver_id;
+    store
+        .insert_authoritative(&core_order(order_id), &input)
+        .await
+        .unwrap();
+
+    assert_eq!(store.active_workload(solver_id, 2_999).await.unwrap(), 1);
+    assert_eq!(
+        store
+            .pending_reservations(solver_id, 2_999)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(store.active_workload(solver_id, 3_000).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .held_output_amount(
+                solver_id,
+                input.terms.chain_id,
+                input.terms.token_out,
+                3_000,
+            )
+            .await
+            .unwrap(),
+        U256::ZERO
+    );
+    assert!(
+        store
+            .pending_reservations(solver_id, 3_000)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.due_reservation_attempts(3_000).await.unwrap(),
+        vec![(order_id, solver_id)]
+    );
 }
 
 #[tokio::test]
@@ -752,6 +1154,10 @@ async fn rejection_evidence_survives_expiry_in_either_arrival_order() {
             assert_eq!(
                 store.state(order_id).await.unwrap(),
                 Some(ProofOrderState::ProofRejected)
+            );
+            assert_eq!(
+                store.capacity_usage(4_000).await.unwrap(),
+                CapacityUsage::default()
             );
         }
 

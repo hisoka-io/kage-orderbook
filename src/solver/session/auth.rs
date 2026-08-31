@@ -18,6 +18,7 @@ impl SolverSessions {
     pub fn new(domain: impl Into<String>) -> Self {
         Self {
             state: Arc::new(Mutex::new(State::default())),
+            capacity_serial: Arc::new(tokio::sync::Mutex::new(())),
             domain: domain.into(),
         }
     }
@@ -63,16 +64,13 @@ impl SolverSessions {
         Ok(solver_id)
     }
 
-    pub fn open(&self, solver_id: Address, now_ms: u64) -> SessionResponse {
+    pub(crate) fn open(&self, solver_id: Address, now_ms: u64) -> SessionResponse {
         let token = Uuid::new_v4().simple().to_string();
         let expires_at_ms = now_ms + SESSION_TTL_MS;
         let mut state = self.lock();
         state
             .tokens
             .retain(|_, session| session.expires_at_ms > now_ms && session.solver_id != solver_id);
-        // Capability revisions are scoped to one authenticated session. A
-        // restarted solver begins again at revision 1, and the previous
-        // bearer/capability lease must not remain authoritative.
         state.capabilities.remove(&solver_id);
         state.tokens.insert(
             token.clone(),

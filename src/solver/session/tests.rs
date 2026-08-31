@@ -29,6 +29,29 @@ fn answer(sessions: &SolverSessions, now_ms: u64) -> SessionRequest {
     }
 }
 
+fn market() -> SolverMarket {
+    SolverMarket {
+        chain_id: 31_337,
+        token_in: Address::repeat_byte(1),
+        token_out: Address::repeat_byte(2),
+        min_amount_in: U256::from(10),
+        max_amount_in: U256::from(1_000),
+        available_amount_out: U256::from(2_000),
+        minimum_margin_bps: 35,
+    }
+}
+
+fn solver_capabilities(revision: u64, key_expires_at_ms: i64) -> SolverCapabilities {
+    SolverCapabilities {
+        revision,
+        max_in_flight: 2,
+        encryption_key_id: B256::repeat_byte(4),
+        encryption_public_key: vec![5; 32],
+        key_expires_at_ms,
+        markets: vec![market()],
+    }
+}
+
 #[test]
 fn signed_challenge_recovers_the_solver_address() {
     let sessions = sessions();
@@ -149,6 +172,221 @@ fn authenticated_capabilities_are_revisioned_and_expire() {
             )
             .is_empty()
     );
+}
+
+#[test]
+fn capacity_lookup_returns_live_market_metadata() {
+    let sessions = sessions();
+    let session = sessions.open(SIGNER, NOW);
+    sessions
+        .register_capabilities(
+            &session.token,
+            solver_capabilities(7, (NOW + 120_000) as i64),
+            NOW,
+        )
+        .unwrap();
+
+    let capacity = sessions
+        .capacity_for_market(
+            SIGNER,
+            31_337,
+            Address::repeat_byte(1),
+            Address::repeat_byte(2),
+            NOW,
+        )
+        .unwrap();
+
+    assert_eq!(capacity.route.solver_id, SIGNER);
+    assert_eq!(capacity.route.min_amount_in, U256::from(10));
+    assert_eq!(capacity.route.max_amount_in, U256::from(1_000));
+    assert_eq!(capacity.route.encryption_key_id, B256::repeat_byte(4));
+    assert_eq!(capacity.route.encryption_public_key, vec![5; 32]);
+    assert_eq!(capacity.route.key_expires_at_ms, (NOW + 120_000) as i64);
+    assert_eq!(capacity.minimum_margin_bps, 35);
+    assert_eq!(capacity.max_in_flight, 2);
+    assert_eq!(capacity.available_amount_out, U256::from(2_000));
+}
+
+#[test]
+fn capacity_lookup_uses_the_latest_capability_revision() {
+    let sessions = sessions();
+    let session = sessions.open(SIGNER, NOW);
+    let original = solver_capabilities(1, (NOW + 120_000) as i64);
+    sessions
+        .register_capabilities(&session.token, original.clone(), NOW)
+        .unwrap();
+
+    let mut stale = original.clone();
+    stale.encryption_key_id = B256::repeat_byte(6);
+    assert_eq!(
+        sessions.register_capabilities(&session.token, stale, NOW + 1),
+        Err(AuthError::StaleCapabilityRevision)
+    );
+    assert_eq!(
+        sessions
+            .capacity_for_market(
+                SIGNER,
+                31_337,
+                Address::repeat_byte(1),
+                Address::repeat_byte(2),
+                NOW + 1,
+            )
+            .unwrap()
+            .route
+            .encryption_key_id,
+        B256::repeat_byte(4)
+    );
+
+    let mut replacement = original;
+    replacement.revision = 2;
+    replacement.max_in_flight = 4;
+    replacement.encryption_key_id = B256::repeat_byte(7);
+    replacement.encryption_public_key = vec![8; 32];
+    sessions
+        .register_capabilities(&session.token, replacement, NOW + 2)
+        .unwrap();
+    let capacity = sessions
+        .capacity_for_market(
+            SIGNER,
+            31_337,
+            Address::repeat_byte(1),
+            Address::repeat_byte(2),
+            NOW + 2,
+        )
+        .unwrap();
+    assert_eq!(capacity.max_in_flight, 4);
+    assert_eq!(capacity.route.encryption_key_id, B256::repeat_byte(7));
+    assert_eq!(capacity.route.encryption_public_key, vec![8; 32]);
+}
+
+#[test]
+fn capacity_lookup_prunes_an_expired_capability_lease() {
+    let sessions = sessions();
+    let session = sessions.open(SIGNER, NOW);
+    sessions
+        .register_capabilities(
+            &session.token,
+            solver_capabilities(1, (NOW + 120_000) as i64),
+            NOW,
+        )
+        .unwrap();
+
+    assert!(
+        sessions
+            .capacity_for_market(
+                SIGNER,
+                31_337,
+                Address::repeat_byte(1),
+                Address::repeat_byte(2),
+                NOW + CAPABILITY_TTL_MS,
+            )
+            .is_none()
+    );
+    assert!(!sessions.lock().capabilities.contains_key(&SIGNER));
+}
+
+#[test]
+fn capability_lease_cannot_outlive_its_session() {
+    let sessions = sessions();
+    let session = sessions.open(SIGNER, NOW);
+    let published_at = session.expires_at_ms - 1;
+    sessions
+        .register_capabilities(
+            &session.token,
+            solver_capabilities(1, (session.expires_at_ms + 120_000) as i64),
+            published_at,
+        )
+        .unwrap();
+
+    assert!(
+        sessions
+            .capacity_for_market(
+                SIGNER,
+                31_337,
+                Address::repeat_byte(1),
+                Address::repeat_byte(2),
+                published_at,
+            )
+            .is_some()
+    );
+    assert!(
+        sessions
+            .capacity_for_market(
+                SIGNER,
+                31_337,
+                Address::repeat_byte(1),
+                Address::repeat_byte(2),
+                session.expires_at_ms,
+            )
+            .is_none()
+    );
+}
+
+#[test]
+fn capacity_lookup_prunes_an_expired_encryption_key() {
+    let sessions = sessions();
+    let session = sessions.open(SIGNER, NOW);
+    sessions
+        .register_capabilities(
+            &session.token,
+            solver_capabilities(1, (NOW + 1) as i64),
+            NOW,
+        )
+        .unwrap();
+
+    assert!(
+        sessions
+            .capacity_for_market(
+                SIGNER,
+                31_337,
+                Address::repeat_byte(1),
+                Address::repeat_byte(2),
+                NOW + 1,
+            )
+            .is_none()
+    );
+    assert!(!sessions.lock().capabilities.contains_key(&SIGNER));
+}
+
+#[test]
+fn capacity_lookup_requires_an_exact_solver_and_market() {
+    let sessions = sessions();
+    let session = sessions.open(SIGNER, NOW);
+    sessions
+        .register_capabilities(
+            &session.token,
+            solver_capabilities(1, (NOW + 120_000) as i64),
+            NOW,
+        )
+        .unwrap();
+
+    for (solver_id, chain_id, token_in, token_out) in [
+        (
+            Address::repeat_byte(9),
+            31_337,
+            Address::repeat_byte(1),
+            Address::repeat_byte(2),
+        ),
+        (SIGNER, 1, Address::repeat_byte(1), Address::repeat_byte(2)),
+        (
+            SIGNER,
+            31_337,
+            Address::repeat_byte(3),
+            Address::repeat_byte(2),
+        ),
+        (
+            SIGNER,
+            31_337,
+            Address::repeat_byte(1),
+            Address::repeat_byte(3),
+        ),
+    ] {
+        assert!(
+            sessions
+                .capacity_for_market(solver_id, chain_id, token_in, token_out, NOW)
+                .is_none()
+        );
+    }
 }
 
 #[test]

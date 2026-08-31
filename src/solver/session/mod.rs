@@ -21,6 +21,7 @@ const CAPABILITY_TTL_MS: u64 = 60_000;
 #[derive(Clone)]
 pub struct SolverSessions {
     state: Arc<Mutex<State>>,
+    capacity_serial: Arc<tokio::sync::Mutex<()>>,
     domain: String,
 }
 
@@ -41,6 +42,10 @@ impl SolverSessions {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) async fn capacity_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.capacity_serial.clone().lock_owned().await
     }
 }
 

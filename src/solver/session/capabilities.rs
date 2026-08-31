@@ -6,7 +6,7 @@ use kage_types::routing::{PreviewRoute, SolverCapabilities};
 use super::{AuthError, CAPABILITY_TTL_MS, CapabilityLease, CapabilityRoute, SolverSessions};
 
 impl SolverSessions {
-    pub fn register_capabilities(
+    pub(crate) fn register_capabilities(
         &self,
         token: &str,
         capabilities: SolverCapabilities,
@@ -29,7 +29,9 @@ impl SolverSessions {
             session.solver_id,
             CapabilityLease {
                 capabilities,
-                expires_at_ms: now_ms.saturating_add(CAPABILITY_TTL_MS),
+                expires_at_ms: now_ms
+                    .saturating_add(CAPABILITY_TTL_MS)
+                    .min(session.expires_at_ms),
             },
         );
         Ok(())
@@ -43,35 +45,12 @@ impl SolverSessions {
         now_ms: u64,
     ) -> Vec<CapabilityRoute> {
         let mut state = self.lock();
-        state.capabilities.retain(|_, lease| {
-            lease.expires_at_ms > now_ms && lease.capabilities.key_expires_at_ms > now_ms as i64
-        });
+        prune_expired_authority(&mut state, now_ms);
         let mut routes = state
             .capabilities
             .iter()
-            .flat_map(|(solver_id, lease)| {
-                lease
-                    .capabilities
-                    .markets
-                    .iter()
-                    .filter(move |market| {
-                        market.chain_id == chain_id
-                            && market.token_in == token_in
-                            && market.token_out == token_out
-                    })
-                    .map(move |market| CapabilityRoute {
-                        route: PreviewRoute {
-                            solver_id: *solver_id,
-                            min_amount_in: market.min_amount_in,
-                            max_amount_in: market.max_amount_in,
-                            encryption_key_id: lease.capabilities.encryption_key_id,
-                            encryption_public_key: lease.capabilities.encryption_public_key.clone(),
-                            key_expires_at_ms: lease.capabilities.key_expires_at_ms,
-                        },
-                        minimum_margin_bps: market.minimum_margin_bps,
-                        max_in_flight: lease.capabilities.max_in_flight,
-                        available_amount_out: market.available_amount_out,
-                    })
+            .filter_map(|(solver_id, lease)| {
+                route_for_market(*solver_id, lease, chain_id, token_in, token_out)
             })
             .collect::<Vec<_>>();
         routes.sort_by_key(|route| {
@@ -83,6 +62,67 @@ impl SolverSessions {
         });
         routes
     }
+
+    pub fn capacity_for_market(
+        &self,
+        solver_id: Address,
+        chain_id: u64,
+        token_in: Address,
+        token_out: Address,
+        now_ms: u64,
+    ) -> Option<CapabilityRoute> {
+        let mut state = self.lock();
+        prune_expired_authority(&mut state, now_ms);
+        route_for_market(
+            solver_id,
+            state.capabilities.get(&solver_id)?,
+            chain_id,
+            token_in,
+            token_out,
+        )
+    }
+}
+
+fn prune_expired_authority(state: &mut super::State, now_ms: u64) {
+    let now_i64 = i64::try_from(now_ms).unwrap_or(i64::MAX);
+    state
+        .tokens
+        .retain(|_, session| session.expires_at_ms > now_ms);
+    let live_solvers = state
+        .tokens
+        .values()
+        .map(|session| session.solver_id)
+        .collect::<HashSet<_>>();
+    state.capabilities.retain(|solver_id, lease| {
+        live_solvers.contains(solver_id)
+            && lease.expires_at_ms > now_ms
+            && lease.capabilities.key_expires_at_ms > now_i64
+    });
+}
+
+fn route_for_market(
+    solver_id: Address,
+    lease: &CapabilityLease,
+    chain_id: u64,
+    token_in: Address,
+    token_out: Address,
+) -> Option<CapabilityRoute> {
+    let market = lease.capabilities.markets.iter().find(|market| {
+        market.chain_id == chain_id && market.token_in == token_in && market.token_out == token_out
+    })?;
+    Some(CapabilityRoute {
+        route: PreviewRoute {
+            solver_id,
+            min_amount_in: market.min_amount_in,
+            max_amount_in: market.max_amount_in,
+            encryption_key_id: lease.capabilities.encryption_key_id,
+            encryption_public_key: lease.capabilities.encryption_public_key.clone(),
+            key_expires_at_ms: lease.capabilities.key_expires_at_ms,
+        },
+        minimum_margin_bps: market.minimum_margin_bps,
+        max_in_flight: lease.capabilities.max_in_flight,
+        available_amount_out: market.available_amount_out,
+    })
 }
 
 pub(super) fn validate_capabilities(

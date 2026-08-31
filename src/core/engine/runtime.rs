@@ -4,10 +4,11 @@ use kage_types::api_types::ComplaintStatus;
 use tokio::sync::{broadcast, mpsc};
 
 use super::{
+    admission::AdmissionGate,
     handle::{OrderbookHandle, Request, ServiceError},
     maintenance::{
         broadcast_reservation_request, cleanup_proof_orders, close_core_projection,
-        expire_due_orders, maintain_proof_reservations, now_ms,
+        decline_and_route, expire_due_orders, maintain_proof_reservations, now_ms,
     },
     operations::{assign_and_disclose_proof_order, create_proof_order_idempotently},
 };
@@ -17,12 +18,8 @@ use crate::{
     storage::{AdvanceOutcome, OrderRepository, RepositoryError},
 };
 
-pub async fn start_orderbook(database_url: &str) -> Result<OrderbookHandle, RepositoryError> {
-    let repository = OrderRepository::connect(database_url).await?;
-    start_orderbook_with_repository(repository, 256).await
-}
-
-pub async fn start_orderbook_with_repository(
+#[cfg(test)]
+pub(crate) async fn start_orderbook_with_repository(
     repository: OrderRepository,
     capacity: usize,
 ) -> Result<OrderbookHandle, RepositoryError> {
@@ -30,10 +27,29 @@ pub async fn start_orderbook_with_repository(
         .await
 }
 
-pub async fn start_orderbook_with_repository_and_policy(
+#[cfg(test)]
+pub(crate) async fn start_orderbook_with_repository_and_policy(
     repository: OrderRepository,
     capacity: usize,
     proof_policy: ProofOrderSettings,
+) -> Result<OrderbookHandle, RepositoryError> {
+    start_orderbook_runtime(repository, capacity, proof_policy, None).await
+}
+
+pub async fn start_orderbook_with_admission(
+    repository: OrderRepository,
+    capacity: usize,
+    proof_policy: ProofOrderSettings,
+    admission: AdmissionGate,
+) -> Result<OrderbookHandle, RepositoryError> {
+    start_orderbook_runtime(repository, capacity, proof_policy, Some(admission)).await
+}
+
+async fn start_orderbook_runtime(
+    repository: OrderRepository,
+    capacity: usize,
+    proof_policy: ProofOrderSettings,
+    admission: Option<AdmissionGate>,
 ) -> Result<OrderbookHandle, RepositoryError> {
     let restored = repository.load_non_terminal_orders().await?;
     let mut orderbook =
@@ -68,6 +84,7 @@ pub async fn start_orderbook_with_repository_and_policy(
                         &repository,
                         &events,
                         &proof_policy,
+                        admission.as_ref(),
                     ).await;
                     continue;
                 }
@@ -91,6 +108,8 @@ pub async fn start_orderbook_with_repository_and_policy(
                         &repository,
                         &events,
                         *input,
+                        admission.as_ref(),
+                        &proof_policy,
                     )
                     .await;
                     let _ = reply.send(result);
@@ -98,6 +117,7 @@ pub async fn start_orderbook_with_repository_and_policy(
                 Request::AssignAndDiscloseProofOrder {
                     order_id,
                     solver_id,
+                    session_token,
                     reservation_ack,
                     ticket,
                     reply,
@@ -108,8 +128,10 @@ pub async fn start_orderbook_with_repository_and_policy(
                         &events,
                         order_id,
                         solver_id,
+                        session_token.as_deref(),
                         &reservation_ack,
                         &ticket,
+                        admission.as_ref(),
                     )
                     .await;
                     let _ = reply.send(result);
@@ -127,18 +149,17 @@ pub async fn start_orderbook_with_repository_and_policy(
                         })
                     });
                     let result = match encoded {
-                        Ok(encoded) => repository
-                            .proof_orders()
-                            .decline_and_advance(
+                        Ok(encoded) => {
+                            decline_and_route(
+                                &repository,
+                                &proof_policy,
+                                admission.as_ref(),
                                 order_id,
                                 solver_id,
-                                Some(&encoded),
-                                now_ms(),
-                                proof_policy.reservation_attempt_timeout_ms,
-                                proof_policy.minimum_remaining_seconds,
+                                &encoded,
                             )
                             .await
-                            .map_err(ServiceError::Repository),
+                        }
                         Err(error) => Err(error),
                     };
                     if matches!(result, Ok(Some(AdvanceOutcome::Advanced(_)))) {

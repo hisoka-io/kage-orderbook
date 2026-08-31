@@ -272,7 +272,11 @@ async fn forward_service_events(
                     OrderEvent::SolverReservationRequested { order_id, .. } => stream
                         .state
                         .proof_orders
-                        .is_target(*order_id, solver_id)
+                        .is_live_target(
+                            *order_id,
+                            solver_id,
+                            i64::try_from(super::now_ms()).unwrap_or(i64::MAX),
+                        )
                         .await
                         .unwrap_or(false),
                     OrderEvent::OrderExpired { order_id } => stream

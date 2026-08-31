@@ -2,8 +2,9 @@ use alloy_primitives::Address;
 use kage_types::proof_orders::{AssignmentTicket, ReservationAck};
 use tokio::sync::broadcast;
 
-use super::{handle::ServiceError, maintenance::now_ms};
+use super::{admission::AdmissionGate, handle::ServiceError, maintenance::now_ms};
 use crate::{
+    config::ProofOrderSettings,
     core::{
         command::Command,
         events::OrderEvent,
@@ -18,7 +19,9 @@ pub(in crate::core::engine) async fn create_proof_order_idempotently(
     orderbook: &mut Orderbook,
     repository: &OrderRepository,
     events: &broadcast::Sender<OrderEvent>,
-    input: NewProofOrder,
+    mut input: NewProofOrder,
+    admission: Option<&AdmissionGate>,
+    proof_policy: &ProofOrderSettings,
 ) -> Result<CreateOrderOutcome, ServiceError> {
     if let Some(existing) = repository
         .get_order(input.order_id)
@@ -50,12 +53,44 @@ pub(in crate::core::engine) async fn create_proof_order_idempotently(
         }
     }
 
+    let admission_now_ms = now_ms();
+    let minimum_remaining_ms =
+        i64::from(proof_policy.minimum_remaining_seconds).saturating_mul(1_000);
+    if admission.is_some()
+        && input.terms.expires_at_ms.saturating_sub(admission_now_ms) <= minimum_remaining_ms
+    {
+        return Err(ServiceError::ProofDeadlineChanged);
+    }
+    let admission_permit = if let Some(admission) = admission {
+        let proof_orders = repository.proof_orders();
+        Some(
+            admission
+                .select_candidate(&proof_orders, &mut input)
+                .await?,
+        )
+    } else {
+        None
+    };
+
     let command = Command::SubmitProofOrder {
         order_id: input.order_id,
         terms: input.terms,
     };
+    let admitted_at_ms = now_ms();
+    if admission_permit
+        .as_ref()
+        .is_some_and(|permit| permit.preview_valid_until_ms <= admitted_at_ms)
+    {
+        return Err(ServiceError::PreviewExpired);
+    }
+    if admission.is_some()
+        && input.terms.expires_at_ms.saturating_sub(admitted_at_ms) <= minimum_remaining_ms
+    {
+        return Err(ServiceError::ProofDeadlineChanged);
+    }
+    input.created_at_ms = admitted_at_ms;
     let prepared = orderbook
-        .prepare(command, input.created_at_ms)
+        .prepare(command, admitted_at_ms)
         .map_err(ServiceError::Order)?
         .ok_or(ServiceError::Order(OrderError::AlreadyExists))?;
     match repository
@@ -100,8 +135,10 @@ pub(in crate::core::engine) async fn assign_and_disclose_proof_order(
     events: &broadcast::Sender<OrderEvent>,
     order_id: OrderId,
     solver_id: Address,
+    session_token: Option<&str>,
     reservation_ack: &ReservationAck,
     ticket: &AssignmentTicket,
+    admission: Option<&AdmissionGate>,
 ) -> Result<bool, ServiceError> {
     if !orderbook.orders.contains_key(&order_id)
         && let Some(stored) = repository
@@ -130,6 +167,40 @@ pub(in crate::core::engine) async fn assign_and_disclose_proof_order(
     {
         return Err(ServiceError::Order(OrderError::InvalidPayload));
     }
+    let _disclosure_permit = if let Some(admission) = admission {
+        let terms = repository
+            .proof_orders()
+            .terms(order_id)
+            .await
+            .map_err(ServiceError::Repository)?
+            .ok_or(ServiceError::Order(OrderError::NotFound))?;
+        let public_key = repository
+            .proof_orders()
+            .candidate_public_key(order_id, solver_id)
+            .await
+            .map_err(|error| {
+                crate::service_error!(
+                    "orderbook",
+                    "disclosure key lookup failed order_id={} error={error}",
+                    short_id(order_id)
+                );
+                ServiceError::AdmissionUnavailable
+            })?;
+        Some(
+            admission
+                .authorize_disclosure(
+                    solver_id,
+                    session_token,
+                    ticket.claims.proof_encryption_key_id,
+                    public_key.as_deref(),
+                    &terms,
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
+    let timestamp_ms = now_ms();
     let persisted = repository
         .proof_orders()
         .assign_and_disclose(
@@ -138,7 +209,7 @@ pub(in crate::core::engine) async fn assign_and_disclose_proof_order(
             solver_id,
             reservation_ack,
             ticket,
-            now_ms(),
+            timestamp_ms,
         )
         .await
         .map_err(ServiceError::Repository)?;
@@ -216,7 +287,11 @@ pub(in crate::core::engine) async fn execute_command(
 
     if let Err(error) = &result {
         match error {
-            ServiceError::Order(_) => crate::service_warn!(
+            ServiceError::Order(_)
+            | ServiceError::RouteCapacityChanged
+            | ServiceError::AdmissionUnavailable
+            | ServiceError::ProofDeadlineChanged
+            | ServiceError::PreviewExpired => crate::service_warn!(
                 "orderbook",
                 "command rejected command={command_name} order_id={} error={error:?}",
                 short_id(order_id)

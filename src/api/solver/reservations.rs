@@ -20,7 +20,11 @@ pub(in crate::api) async fn reserve_order(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, StatusCode> {
-    let solver_id = auth::authenticated_solver(&state, &headers)?;
+    let session_token = auth::bearer_token(&headers)?;
+    let solver_id = state
+        .sessions
+        .resolve(&session_token, now_ms())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
     auth::active_solver(&state, solver_id)?;
     let reservation_ack: ReservationAck = decode_solver_body(&headers, &body)?;
     let proof_orders = &state.proof_orders;
@@ -43,6 +47,11 @@ pub(in crate::api) async fn reserve_order(
         {
             return Err(StatusCode::CONFLICT);
         }
+        let _session_guard = state.sessions.capacity_guard().await;
+        if state.sessions.resolve(&session_token, now_ms()) != Some(solver_id) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        auth::active_solver(&state, solver_id)?;
         return Ok(Json(delivery).into_response());
     }
 
@@ -66,7 +75,13 @@ pub(in crate::api) async fn reserve_order(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     state
         .orderbook
-        .assign_and_disclose_proof_order(order_id, solver_id, reservation_ack.clone(), ticket)
+        .assign_and_disclose_proof_order(
+            order_id,
+            solver_id,
+            Some(session_token.clone()),
+            reservation_ack.clone(),
+            ticket,
+        )
         .await
         .map_err(status_for_error)?;
     let delivery = proof_orders
@@ -82,6 +97,11 @@ pub(in crate::api) async fn reserve_order(
     {
         return Err(StatusCode::CONFLICT);
     }
+    let _session_guard = state.sessions.capacity_guard().await;
+    if state.sessions.resolve(&session_token, now_ms()) != Some(solver_id) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    auth::active_solver(&state, solver_id)?;
     Ok(Json(delivery).into_response())
 }
 
@@ -119,6 +139,14 @@ pub(in crate::api) async fn decline_order(
             crate::service_log!(
                 "orderbook",
                 "order rerouted order_id={} solver={next}",
+                short_id(order_id)
+            );
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Some(AdvanceOutcome::AwaitingCapacity) => {
+            crate::service_log!(
+                "orderbook",
+                "order awaiting fallback capacity order_id={}",
                 short_id(order_id)
             );
             Ok(StatusCode::NO_CONTENT)

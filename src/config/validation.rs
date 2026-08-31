@@ -234,6 +234,11 @@ impl AppConfig {
                 "proof_orders.preview_lifetime_seconds must not exceed proof_lifetime_seconds",
             ));
         }
+        if policy.preview_cleanup_grace_seconds < u64::from(policy.proof_lifetime_seconds) {
+            return Err(invalid(
+                "proof_orders.preview_cleanup_grace_seconds must cover proof_lifetime_seconds",
+            ));
+        }
         if policy.reservation_attempt_timeout_ms
             >= u64::from(policy.minimum_remaining_seconds).saturating_mul(1_000)
         {

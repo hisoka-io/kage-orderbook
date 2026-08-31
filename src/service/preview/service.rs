@@ -171,7 +171,7 @@ impl PreviewService {
         let now_i64 = i64::try_from(now_ms).unwrap_or(i64::MAX);
         let required_key_expiry_ms = now_i64.saturating_add(proof_lifetime_ms);
         let mut live_routes = Vec::new();
-        for route in self.sessions.routes_for_market(
+        for mut route in self.sessions.routes_for_market(
             request.chain_id,
             request.token_in,
             request.token_out,
@@ -191,7 +191,20 @@ impl PreviewService {
                 .await
                 .map_err(|error| PreviewError::Storage(error.to_string()))?;
             if workload < u64::from(route.max_in_flight) {
-                live_routes.push(route);
+                let held_output = self
+                    .proof_orders
+                    .held_output_amount(
+                        public.solver_id,
+                        request.chain_id,
+                        request.token_out,
+                        now_i64,
+                    )
+                    .await
+                    .map_err(|error| PreviewError::Storage(error.to_string()))?;
+                route.available_amount_out = route.available_amount_out.saturating_sub(held_output);
+                if route.available_amount_out > U256::ZERO {
+                    live_routes.push(route);
+                }
             }
         }
         if live_routes.is_empty() {

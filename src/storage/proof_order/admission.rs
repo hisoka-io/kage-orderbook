@@ -1,7 +1,38 @@
 use super::{rows::*, *};
 
 impl ProofOrderRepository {
-    pub async fn insert_authoritative(
+    pub(crate) async fn preview_valid_until(
+        &self,
+        preview_id: B256,
+    ) -> Result<Option<i64>, RepositoryError> {
+        sqlx::query_scalar("SELECT valid_until_ms FROM proof_order_previews WHERE preview_id = ?")
+            .bind(preview_id.as_slice())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(RepositoryError::from)
+    }
+
+    pub(crate) async fn candidate_public_key(
+        &self,
+        order_id: OrderId,
+        solver_id: Address,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        let key: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT r.encryption_public_key
+             FROM proof_orders p
+             JOIN proof_order_preview_routes r
+               ON r.preview_id = p.preview_id AND r.category_id = p.category_id
+             WHERE p.order_id = ? AND r.solver_id = ?",
+        )
+        .bind(order_id.to_string())
+        .bind(solver_id.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        key.map(|key| parse_fixed::<32>("encryption_public_key", key).map(|key| key.to_vec()))
+            .transpose()
+    }
+
+    pub(crate) async fn insert_authoritative(
         &self,
         order: &Order,
         input: &NewProofOrder,
@@ -216,19 +247,21 @@ impl ProofOrderRepository {
                 SELECT order_id FROM proof_orders
                 WHERE assigned_solver = ?
                   AND proof_expires_at_ms > ?
-                  AND state IN ('assigned', 'proof_delivered', 'proof_accepted')
+                  AND state IN ('assigned', 'proof_delivered')
                 UNION
                 SELECT p.order_id
                 FROM proof_orders p
                 JOIN proof_order_reservation_attempts a ON a.order_id = p.order_id
                 WHERE a.solver_id = ? AND a.outcome = 'pending'
                   AND p.state = 'reservation_pending'
+                  AND a.deadline_ms > ?
                   AND p.proof_expires_at_ms > ?
              )",
         )
         .bind(solver_id.as_slice())
         .bind(now_ms)
         .bind(solver_id.as_slice())
+        .bind(now_ms)
         .bind(now_ms)
         .fetch_one(&self.pool)
         .await?;

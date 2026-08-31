@@ -13,6 +13,7 @@ pub(in crate::api) async fn register_solver_capabilities(
     Json(capabilities): Json<SolverCapabilities>,
 ) -> Result<StatusCode, StatusCode> {
     let token = auth::bearer_token(&headers)?;
+    let _guard = state.sessions.capacity_guard().await;
     let solver_id = state
         .sessions
         .resolve(&token, now_ms())

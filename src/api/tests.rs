@@ -15,7 +15,7 @@ use uuid::Uuid;
 use super::*;
 use crate::{
     config::{AppConfig, ComplaintFinalityPolicy},
-    core::engine::start_orderbook_with_repository_and_policy,
+    core::engine::{ServiceError, start_orderbook_with_repository_and_policy},
     order::ProofOrderState,
     readiness::ServiceReadiness,
     registry::SolverProfile,
@@ -297,7 +297,7 @@ async fn spawn_complaint_api_with_block_timestamp(
         )
         .unwrap();
     orderbook
-        .assign_and_disclose_proof_order(order_id, solver_id, reservation_ack, ticket)
+        .assign_and_disclose_proof_order(order_id, solver_id, None, reservation_ack, ticket)
         .await
         .unwrap();
     let binding = proof_orders.binding(order_id).await.unwrap().unwrap();
@@ -514,7 +514,7 @@ async fn spawn_result_api(active: bool, allowed: bool) -> ResultApi {
         .unwrap();
     assert!(
         orderbook
-            .assign_and_disclose_proof_order(order_id, solver_id, reservation_ack, ticket,)
+            .assign_and_disclose_proof_order(order_id, solver_id, None, reservation_ack, ticket)
             .await
             .unwrap()
     );
@@ -811,6 +811,41 @@ async fn post_proof_json(fixture: &ProofApi, request: &CreateOrderRequest) -> re
         .send()
         .await
         .unwrap()
+}
+
+#[test]
+fn admission_errors_have_stable_retryable_http_contracts() {
+    let (status, Json(response)) =
+        super::error::api_error_for_service(ServiceError::RouteCapacityChanged);
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(response.code, "route_capacity_changed");
+    assert_eq!(
+        response.message,
+        "solver capacity changed; request a fresh preview and retry"
+    );
+    assert!(response.missing.is_empty());
+
+    let (status, Json(response)) =
+        super::error::api_error_for_service(ServiceError::AdmissionUnavailable);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.code, "admission_unavailable");
+    assert_eq!(
+        response.message,
+        "order admission is temporarily unavailable; retry later"
+    );
+    assert!(response.missing.is_empty());
+
+    let (status, Json(response)) =
+        super::error::api_error_for_service(ServiceError::ProofDeadlineChanged);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.code, "invalid_proof_deadline");
+    assert!(response.missing.is_empty());
+
+    let (status, Json(response)) =
+        super::error::api_error_for_service(ServiceError::PreviewExpired);
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(response.code, "preview_expired");
+    assert!(response.missing.is_empty());
 }
 
 #[tokio::test]

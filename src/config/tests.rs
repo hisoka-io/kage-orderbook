@@ -232,6 +232,10 @@ fn validates_fee_categories_and_proof_order_bounds() {
             "\"evidence_retention_seconds\": 2592000",
             "\"evidence_retention_seconds\": 1",
         ),
+        (
+            "\"preview_cleanup_grace_seconds\": 300",
+            "\"preview_cleanup_grace_seconds\": 29",
+        ),
     ] {
         let invalid_config = VALID_CONFIG.replace(from, to);
         assert_ne!(

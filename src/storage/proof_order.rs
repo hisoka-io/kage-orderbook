@@ -42,6 +42,7 @@ pub enum InsertOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdvanceOutcome {
     Advanced(Address),
+    AwaitingCapacity,
     Exhausted,
 }
 
@@ -92,6 +93,13 @@ pub struct PendingReservation {
     pub fee_bps: u16,
     pub settlement_commitment: B256,
     pub key_id: B256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservationCandidate {
+    pub solver_id: Address,
+    pub key_id: B256,
+    pub encryption_public_key: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,10 +177,13 @@ impl RetentionMetrics {
 }
 
 mod admission;
+mod capacity;
 mod cleanup;
 mod evidence;
 mod reservations;
 mod rows;
+
+pub use capacity::{CapacityUsage, OutputLiquidityKey};
 
 #[cfg(test)]
 mod tests;

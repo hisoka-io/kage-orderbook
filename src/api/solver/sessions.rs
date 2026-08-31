@@ -18,6 +18,7 @@ pub(in crate::api) async fn solver_session(
         crate::service_warn!("orderbook", "solver authentication failed reason={error}");
         StatusCode::UNAUTHORIZED
     })?;
+    let _guard = state.sessions.capacity_guard().await;
     auth::active_solver(&state, solver_id)?;
 
     tracing::debug!(target: "orderbook", %solver_id, "solver authenticated");

@@ -6,7 +6,7 @@ use axum::{
 };
 use kage_types::proof_orders::ReservationOffer;
 
-use super::super::{ApiState, auth};
+use super::super::{ApiState, auth, now_ms};
 
 pub(in crate::api) async fn reserving_orders(
     State(state): State<ApiState>,
@@ -16,7 +16,10 @@ pub(in crate::api) async fn reserving_orders(
     auth::active_solver(&state, solver_id)?;
     let pending = state
         .proof_orders
-        .pending_reservations(solver_id)
+        .pending_reservations(
+            solver_id,
+            i64::try_from(now_ms()).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
+        )
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let offers = pending

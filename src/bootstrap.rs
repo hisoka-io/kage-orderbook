@@ -9,7 +9,7 @@ use kage_orderbook::{
     assignment::AssignmentIssuer,
     complaint::{ComplaintEvidenceCipher, ComplaintVerifier},
     config::{AppConfig, Network},
-    core::engine::start_orderbook_with_repository_and_policy,
+    core::engine::{AdmissionGate, start_orderbook_with_admission},
     preview::PreviewService,
     pricing::EmbeddedPricing,
     readiness::ServiceReadiness,
@@ -51,12 +51,6 @@ pub async fn run(network_argument: Option<String>) -> Result<(), Box<dyn std::er
     repository.bind_network(network).await?;
     let proof_orders = repository.proof_orders();
     let previews = repository.previews();
-    let orderbook = start_orderbook_with_repository_and_policy(
-        repository,
-        config.runtime.command_capacity,
-        config.proof_orders.clone(),
-    )
-    .await?;
 
     let indexer = RegistryIndexer::init(RegistryConfig {
         confirmations: chain.confirmations,
@@ -64,6 +58,15 @@ pub async fn run(network_argument: Option<String>) -> Result<(), Box<dyn std::er
     })
     .await?;
     let registry = SolverRegistry::chain(indexer);
+    let sessions = SolverSessions::new(domain(network, chain.chain_id));
+    let admission = AdmissionGate::from_config(sessions.clone(), registry.clone(), &config);
+    let orderbook = start_orderbook_with_admission(
+        repository,
+        config.runtime.command_capacity,
+        config.proof_orders.clone(),
+        admission,
+    )
+    .await?;
     let readiness = ServiceReadiness::new();
     readiness.set_chain(true);
     readiness.monitor_embedded_pricing(pricing.clone(), Duration::from_millis(250));
@@ -75,7 +78,6 @@ pub async fn run(network_argument: Option<String>) -> Result<(), Box<dyn std::er
         "proof assignment signing enabled signer={}",
         assignment_issuer.signer_address()
     );
-    let sessions = SolverSessions::new(domain(network, chain.chain_id));
     let preview = PreviewService::new(
         pricing,
         sessions.clone(),

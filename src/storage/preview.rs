@@ -226,13 +226,21 @@ impl PreviewRepository {
     }
 
     pub async fn cleanup(&self, now_ms: i64) -> Result<u64, RepositoryError> {
-        Ok(
-            sqlx::query("DELETE FROM proof_order_previews WHERE erase_after_ms <= ?")
-                .bind(now_ms)
-                .execute(&self.pool)
-                .await?
-                .rows_affected(),
+        Ok(sqlx::query(
+            "DELETE FROM proof_order_previews
+             WHERE erase_after_ms <= ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM proof_orders p
+                   WHERE p.preview_id = proof_order_previews.preview_id
+                     AND p.state IN ('submitted', 'reservation_pending', 'assigned')
+                     AND p.proof_expires_at_ms > ?
+               )",
         )
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 }
 

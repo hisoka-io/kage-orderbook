@@ -23,6 +23,7 @@ pub(in crate::core::engine) enum Request {
     AssignAndDiscloseProofOrder {
         order_id: OrderId,
         solver_id: Address,
+        session_token: Option<String>,
         reservation_ack: ReservationAck,
         ticket: Box<AssignmentTicket>,
         reply: oneshot::Sender<Result<bool, ServiceError>>,
@@ -72,6 +73,10 @@ pub struct OrderbookHandle {
 #[derive(Debug)]
 pub enum ServiceError {
     Closed,
+    RouteCapacityChanged,
+    AdmissionUnavailable,
+    ProofDeadlineChanged,
+    PreviewExpired,
     Order(OrderError),
     Repository(RepositoryError),
 }
@@ -81,7 +86,7 @@ impl OrderbookHandle {
         !self.requests.is_closed()
     }
 
-    pub async fn create_proof_order(
+    pub(crate) async fn create_proof_order(
         &self,
         input: NewProofOrder,
     ) -> Result<CreateOrderOutcome, ServiceError> {
@@ -96,10 +101,11 @@ impl OrderbookHandle {
         result.await.map_err(|_| ServiceError::Closed)?
     }
 
-    pub async fn assign_and_disclose_proof_order(
+    pub(crate) async fn assign_and_disclose_proof_order(
         &self,
         order_id: OrderId,
         solver_id: Address,
+        session_token: Option<String>,
         reservation_ack: ReservationAck,
         ticket: AssignmentTicket,
     ) -> Result<bool, ServiceError> {
@@ -108,6 +114,7 @@ impl OrderbookHandle {
             .send(Request::AssignAndDiscloseProofOrder {
                 order_id,
                 solver_id,
+                session_token,
                 reservation_ack,
                 ticket: Box::new(ticket),
                 reply,
