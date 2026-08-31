@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use axum::{
     extract::{
@@ -11,11 +11,8 @@ use axum::{
 use serde::Serialize;
 
 use super::{ApiState, UserEventClientMessage, UserEventServerMessage, auth};
-use crate::{
-    config::ApiSettings,
-    core::{engine::OrderbookHandle, events::OrderEvent},
-    order::SolverId,
-};
+use crate::{config::ApiSettings, core::events::OrderEvent, order::SolverId};
+use tokio::time::Instant;
 
 pub(super) async fn user_events_ws(
     ws: WebSocketUpgrade,
@@ -24,10 +21,13 @@ pub(super) async fn user_events_ws(
 ) -> Result<impl IntoResponse, StatusCode> {
     ensure_allowed_origin(&state.api, &headers)?;
     let events = state.orderbook.subscribe();
+    let api = state.api.clone();
+    let max_message_bytes = api.websocket_max_message_bytes;
+    let proof_orders = state.proof_orders;
     Ok(ws
-        .max_message_size(state.api.websocket_max_message_bytes)
-        .max_frame_size(state.api.websocket_max_message_bytes)
-        .on_upgrade(move |socket| forward_user_events(socket, events, state.orderbook)))
+        .max_message_size(max_message_bytes)
+        .max_frame_size(max_message_bytes)
+        .on_upgrade(move |socket| forward_user_events(socket, events, proof_orders, api)))
 }
 
 pub(super) async fn solver_events_ws(
@@ -36,25 +36,29 @@ pub(super) async fn solver_events_ws(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
     ensure_allowed_origin(&state.api, &headers)?;
-    let solver_id = auth::authenticated_solver(&state, &headers)?;
+    let session_token = auth::bearer_token(&headers)?;
+    let session = state
+        .sessions
+        .resolve_session(&session_token, super::now_ms())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let solver_id = session.solver_id;
     auth::active_solver(&state, solver_id)?;
     let events = state.orderbook.subscribe();
     let readiness = state.readiness.clone();
+    let max_message_bytes = state.api.websocket_max_message_bytes;
+    let stream = SolverStream {
+        solver_id,
+        session_token,
+        session_expires_at_ms: session.expires_at_ms,
+        state,
+    };
     Ok(ws
-        .max_message_size(state.api.websocket_max_message_bytes)
-        .max_frame_size(state.api.websocket_max_message_bytes)
+        .max_message_size(max_message_bytes)
+        .max_frame_size(max_message_bytes)
         .on_upgrade(move |socket| async move {
             let connection = readiness.solver_connection();
             tracing::debug!(target: "orderbook", %solver_id, "solver connected");
-            forward_service_events(
-                socket,
-                events,
-                SolverStream {
-                    solver_id,
-                    orderbook: state.orderbook,
-                },
-            )
-            .await;
+            forward_service_events(socket, events, stream).await;
             drop(connection);
             tracing::debug!(target: "orderbook", %solver_id, "solver disconnected");
         }))
@@ -78,9 +82,16 @@ fn ensure_allowed_origin(api: &ApiSettings, headers: &HeaderMap) -> Result<(), S
 async fn forward_user_events(
     mut socket: WebSocket,
     mut events: tokio::sync::broadcast::Receiver<OrderEvent>,
-    orderbook: OrderbookHandle,
+    proof_orders: crate::storage::ProofOrderRepository,
+    api: ApiSettings,
 ) {
     let mut subscriptions = HashSet::new();
+    let mut messages = MessageBudget::new();
+    let mut last_seen = Instant::now();
+    let mut heartbeat =
+        tokio::time::interval(Duration::from_millis(api.websocket_heartbeat_interval_ms));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
 
     loop {
         tokio::select! {
@@ -88,21 +99,37 @@ async fn forward_user_events(
                 let Some(Ok(message)) = message else {
                     return;
                 };
-                let Message::Text(text) = message else {
-                    if matches!(message, Message::Close(_)) {
-                        return;
+                let now = Instant::now();
+                last_seen = now;
+                if !messages.allow(
+                    now,
+                    Duration::from_millis(api.websocket_message_window_ms),
+                    api.websocket_message_burst,
+                ) {
+                    close(&mut socket).await;
+                    return;
+                }
+                let text = match message {
+                    Message::Text(text) => text,
+                    Message::Ping(payload) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            return;
+                        }
+                        continue;
                     }
-                    continue;
+                    Message::Pong(_) => continue,
+                    Message::Close(_) => return,
+                    _ => continue,
                 };
                 let Ok(UserEventClientMessage::Subscribe {
                     order_id,
-                    order_commitment,
+                    access_token,
                 }) = serde_json::from_str(&text) else {
                     continue;
                 };
 
-                let authorized = match orderbook
-                    .get_order_by_commitment(order_id, order_commitment)
+                let authorized = match proof_orders
+                    .authenticated_snapshot(order_id, auth::access_token_hash(access_token))
                     .await
                 {
                     Ok(Some(_)) => true,
@@ -110,12 +137,29 @@ async fn forward_user_events(
                     Err(_) => return,
                 };
                 let response = if authorized {
+                    if !subscriptions.contains(&order_id)
+                        && subscriptions.len() >= api.websocket_max_subscriptions
+                    {
+                        close(&mut socket).await;
+                        return;
+                    }
                     subscriptions.insert(order_id);
                     UserEventServerMessage::Subscribed { order_id }
                 } else {
                     UserEventServerMessage::Rejected { order_id }
                 };
                 if send_json(&mut socket, &response).await.is_err() {
+                    return;
+                }
+            }
+            _ = heartbeat.tick() => {
+                if last_seen.elapsed()
+                    >= Duration::from_millis(api.websocket_idle_timeout_ms)
+                {
+                    close(&mut socket).await;
+                    return;
+                }
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
                     return;
                 }
             }
@@ -139,7 +183,9 @@ async fn forward_user_events(
 
 struct SolverStream {
     solver_id: SolverId,
-    orderbook: OrderbookHandle,
+    session_token: String,
+    session_expires_at_ms: u64,
+    state: ApiState,
 }
 
 async fn forward_service_events(
@@ -147,17 +193,73 @@ async fn forward_service_events(
     mut events: tokio::sync::broadcast::Receiver<OrderEvent>,
     stream: SolverStream,
 ) {
+    let api = &stream.state.api;
+    let mut messages = MessageBudget::new();
+    let mut last_seen = Instant::now();
+    let mut heartbeat =
+        tokio::time::interval(Duration::from_millis(api.websocket_heartbeat_interval_ms));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    let mut auth_recheck = tokio::time::interval(Duration::from_millis(api.solver_auth_recheck_ms));
+    auth_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    auth_recheck.tick().await;
+    let session_expiry = tokio::time::sleep(Duration::from_millis(
+        stream.session_expires_at_ms.saturating_sub(super::now_ms()),
+    ));
+    tokio::pin!(session_expiry);
+
     loop {
         tokio::select! {
-            message = socket.recv() => match message {
-                Some(Ok(Message::Ping(payload))) => {
-                    if socket.send(Message::Pong(payload)).await.is_err() {
-                        return;
-                    }
+            message = socket.recv() => {
+                let Some(Ok(message)) = message else {
+                    return;
+                };
+                let now = Instant::now();
+                last_seen = now;
+                if !messages.allow(
+                    now,
+                    Duration::from_millis(api.websocket_message_window_ms),
+                    api.websocket_message_burst,
+                ) {
+                    close(&mut socket).await;
+                    return;
                 }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
-                Some(Ok(_)) => {}
-            },
+                match message {
+                    Message::Ping(payload) => {
+                        let Ok(()) = socket.send(Message::Pong(payload)).await else {
+                            return;
+                        };
+                    }
+                    Message::Close(_) => return,
+                    _ => {}
+                }
+            }
+            _ = &mut session_expiry => {
+                close(&mut socket).await;
+                return;
+            }
+            _ = auth_recheck.tick() => {
+                let current = stream
+                    .state
+                    .sessions
+                    .resolve(&stream.session_token, super::now_ms())
+                    == Some(stream.solver_id);
+                if !current || auth::active_solver(&stream.state, stream.solver_id).is_err() {
+                    close(&mut socket).await;
+                    return;
+                }
+            }
+            _ = heartbeat.tick() => {
+                if last_seen.elapsed()
+                    >= Duration::from_millis(api.websocket_idle_timeout_ms)
+                {
+                    close(&mut socket).await;
+                    return;
+                }
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return;
+                }
+            }
             event = events.recv() => {
                 let event = match event {
                     Ok(event) => event,
@@ -165,18 +267,22 @@ async fn forward_service_events(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 };
 
-                let SolverStream {
-                    solver_id,
-                    orderbook,
-                } = &stream;
+                let solver_id = stream.solver_id;
                 let relevant = match &event {
-                    OrderEvent::SolverReservationRequested { .. } => true,
-                    OrderEvent::OrderExpired { order_id } => orderbook
+                    OrderEvent::SolverReservationRequested { order_id, .. } => stream
+                        .state
+                        .proof_orders
+                        .is_target(*order_id, solver_id)
+                        .await
+                        .unwrap_or(false),
+                    OrderEvent::OrderExpired { order_id } => stream
+                        .state
+                        .orderbook
                         .get_order(*order_id)
                         .await
                         .ok()
                         .flatten()
-                        .is_some_and(|order| order.solver == Some(*solver_id)),
+                        .is_some_and(|order| order.solver == Some(solver_id)),
                     _ => false,
                 };
                 if relevant && send_json(&mut socket, &event).await.is_err() {
@@ -185,6 +291,36 @@ async fn forward_service_events(
             }
         }
     }
+}
+
+struct MessageBudget {
+    window_started: Instant,
+    used: u32,
+}
+
+impl MessageBudget {
+    fn new() -> Self {
+        Self {
+            window_started: Instant::now(),
+            used: 0,
+        }
+    }
+
+    fn allow(&mut self, now: Instant, window: Duration, burst: u32) -> bool {
+        if now.duration_since(self.window_started) >= window {
+            self.window_started = now;
+            self.used = 0;
+        }
+        if self.used >= burst {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
+}
+
+async fn close(socket: &mut WebSocket) {
+    let _ = socket.send(Message::Close(None)).await;
 }
 
 async fn send_json(socket: &mut WebSocket, value: &impl Serialize) -> Result<(), ()> {
@@ -222,5 +358,15 @@ mod tests {
             ensure_allowed_origin(&api, &headers(Some("https://attacker.example")),),
             Err(StatusCode::FORBIDDEN)
         );
+    }
+
+    #[test]
+    fn websocket_message_budget_is_fixed_window_and_fail_closed() {
+        let mut budget = MessageBudget::new();
+        let start = budget.window_started;
+        assert!(budget.allow(start, Duration::from_secs(1), 2));
+        assert!(budget.allow(start, Duration::from_secs(1), 2));
+        assert!(!budget.allow(start, Duration::from_secs(1), 2));
+        assert!(budget.allow(start + Duration::from_secs(1), Duration::from_secs(1), 2));
     }
 }

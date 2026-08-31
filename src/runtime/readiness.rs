@@ -87,6 +87,25 @@ impl ServiceReadiness {
         })
     }
 
+    pub fn monitor_embedded_pricing(
+        &self,
+        pricing: crate::pricing::EmbeddedPricing,
+        interval: Duration,
+    ) -> JoinHandle<()> {
+        use kage_price_estimate::oracle::PricingStatus as EmbeddedStatus;
+
+        self.set_pricing(matches!(pricing.status(), EmbeddedStatus::Ready));
+        let readiness = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                readiness.set_pricing(matches!(pricing.status(), EmbeddedStatus::Ready));
+            }
+        })
+    }
+
     pub fn monitor_registry(&self, registry: SolverRegistry, interval: Duration) -> JoinHandle<()> {
         self.set_registry(registry.health().is_ok());
         let readiness = self.clone();
@@ -121,6 +140,7 @@ impl ServiceReadiness {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn always_ready() -> Self {
         let readiness = Self::new();
         readiness.state.pricing.store(true, Ordering::Release);

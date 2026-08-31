@@ -1,13 +1,16 @@
 pub mod api;
-pub mod assignment;
+pub mod complaint;
 pub mod config;
 pub mod core;
-pub mod logging;
+mod crypto;
 pub mod pricing;
-pub mod readiness;
+mod runtime;
+mod service;
 pub mod solver;
 pub mod storage;
 
-// Keep the established public paths while organizing their implementations by domain.
 pub use core::order;
+pub use crypto::{assignment, proof_domain};
+pub use runtime::{logging, readiness};
+pub use service::preview;
 pub use solver::{registry, session};

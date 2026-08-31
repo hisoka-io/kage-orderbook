@@ -15,13 +15,4 @@ lint:
 test:
     cargo test --locked --all-targets
 
-submit-priced-order:
-    cargo run --quiet --bin submit_priced_order
-
-wrong-quote:
-    cargo run --quiet --bin submit_priced_order -- --wrong-quote
-
-test-intent-proof:
-    bash ./scripts/test-intent-proof.sh
-
 ci: fmt-check lint test

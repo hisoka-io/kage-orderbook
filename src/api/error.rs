@@ -3,7 +3,6 @@ use axum::{Json, http::StatusCode};
 use super::ApiErrorResponse;
 use crate::{
     core::engine::{OrderError, ServiceError},
-    pricing::PriceValidationError,
     storage::RepositoryError,
 };
 
@@ -11,7 +10,7 @@ pub(super) type ApiError = (StatusCode, Json<ApiErrorResponse>);
 
 pub(super) fn status_for_error(error: ServiceError) -> StatusCode {
     match error {
-        ServiceError::Repository(RepositoryError::DuplicateOrderCommitment) => StatusCode::CONFLICT,
+        ServiceError::Repository(RepositoryError::IdempotencyConflict) => StatusCode::CONFLICT,
         ServiceError::Closed | ServiceError::Repository(_) => StatusCode::SERVICE_UNAVAILABLE,
         ServiceError::Order(OrderError::InvalidTerms | OrderError::InvalidPayload) => {
             StatusCode::UNPROCESSABLE_ENTITY
@@ -20,16 +19,6 @@ pub(super) fn status_for_error(error: ServiceError) -> StatusCode {
         ServiceError::Order(OrderError::AlreadyExists | OrderError::InvalidState) => {
             StatusCode::CONFLICT
         }
-    }
-}
-
-pub(super) fn status_for_price_validation(error: &PriceValidationError) -> StatusCode {
-    match error {
-        PriceValidationError::Pricing(_) => StatusCode::SERVICE_UNAVAILABLE,
-        PriceValidationError::UnsupportedMarket
-        | PriceValidationError::Arithmetic
-        | PriceValidationError::DeviationExceeded { .. }
-        | PriceValidationError::OrderValueExceeded { .. } => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 

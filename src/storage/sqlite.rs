@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     config::Network,
-    order::{Order, OrderCommitment, OrderId, OrderState},
+    order::{Order, OrderId, ProofOrderState},
 };
 
 #[derive(Debug, Error)]
@@ -23,8 +23,8 @@ pub enum RepositoryError {
     Migration(#[from] sqlx::migrate::MigrateError),
     #[error("order version conflict")]
     VersionConflict,
-    #[error("order commitment already exists")]
-    DuplicateOrderCommitment,
+    #[error("order id or access token is already bound to different immutable proof-order data")]
+    IdempotencyConflict,
     #[error("invalid stored {field}: {value}")]
     InvalidData { field: &'static str, value: String },
     #[error("database belongs to {found}, refusing to open it as {expected}")]
@@ -39,9 +39,17 @@ pub(crate) struct PersistedOrder {
 #[derive(Clone)]
 pub struct OrderRepository {
     pool: SqlitePool,
+    retention_metrics: super::RetentionMetrics,
 }
 
 impl OrderRepository {
+    pub fn previews(&self) -> super::PreviewRepository {
+        super::PreviewRepository::new(self.pool.clone())
+    }
+
+    pub fn proof_orders(&self) -> super::ProofOrderRepository {
+        super::ProofOrderRepository::new(self.pool.clone(), self.retention_metrics.clone())
+    }
     pub async fn connect(database_url: &str) -> Result<Self, RepositoryError> {
         Self::connect_with_options(database_url, Duration::from_secs(5), 1).await
     }
@@ -61,7 +69,10 @@ impl OrderRepository {
             .max_connections(max_connections)
             .connect_with(options)
             .await?;
-        let repository = Self { pool };
+        let repository = Self {
+            pool,
+            retention_metrics: super::RetentionMetrics::default(),
+        };
         repository.migrate().await?;
         Ok(repository)
     }
@@ -92,60 +103,23 @@ impl OrderRepository {
         Ok(())
     }
 
-    pub(crate) async fn insert_order(
-        &self,
-        order: &Order,
-        order_commitment: OrderCommitment,
-        created_at_ms: i64,
-    ) -> Result<(), RepositoryError> {
-        let result = sqlx::query(
-            "INSERT INTO orders (
-                id, chain_id, state, version, token_in, token_out, amount_in, amount_out,
-                solver_noise_public_key, created_at_ms, updated_at_ms,
-                expires_at_ms, order_commitment, solver_address
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(order.id.to_string())
-        .bind(u64_to_i64("chain_id", order.chain_id)?)
-        .bind(state_name(order.state))
-        .bind(version_to_i64(order.version)?)
-        .bind(order.token_in.as_slice())
-        .bind(order.token_out.as_slice())
-        .bind(order.amount_in.to_string())
-        .bind(order.amount_out.to_string())
-        .bind(order.solver_noise_public_key.as_deref())
-        .bind(created_at_ms)
-        .bind(created_at_ms)
-        .bind(order.expires_at_ms)
-        .bind(order_commitment.as_slice())
-        .bind(order.solver.map(|address| address.to_vec()))
-        .execute(&self.pool)
-        .await;
-
-        match result {
-            Ok(_) => {}
-            Err(sqlx::Error::Database(error))
-                if error.is_unique_violation()
-                    && error.message().contains("orders.order_commitment") =>
-            {
-                return Err(RepositoryError::DuplicateOrderCommitment);
-            }
-            Err(error) => return Err(RepositoryError::Database(error)),
-        }
-        Ok(())
-    }
-
     pub(crate) async fn persist_transition(
         &self,
         order: &Order,
         expected_version: u64,
         timestamp_ms: i64,
     ) -> Result<(), RepositoryError> {
+        if order.state == ProofOrderState::Expired {
+            return self
+                .proof_orders()
+                .expire_with_core_transition(order, expected_version, timestamp_ms)
+                .await;
+        }
         let result = sqlx::query(
             "UPDATE orders SET
                 state = ?, version = ?, token_in = ?, token_out = ?,
                 amount_in = ?, amount_out = ?, solver_address = ?,
-                solver_noise_public_key = ?, updated_at_ms = ?
+                updated_at_ms = ?
              WHERE id = ? AND version = ?",
         )
         .bind(state_name(order.state))
@@ -155,7 +129,6 @@ impl OrderRepository {
         .bind(order.amount_in.to_string())
         .bind(order.amount_out.to_string())
         .bind(order.solver.map(|address| address.to_vec()))
-        .bind(order.solver_noise_public_key.as_deref())
         .bind(timestamp_ms)
         .bind(order.id.to_string())
         .bind(version_to_i64(expected_version)?)
@@ -180,44 +153,12 @@ impl OrderRepository {
         row.map(decode_order).transpose()
     }
 
-    pub(crate) async fn find_order_by_commitment(
-        &self,
-        order_commitment: OrderCommitment,
-    ) -> Result<Option<PersistedOrder>, RepositoryError> {
-        let row = sqlx::query(
-            "SELECT * FROM orders
-             WHERE order_commitment = ?",
-        )
-        .bind(order_commitment.as_slice())
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(decode_order).transpose()
-    }
-
-    pub(crate) async fn get_order_by_commitment(
-        &self,
-        order_id: OrderId,
-        order_commitment: OrderCommitment,
-    ) -> Result<Option<PersistedOrder>, RepositoryError> {
-        let row = sqlx::query(
-            "SELECT * FROM orders
-             WHERE id = ? AND order_commitment = ?",
-        )
-        .bind(order_id.to_string())
-        .bind(order_commitment.as_slice())
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(decode_order).transpose()
-    }
-
     pub(crate) async fn load_non_terminal_orders(
         &self,
     ) -> Result<Vec<PersistedOrder>, RepositoryError> {
         let rows = sqlx::query(
             "SELECT * FROM orders
-             WHERE state IN (
-                'created', 'validated', 'reserving', 'assigned', 'awaiting_user_proof'
-             )
+             WHERE state NOT IN ('expired', 'closed')
              ORDER BY created_at_ms, id",
         )
         .fetch_all(&self.pool)
@@ -240,7 +181,6 @@ fn decode_order(row: SqliteRow) -> Result<PersistedOrder, RepositoryError> {
         .try_get::<Option<Vec<u8>>, _>("solver_address")?
         .map(|value| parse_fixed::<20>("solver_address", value).map(Address::from))
         .transpose()?;
-    let noise_public_key = row.try_get("solver_noise_public_key")?;
     let expires_at_ms = row.try_get("expires_at_ms")?;
     Ok(PersistedOrder {
         order: Order {
@@ -254,30 +194,35 @@ fn decode_order(row: SqliteRow) -> Result<PersistedOrder, RepositoryError> {
             amount_out,
             expires_at_ms,
             solver,
-            solver_noise_public_key: noise_public_key,
         },
     })
 }
 
-fn state_name(state: OrderState) -> &'static str {
+fn state_name(state: ProofOrderState) -> &'static str {
     match state {
-        OrderState::Created => "created",
-        OrderState::Validated => "validated",
-        OrderState::Reserving => "reserving",
-        OrderState::Assigned => "assigned",
-        OrderState::AwaitingUserProof => "awaiting_user_proof",
-        OrderState::Expired => "expired",
+        ProofOrderState::Submitted => "submitted",
+        ProofOrderState::ReservationPending => "reservation_pending",
+        ProofOrderState::Assigned => "assigned",
+        ProofOrderState::ProofDelivered => "proof_delivered",
+        ProofOrderState::ProofAccepted => "proof_accepted",
+        ProofOrderState::ProofRejected => "proof_rejected",
+        ProofOrderState::Expired => "expired",
+        ProofOrderState::ComplaintVerified => "complaint_verified",
+        ProofOrderState::Closed => "closed",
     }
 }
 
-fn parse_state(value: &str) -> Result<OrderState, RepositoryError> {
+fn parse_state(value: &str) -> Result<ProofOrderState, RepositoryError> {
     match value {
-        "created" => Ok(OrderState::Created),
-        "validated" => Ok(OrderState::Validated),
-        "reserving" => Ok(OrderState::Reserving),
-        "assigned" => Ok(OrderState::Assigned),
-        "awaiting_user_proof" => Ok(OrderState::AwaitingUserProof),
-        "expired" => Ok(OrderState::Expired),
+        "submitted" => Ok(ProofOrderState::Submitted),
+        "reservation_pending" => Ok(ProofOrderState::ReservationPending),
+        "assigned" => Ok(ProofOrderState::Assigned),
+        "proof_delivered" => Ok(ProofOrderState::ProofDelivered),
+        "proof_accepted" => Ok(ProofOrderState::ProofAccepted),
+        "proof_rejected" => Ok(ProofOrderState::ProofRejected),
+        "expired" => Ok(ProofOrderState::Expired),
+        "complaint_verified" => Ok(ProofOrderState::ComplaintVerified),
+        "closed" => Ok(ProofOrderState::Closed),
         _ => Err(invalid("state", value)),
     }
 }
@@ -320,9 +265,6 @@ fn invalid(field: &'static str, value: impl Into<String>) -> RepositoryError {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{Address, B256, U256};
-    use uuid::Uuid;
-
     use super::*;
 
     #[tokio::test]
@@ -338,85 +280,19 @@ mod tests {
         ));
     }
 
-    fn order(state: OrderState, version: u64) -> Order {
-        let id = Uuid::new_v4();
-        Order {
-            id,
-            chain_id: 31_337,
-            state,
-            version,
-            token_in: Address::repeat_byte(1),
-            token_out: Address::repeat_byte(2),
-            amount_in: U256::from(100),
-            amount_out: U256::from(200),
-            expires_at_ms: Some(5000),
-            solver: Some(Address::repeat_byte(3)),
-            solver_noise_public_key: Some(vec![7; 32]),
-        }
-    }
-
-    async fn repository() -> OrderRepository {
-        OrderRepository::connect("sqlite::memory:").await.unwrap()
-    }
-
     #[tokio::test]
-    async fn stores_and_loads_an_order() {
-        let repository = repository().await;
-        let order = order(OrderState::AwaitingUserProof, 5);
-        let commitment = B256::repeat_byte(1);
-        repository
-            .insert_order(&order, commitment, 1000)
+    async fn initial_schema_creates_only_encrypted_complaint_columns() {
+        let repository = OrderRepository::connect("sqlite::memory:").await.unwrap();
+        let columns = sqlx::query("PRAGMA table_info(proof_order_complaints)")
+            .fetch_all(&repository.pool)
             .await
-            .unwrap();
-
-        let stored = repository.get_order(order.id).await.unwrap().unwrap();
-        assert_eq!(stored.order.id, order.id);
-        assert_eq!(stored.order.chain_id, order.chain_id);
-        assert_eq!(stored.order.state, OrderState::AwaitingUserProof);
-        assert_eq!(stored.order.version, 5);
-        assert_eq!(stored.order.amount_in, order.amount_in);
-        assert_eq!(stored.order.solver, order.solver);
-    }
-
-    #[tokio::test]
-    async fn rejects_a_stale_order_update() {
-        let repository = repository().await;
-        let mut order = order(OrderState::Reserving, 3);
-        repository
-            .insert_order(&order, B256::repeat_byte(1), 1000)
-            .await
-            .unwrap();
-
-        order.state = OrderState::AwaitingUserProof;
-        order.version = 4;
-        repository
-            .persist_transition(&order, 3, 2000)
-            .await
-            .unwrap();
-
-        let error = repository
-            .persist_transition(&order, 3, 3000)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, RepositoryError::VersionConflict));
-    }
-
-    #[tokio::test]
-    async fn loads_only_non_terminal_orders() {
-        let repository = repository().await;
-        let active = order(OrderState::AwaitingUserProof, 5);
-        let expired = order(OrderState::Expired, 6);
-        repository
-            .insert_order(&active, B256::repeat_byte(1), 1000)
-            .await
-            .unwrap();
-        repository
-            .insert_order(&expired, B256::repeat_byte(2), 1001)
-            .await
-            .unwrap();
-
-        let orders = repository.load_non_terminal_orders().await.unwrap();
-        assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].order.id, active.id);
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        assert!(columns.iter().any(|column| column == "opening_ciphertext"));
+        assert!(columns.iter().any(|column| column == "legal_hold"));
+        assert!(!columns.iter().any(|column| column == "nullifier"));
+        assert!(!columns.iter().any(|column| column == "salt"));
     }
 }

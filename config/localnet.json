@@ -1,19 +1,69 @@
 {
   "api": {
     "request_timeout_ms": 10000,
-    "max_body_bytes": 65536,
+    "max_body_bytes": 8388608,
+    "max_order_request_bytes": 8388608,
+    "max_ciphertext_bytes": 7340032,
     "websocket_max_message_bytes": 16384,
+    "websocket_max_subscriptions": 32,
+    "websocket_message_window_ms": 1000,
+    "websocket_message_burst": 20,
+    "websocket_heartbeat_interval_ms": 30000,
+    "websocket_idle_timeout_ms": 90000,
+    "solver_auth_recheck_ms": 5000,
     "rate_limit_replenish_ms": 100,
     "rate_limit_burst": 100,
     "cors_max_age_seconds": 600,
     "allowed_origins": []
   },
-  "order": {
-    "default_ttl_seconds": 60,
-    "min_ttl_seconds": 5,
-    "max_ttl_seconds": 300,
-    "max_order_usd_cents": 25000
+  "allowed_solvers": [
+    "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+    "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+  ],
+  "proof_orders": {
+    "proof_lifetime_seconds": 30,
+    "minimum_remaining_seconds": 15,
+    "preview_lifetime_seconds": 15,
+    "reservation_attempt_timeout_ms": 2000,
+    "max_recipients": 8,
+    "preview_cleanup_grace_seconds": 300,
+    "ciphertext_cleanup_grace_seconds": 300,
+    "complaint_window_seconds": 2592000,
+    "evidence_retention_seconds": 2592000,
+    "resolved_complaint_retention_seconds": 2592000,
+    "complaint_finality": {
+      "mode": "confirmations",
+      "count": 1
+    }
   },
+  "fee_categories": [
+    {
+      "id": "major-50",
+      "fee_bps": 50,
+      "markets": [
+        "WETH/USDC",
+        "USDC/WETH",
+        "WETH/USDT",
+        "USDT/WETH"
+      ],
+      "solver_ids": [
+        "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+        "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+      ]
+    },
+    {
+      "id": "stable-15",
+      "fee_bps": 15,
+      "markets": [
+        "USDC/USDT",
+        "USDT/USDC"
+      ],
+      "solver_ids": [
+        "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+        "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+      ]
+    }
+  ],
   "database": {
     "max_connections": 1,
     "busy_timeout_ms": 5000
@@ -26,66 +76,101 @@
     "reconnect_delay_ms": 1000,
     "idle_timeout_ms": 30000
   },
+  "pricing_oracle": {
+    "rpc_urls": [
+      "https://ethereum-rpc.publicnode.com",
+      "https://eth.drpc.org"
+    ],
+    "tick_secs": 1,
+    "fast_staleness_secs": 15,
+    "max_spread_bps": 150,
+    "assets": {
+      "ETH": {
+        "coinbase_product": "ETH-USD",
+        "kraken_pair": "ETHUSD",
+        "chainlink_feed": "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419",
+        "chainlink_heartbeat_secs": 3900
+      },
+      "USDC": {
+        "kraken_pair": "USDCUSD",
+        "chainlink_feed": "0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6",
+        "chainlink_heartbeat_secs": 87300
+      },
+      "USDT": {
+        "coinbase_product": "USDT-USD",
+        "kraken_pair": "USDTUSD",
+        "chainlink_feed": "0x3E7d1eAB13ad0104d2750B8863b489D65364e32D",
+        "chainlink_heartbeat_secs": 87300
+      }
+    }
+  },
   "chains": [
     {
       "chain_id": 31337,
       "name": "local",
-      "registry": "0xa85233C63b9Ee964Add6F2cffe00Fd84eb32338f",
-      "registry_deploy_block": 100,
+      "darkpool": "0x3Aa5ebB10DC797CAC828524e59A333d0A371443c",
+      "registry": "0x7a2088a1bFc9d81c55368AE168C2C02570cB814F",
+      "registry_deploy_block": 27,
       "confirmations": 0,
       "tokens": [
         {
           "symbol": "WETH",
-          "address": "0x59b670e9fA9D0A427751Af201D676719a970857b",
+          "address": "0x322813Fd9A801c5507c9de605d63CEA4f2CE6c44",
           "decimals": 18,
           "pricing_asset": "ETH",
-          "max_price_deviation_bps": 50
+          "max_price_deviation_bps": 200
         },
         {
           "symbol": "USDC",
-          "address": "0x4ed7c70F96B99c776995fB64377f0d4aB3B0e1C1",
+          "address": "0xa85233C63b9Ee964Add6F2cffe00Fd84eb32338f",
           "decimals": 6,
           "pricing_asset": "USDC",
-          "max_price_deviation_bps": 20
+          "max_price_deviation_bps": 200
         },
         {
           "symbol": "USDT",
-          "address": "0x322813Fd9A801c5507c9de605d63CEA4f2CE6c44",
+          "address": "0x4A679253410272dd5232B3Ff7cF5dbB88f295319",
           "decimals": 6,
           "pricing_asset": "USDT",
-          "max_price_deviation_bps": 20
+          "max_price_deviation_bps": 200
         }
       ],
       "markets": [
         {
           "token_in": "WETH",
           "token_out": "USDC",
-          "max_price_deviation_bps": 20
+          "movement_allowance_bps": 15,
+          "max_price_deviation_bps": 100
         },
         {
           "token_in": "USDC",
           "token_out": "WETH",
-          "max_price_deviation_bps": 20
+          "movement_allowance_bps": 15,
+          "max_price_deviation_bps": 100
         },
         {
           "token_in": "USDT",
           "token_out": "USDC",
-          "max_price_deviation_bps": 20
+          "movement_allowance_bps": 5,
+          "max_price_deviation_bps": 30
         },
         {
           "token_in": "USDC",
           "token_out": "USDT",
-          "max_price_deviation_bps": 20
+          "movement_allowance_bps": 5,
+          "max_price_deviation_bps": 30
         },
         {
           "token_in": "WETH",
           "token_out": "USDT",
-          "max_price_deviation_bps": 20
+          "movement_allowance_bps": 15,
+          "max_price_deviation_bps": 100
         },
         {
           "token_in": "USDT",
           "token_out": "WETH",
-          "max_price_deviation_bps": 20
+          "movement_allowance_bps": 15,
+          "max_price_deviation_bps": 100
         }
       ]
     }

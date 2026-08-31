@@ -1,21 +1,23 @@
-use crate::order::{OrderCommitment, OrderId, SolverId, TradeTerms};
+use crate::order::{OrderId, SolverId, TradeTerms};
 
 pub enum Command {
-    CreateOrder {
+    SubmitProofOrder {
         order_id: OrderId,
-        order_commitment: OrderCommitment,
         terms: TradeTerms,
     },
 
     SolverReserved {
         order_id: OrderId,
         solver_id: SolverId,
-        noise_public_key: Vec<u8>,
     },
 
     SolverDeclined {
         order_id: OrderId,
         solver_id: SolverId,
+    },
+
+    RetryReservation {
+        order_id: OrderId,
     },
 
     ExpireOrder {
@@ -26,18 +28,20 @@ pub enum Command {
 impl Command {
     pub fn order_id(&self) -> OrderId {
         match self {
-            Command::CreateOrder { order_id, .. }
+            Command::SubmitProofOrder { order_id, .. }
             | Command::SolverReserved { order_id, .. }
             | Command::SolverDeclined { order_id, .. }
+            | Command::RetryReservation { order_id }
             | Command::ExpireOrder { order_id } => *order_id,
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
-            Command::CreateOrder { .. } => "CreateOrder",
+            Command::SubmitProofOrder { .. } => "SubmitProofOrder",
             Command::SolverReserved { .. } => "SolverReserved",
             Command::SolverDeclined { .. } => "SolverDeclined",
+            Command::RetryReservation { .. } => "RetryReservation",
             Command::ExpireOrder { .. } => "ExpireOrder",
         }
     }

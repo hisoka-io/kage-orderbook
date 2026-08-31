@@ -1,13 +1,13 @@
 mod cache;
 mod client;
-mod validator;
+mod embedded;
 
 use std::{sync::Arc, time::Duration};
 
 use tokio::sync::watch;
 
 pub use cache::{PricePoint, PricingReadError, PricingStatus};
-pub use validator::{PriceValidationError, PricingValidator};
+pub use embedded::EmbeddedPricing;
 
 use cache::PricingSnapshot;
 
