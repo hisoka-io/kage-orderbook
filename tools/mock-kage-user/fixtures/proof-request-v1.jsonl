@@ -1,1 +1,0 @@
-{"version":1,"type":"prove_swap_intent","request_id":"11111111-1111-4111-8111-111111111111","wallet_fixture":"default","order":{"order_id":"22222222-2222-4222-8222-222222222222","chain_id":31337,"token_in":"0x0101010101010101010101010101010101010101","token_out":"0x0202020202020202020202020202020202020202","amount_in":"60","amount_out":"50","expires_at_ms":2000000000000}}
