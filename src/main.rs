@@ -1,7 +1,6 @@
-mod core;
-mod guard;
-mod order;
+mod bootstrap;
 
-fn main() {
-    println!("kage-orderbook");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    bootstrap::run(std::env::args().nth(1)).await
 }

@@ -1,18 +1,18 @@
 default: ci
 
-run:
-    cargo run
+run network="localnet":
+    @cargo run --quiet -- {{network}}
 
 fmt:
     cargo fmt
 
+fmt-check:
+    cargo fmt --check
+
 lint:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --locked --all-targets -- -D warnings
 
 test:
-    cargo test
+    cargo test --locked --all-targets
 
-ci:
-    cargo fmt --check
-    cargo clippy --all-targets -- -D warnings
-    cargo test
+ci: fmt-check lint test
