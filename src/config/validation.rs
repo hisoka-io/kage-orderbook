@@ -75,9 +75,12 @@ impl AppConfig {
         if self.database.max_connections == 0 || self.database.busy_timeout_ms == 0 {
             return Err(invalid("database values must be greater than zero"));
         }
-        if self.runtime.command_capacity == 0 {
+        if self.runtime.command_capacity == 0
+            || self.runtime.shutdown_grace_ms == 0
+            || self.runtime.shutdown_grace_ms > 300_000
+        {
             return Err(invalid(
-                "runtime.command_capacity must be greater than zero",
+                "runtime.command_capacity must be greater than zero and shutdown_grace_ms must be between 1 and 300000",
             ));
         }
         if self.pricing.max_age_ms == 0

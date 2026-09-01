@@ -179,6 +179,8 @@ impl PreviewService {
         ) {
             let public = &route.route;
             if !solver_is_exposable(&self.allowed_solvers, &self.registry, public.solver_id)
+                || u64::from(self.policy.proof_lifetime_seconds)
+                    <= route.required_proof_lifetime_seconds
                 || public.key_expires_at_ms <= required_key_expiry_ms
                 || public.min_amount_in > request.amount_in
                 || request.amount_in > public.max_amount_in
@@ -190,7 +192,7 @@ impl PreviewService {
                 .active_workload(public.solver_id, now_i64)
                 .await
                 .map_err(|error| PreviewError::Storage(error.to_string()))?;
-            if workload < u64::from(route.max_in_flight) {
+            if workload < u64::from(route.max_jobs_total) {
                 let held_output = self
                     .proof_orders
                     .held_output_amount(
@@ -201,8 +203,8 @@ impl PreviewService {
                     )
                     .await
                     .map_err(|error| PreviewError::Storage(error.to_string()))?;
-                route.available_amount_out = route.available_amount_out.saturating_sub(held_output);
-                if route.available_amount_out > U256::ZERO {
+                route.amount_out_total = route.amount_out_total.saturating_sub(held_output);
+                if route.amount_out_total > U256::ZERO {
                     live_routes.push(route);
                 }
             }

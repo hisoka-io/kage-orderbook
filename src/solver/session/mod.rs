@@ -16,7 +16,7 @@ pub use types::{AuthError, CapabilityRoute, ChallengeResponse, SessionRequest, S
 
 const CHALLENGE_TTL_MS: u64 = 60_000;
 const SESSION_TTL_MS: u64 = 15 * 60_000;
-const CAPABILITY_TTL_MS: u64 = 60_000;
+const CAPABILITY_MAX_TTL_MS: u64 = 60_000;
 
 #[derive(Clone)]
 pub struct SolverSessions {

@@ -10,6 +10,7 @@ pub use kage_types::health::ReadinessSnapshot;
 use tokio::task::JoinHandle;
 
 use crate::{
+    Shutdown,
     core::engine::OrderbookHandle,
     pricing::{PricingHandle, PricingStatus},
     registry::SolverRegistry,
@@ -24,11 +25,21 @@ struct ReadinessState {
     chain: AtomicBool,
     reported: AtomicBool,
     announced_ready: AtomicBool,
+    draining: AtomicBool,
+    live: AtomicBool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ServiceReadiness {
     state: Arc<ReadinessState>,
+}
+
+impl Default for ServiceReadiness {
+    fn default() -> Self {
+        let state = Arc::new(ReadinessState::default());
+        state.live.store(true, Ordering::Release);
+        Self { state }
+    }
 }
 
 pub(crate) struct SolverConnection {
@@ -47,6 +58,9 @@ impl ServiceReadiness {
         let solver = self.state.solvers.load(Ordering::Acquire) > 0;
         let chain = self.state.chain.load(Ordering::Acquire);
         let mut missing = Vec::new();
+        if self.state.draining.load(Ordering::Acquire) {
+            missing.push("shutdown".to_owned());
+        }
         if !pricing {
             missing.push("pricing".to_owned());
         }
@@ -75,14 +89,27 @@ impl ServiceReadiness {
     }
 
     pub fn monitor_pricing(&self, pricing: PricingHandle, interval: Duration) -> JoinHandle<()> {
+        self.monitor_pricing_until_shutdown(pricing, interval, Shutdown::new())
+    }
+
+    pub fn monitor_pricing_until_shutdown(
+        &self,
+        pricing: PricingHandle,
+        interval: Duration,
+        shutdown: Shutdown,
+    ) -> JoinHandle<()> {
         self.set_pricing(pricing.status() == PricingStatus::Ready);
         let readiness = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
-                readiness.set_pricing(pricing.status() == PricingStatus::Ready);
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = interval.tick() => {
+                        readiness.set_pricing(pricing.status() == PricingStatus::Ready);
+                    }
+                }
             }
         })
     }
@@ -92,6 +119,15 @@ impl ServiceReadiness {
         pricing: crate::pricing::EmbeddedPricing,
         interval: Duration,
     ) -> JoinHandle<()> {
+        self.monitor_embedded_pricing_until_shutdown(pricing, interval, Shutdown::new())
+    }
+
+    pub fn monitor_embedded_pricing_until_shutdown(
+        &self,
+        pricing: crate::pricing::EmbeddedPricing,
+        interval: Duration,
+        shutdown: Shutdown,
+    ) -> JoinHandle<()> {
         use kage_price_estimate::oracle::PricingStatus as EmbeddedStatus;
 
         self.set_pricing(matches!(pricing.status(), EmbeddedStatus::Ready));
@@ -100,34 +136,64 @@ impl ServiceReadiness {
             let mut interval = tokio::time::interval(interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
-                readiness.set_pricing(matches!(pricing.status(), EmbeddedStatus::Ready));
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = interval.tick() => {
+                        readiness.set_pricing(matches!(pricing.status(), EmbeddedStatus::Ready));
+                    }
+                }
             }
         })
     }
 
     pub fn monitor_registry(&self, registry: SolverRegistry, interval: Duration) -> JoinHandle<()> {
+        self.monitor_registry_until_shutdown(registry, interval, Shutdown::new())
+    }
+
+    pub fn monitor_registry_until_shutdown(
+        &self,
+        registry: SolverRegistry,
+        interval: Duration,
+        shutdown: Shutdown,
+    ) -> JoinHandle<()> {
         self.set_registry(registry.health().is_ok());
         let readiness = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
-                readiness.set_registry(registry.health().is_ok());
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = interval.tick() => {
+                        readiness.set_registry(registry.health().is_ok());
+                    }
+                }
             }
         })
     }
 
     pub fn monitor_engine(&self, orderbook: OrderbookHandle, interval: Duration) -> JoinHandle<()> {
+        self.monitor_engine_until_shutdown(orderbook, interval, Shutdown::new())
+    }
+
+    pub fn monitor_engine_until_shutdown(
+        &self,
+        orderbook: OrderbookHandle,
+        interval: Duration,
+        shutdown: Shutdown,
+    ) -> JoinHandle<()> {
         self.set_engine(orderbook.is_available());
         let readiness = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
-                readiness.set_engine(orderbook.is_available());
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = interval.tick() => {
+                        readiness.set_engine(orderbook.is_available());
+                    }
+                }
             }
         })
     }
@@ -165,6 +231,21 @@ impl ServiceReadiness {
 
     pub fn set_chain(&self, ready: bool) {
         self.set_dependency(&self.state.chain, ready);
+    }
+
+    pub fn begin_shutdown(&self) {
+        if !self.state.draining.swap(true, Ordering::AcqRel) {
+            self.state_changed();
+        }
+    }
+
+    pub fn fail_liveness(&self) {
+        self.state.live.store(false, Ordering::Release);
+        self.begin_shutdown();
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.state.live.load(Ordering::Acquire)
     }
 
     pub fn report(&self) {
@@ -239,5 +320,18 @@ mod tests {
         assert_eq!(readiness.snapshot().missing, vec!["chain"]);
         drop(solver);
         assert_eq!(readiness.snapshot().missing, vec!["solver", "chain"]);
+    }
+
+    #[test]
+    fn shutdown_rejects_admission_without_failing_liveness() {
+        let readiness = ServiceReadiness::always_ready();
+        readiness.begin_shutdown();
+
+        assert!(readiness.is_live());
+        assert!(!readiness.snapshot().ready);
+        assert_eq!(readiness.snapshot().missing, vec!["shutdown"]);
+
+        readiness.fail_liveness();
+        assert!(!readiness.is_live());
     }
 }

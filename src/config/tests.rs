@@ -79,8 +79,30 @@ fn loads_metadata_and_canonical_market_policy() {
     assert_eq!(config.api.max_ciphertext_bytes, 7 * 1024 * 1024);
     assert!(config.api.allowed_origins.is_empty());
     assert_eq!(config.allowed_solvers.len(), 2);
+    assert_eq!(config.runtime.shutdown_grace_ms, 15_000);
     assert_eq!(config.proof_orders, ProofOrderSettings::default());
     assert_eq!(config.fee_categories[0].id, "eth-10");
+}
+
+#[test]
+fn validates_shutdown_grace_period() {
+    let zero = VALID_CONFIG.replace(
+        "\"runtime\": { \"command_capacity\": 256 }",
+        "\"runtime\": { \"command_capacity\": 256, \"shutdown_grace_ms\": 0 }",
+    );
+    assert!(matches!(
+        AppConfig::from_json(&zero),
+        Err(ConfigError::Invalid(_))
+    ));
+
+    let excessive = VALID_CONFIG.replace(
+        "\"runtime\": { \"command_capacity\": 256 }",
+        "\"runtime\": { \"command_capacity\": 256, \"shutdown_grace_ms\": 300001 }",
+    );
+    assert!(matches!(
+        AppConfig::from_json(&excessive),
+        Err(ConfigError::Invalid(_))
+    ));
 }
 
 #[test]
@@ -160,6 +182,8 @@ fn checked_in_config_is_valid() {
     assert_eq!(
         config.proof_orders,
         ProofOrderSettings {
+            proof_lifetime_seconds: 120,
+            minimum_remaining_seconds: 60,
             complaint_finality: ComplaintFinalityPolicy::Confirmations { count: 1 },
             ..ProofOrderSettings::default()
         }

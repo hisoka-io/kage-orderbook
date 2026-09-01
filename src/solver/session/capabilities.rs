@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use alloy_primitives::{Address, B256};
 use kage_types::routing::{PreviewRoute, SolverCapabilities};
 
-use super::{AuthError, CAPABILITY_TTL_MS, CapabilityLease, CapabilityRoute, SolverSessions};
+use super::{AuthError, CAPABILITY_MAX_TTL_MS, CapabilityLease, CapabilityRoute, SolverSessions};
 
 impl SolverSessions {
     pub(crate) fn register_capabilities(
@@ -28,10 +28,11 @@ impl SolverSessions {
         state.capabilities.insert(
             session.solver_id,
             CapabilityLease {
-                capabilities,
-                expires_at_ms: now_ms
-                    .saturating_add(CAPABILITY_TTL_MS)
+                expires_at_ms: u64::try_from(capabilities.lease_expires_at_ms)
+                    .unwrap_or(0)
+                    .min(now_ms.saturating_add(CAPABILITY_MAX_TTL_MS))
                     .min(session.expires_at_ms),
+                capabilities,
             },
         );
         Ok(())
@@ -120,8 +121,9 @@ fn route_for_market(
             key_expires_at_ms: lease.capabilities.key_expires_at_ms,
         },
         minimum_margin_bps: market.minimum_margin_bps,
-        max_in_flight: lease.capabilities.max_in_flight,
-        available_amount_out: market.available_amount_out,
+        max_jobs_total: lease.capabilities.max_jobs_total,
+        amount_out_total: market.amount_out_total,
+        required_proof_lifetime_seconds: lease.capabilities.required_proof_lifetime_seconds,
     })
 }
 
@@ -131,6 +133,8 @@ pub(super) fn validate_capabilities(
 ) -> Result<(), AuthError> {
     let mut markets = HashSet::with_capacity(capabilities.markets.len());
     let valid = capabilities.revision > 0
+        && capabilities.lease_expires_at_ms > now_ms as i64
+        && capabilities.required_proof_lifetime_seconds > 0
         && capabilities.encryption_key_id != B256::ZERO
         && capabilities.encryption_public_key.len() == 32
         && capabilities
@@ -138,14 +142,13 @@ pub(super) fn validate_capabilities(
             .iter()
             .any(|byte| *byte != 0)
         && capabilities.key_expires_at_ms > now_ms as i64
-        && ((capabilities.markets.is_empty() && capabilities.max_in_flight == 0)
-            || (!capabilities.markets.is_empty() && capabilities.max_in_flight > 0))
+        && (capabilities.markets.is_empty() || capabilities.max_jobs_total > 0)
         && capabilities.markets.iter().all(|market| {
             market.chain_id > 0
                 && market.token_in != market.token_out
                 && market.min_amount_in > alloy_primitives::U256::ZERO
                 && market.max_amount_in >= market.min_amount_in
-                && market.available_amount_out > alloy_primitives::U256::ZERO
+                && market.amount_out_total > alloy_primitives::U256::ZERO
                 && market.minimum_margin_bps > 0
                 && market.minimum_margin_bps <= 10_000
                 && markets.insert((market.chain_id, market.token_in, market.token_out))

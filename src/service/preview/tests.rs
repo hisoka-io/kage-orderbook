@@ -7,7 +7,7 @@ use kage_types::routing::{PreviewRequest, PreviewRoute, SolverCapabilities, Solv
 use super::{
     PreviewService,
     calculation::{deviation_bps, output_amount, route_supports_category, solver_is_exposable},
-    model::{Category, Market},
+    model::{Category, Market, PreviewError},
 };
 use crate::{
     config::AppConfig,
@@ -116,8 +116,9 @@ fn route(minimum_margin_bps: u16) -> CapabilityRoute {
             key_expires_at_ms: 10_000,
         },
         minimum_margin_bps,
-        max_in_flight: 2,
-        available_amount_out: U256::MAX,
+        max_jobs_total: 2,
+        amount_out_total: U256::MAX,
+        required_proof_lifetime_seconds: 15,
     }
 }
 
@@ -144,7 +145,7 @@ fn movement_allowance_must_fit_inside_the_category_fee() {
         U256::from(100)
     ));
     let mut insufficient = route(35);
-    insufficient.available_amount_out = U256::from(99);
+    insufficient.amount_out_total = U256::from(99);
     assert!(!route_supports_category(
         &insufficient,
         &market(),
@@ -287,7 +288,9 @@ async fn preview_returns_every_category_and_route_without_internal_inputs() {
                 &opened.token,
                 SolverCapabilities {
                     revision: 1,
-                    max_in_flight: 2,
+                    max_jobs_total: 2,
+                    lease_expires_at_ms: now as i64 + 60_000,
+                    required_proof_lifetime_seconds: 15,
                     encryption_key_id: B256::repeat_byte(0x31 + index as u8),
                     encryption_public_key: vec![0x41 + index as u8; 32],
                     key_expires_at_ms: now as i64 + 60_000,
@@ -297,7 +300,7 @@ async fn preview_returns_every_category_and_route_without_internal_inputs() {
                         token_out: Address::repeat_byte(2),
                         min_amount_in: U256::from(1),
                         max_amount_in: U256::from(2_000_000_000_000_000_000_u64),
-                        available_amount_out: U256::from(4_000_000_000_u64),
+                        amount_out_total: U256::from(4_000_000_000_u64),
                         minimum_margin_bps: 20,
                     }],
                 },
@@ -316,7 +319,7 @@ async fn preview_returns_every_category_and_route_without_internal_inputs() {
     }));
     let service = PreviewService::new(
         pricing,
-        sessions,
+        sessions.clone(),
         registry,
         repository.previews(),
         repository.proof_orders(),
@@ -364,4 +367,46 @@ async fn preview_returns_every_category_and_route_without_internal_inputs() {
             .response,
         preview
     );
+
+    for (index, solver_id) in solvers.into_iter().enumerate() {
+        let opened = sessions.open(solver_id, now + 1);
+        sessions
+            .register_capabilities(
+                &opened.token,
+                SolverCapabilities {
+                    revision: 1,
+                    max_jobs_total: 2,
+                    lease_expires_at_ms: now as i64 + 60_000,
+                    required_proof_lifetime_seconds: 30,
+                    encryption_key_id: B256::repeat_byte(0x31 + index as u8),
+                    encryption_public_key: vec![0x41 + index as u8; 32],
+                    key_expires_at_ms: now as i64 + 60_000,
+                    markets: vec![SolverMarket {
+                        chain_id: 31_337,
+                        token_in: Address::repeat_byte(1),
+                        token_out: Address::repeat_byte(2),
+                        min_amount_in: U256::from(1),
+                        max_amount_in: U256::from(2_000_000_000_000_000_000_u64),
+                        amount_out_total: U256::from(4_000_000_000_u64),
+                        minimum_margin_bps: 20,
+                    }],
+                },
+                now + 1,
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        service
+            .create(
+                PreviewRequest {
+                    chain_id: 31_337,
+                    token_in: Address::repeat_byte(1),
+                    token_out: Address::repeat_byte(2),
+                    amount_in: U256::from(1_000_000_000_000_000_000_u64),
+                },
+                now + 1,
+            )
+            .await,
+        Err(PreviewError::NoRoute)
+    ));
 }

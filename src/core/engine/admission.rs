@@ -250,13 +250,13 @@ impl AdmissionGate {
         {
             return Ok(false);
         }
-        if usage.active_workload(solver_id) >= u64::from(capacity.max_in_flight) {
+        if usage.active_workload(solver_id) >= u64::from(capacity.max_jobs_total) {
             return Ok(false);
         }
         Ok(usage
             .held_output_amount(solver_id, terms.chain_id, terms.token_out)
             .checked_add(terms.amount_out)
-            .is_some_and(|required| required <= capacity.available_amount_out))
+            .is_some_and(|required| required <= capacity.amount_out_total))
     }
 
     async fn capacity_usage(
@@ -299,8 +299,27 @@ impl AdmissionGate {
                     && public_key
                         .is_none_or(|expected| capacity.route.encryption_public_key == expected)
                     && capacity.route.key_expires_at_ms > terms.expires_at_ms
+                    && proof_has_required_runway(
+                        terms.expires_at_ms,
+                        now_ms,
+                        capacity.required_proof_lifetime_seconds,
+                    )
                     && capacity.route.min_amount_in <= terms.amount_in
                     && terms.amount_in <= capacity.route.max_amount_in
             })
     }
+}
+
+fn proof_has_required_runway(
+    expires_at_ms: i64,
+    now_ms: u64,
+    required_proof_lifetime_seconds: u64,
+) -> bool {
+    let Ok(now_ms) = i64::try_from(now_ms) else {
+        return false;
+    };
+    let required_ms = i64::try_from(required_proof_lifetime_seconds)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000);
+    expires_at_ms > now_ms.saturating_add(required_ms)
 }

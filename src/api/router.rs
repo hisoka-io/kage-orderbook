@@ -33,6 +33,7 @@ use super::{
     websocket,
 };
 use crate::{
+    NamedTask, Shutdown,
     assignment::AssignmentIssuer,
     complaint::{ComplaintEvidenceCipher, ComplaintVerifier},
     config::{ApiSettings, ProofOrderSettings},
@@ -43,6 +44,11 @@ use crate::{
     session::SolverSessions,
     storage::ProofOrderRepository,
 };
+
+pub struct ApiRuntime {
+    pub router: Router,
+    pub tasks: Vec<NamedTask>,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn router(
@@ -59,7 +65,7 @@ pub fn router(
     allowed_solvers: HashSet<Address>,
     proof_order_settings: ProofOrderSettings,
 ) -> Router {
-    router_with_components(
+    let runtime = build_router_with_components(
         orderbook,
         registry,
         sessions,
@@ -72,10 +78,51 @@ pub fn router(
         assignment_issuer,
         Arc::new(allowed_solvers),
         proof_order_settings,
+        Shutdown::new(),
+        true,
+    );
+    // This compatibility entry point preserves the previous detached-task
+    // behavior. Production startup uses `supervised_router` and owns the handles.
+    drop(runtime.tasks);
+    runtime.router
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn supervised_router(
+    orderbook: OrderbookHandle,
+    registry: SolverRegistry,
+    sessions: SolverSessions,
+    preview: PreviewService,
+    proof_orders: ProofOrderRepository,
+    complaint_verifier: ComplaintVerifier,
+    complaint_evidence_cipher: ComplaintEvidenceCipher,
+    readiness: ServiceReadiness,
+    api: ApiSettings,
+    assignment_issuer: AssignmentIssuer,
+    allowed_solvers: HashSet<Address>,
+    proof_order_settings: ProofOrderSettings,
+    shutdown: Shutdown,
+) -> ApiRuntime {
+    build_router_with_components(
+        orderbook,
+        registry,
+        sessions,
+        Some(preview),
+        proof_orders,
+        Some(complaint_verifier),
+        Some(complaint_evidence_cipher),
+        readiness,
+        api,
+        assignment_issuer,
+        Arc::new(allowed_solvers),
+        proof_order_settings,
+        shutdown,
+        true,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn router_with_components(
     orderbook: OrderbookHandle,
     registry: SolverRegistry,
@@ -90,6 +137,43 @@ pub(super) fn router_with_components(
     allowed_solvers: Arc<HashSet<Address>>,
     proof_order_settings: ProofOrderSettings,
 ) -> Router {
+    build_router_with_components(
+        orderbook,
+        registry,
+        sessions,
+        preview,
+        proof_orders,
+        complaint_verifier,
+        complaint_evidence_cipher,
+        readiness,
+        api,
+        assignment_issuer,
+        allowed_solvers,
+        proof_order_settings,
+        Shutdown::new(),
+        false,
+    )
+    .router
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_router_with_components(
+    orderbook: OrderbookHandle,
+    registry: SolverRegistry,
+    sessions: SolverSessions,
+    preview: Option<PreviewService>,
+    proof_orders: ProofOrderRepository,
+    complaint_verifier: Option<ComplaintVerifier>,
+    complaint_evidence_cipher: Option<ComplaintEvidenceCipher>,
+    readiness: ServiceReadiness,
+    api: ApiSettings,
+    assignment_issuer: AssignmentIssuer,
+    allowed_solvers: Arc<HashSet<Address>>,
+    proof_order_settings: ProofOrderSettings,
+    shutdown: Shutdown,
+    supervise_background: bool,
+) -> ApiRuntime {
+    let mut tasks = Vec::new();
     let mut rate_limit = GovernorConfigBuilder::default();
     rate_limit
         .period(Duration::from_millis(api.rate_limit_replenish_ms))
@@ -99,35 +183,47 @@ pub(super) fn router_with_components(
         .finish()
         .expect("validated API rate limit settings");
     let rate_limit_limiter = rate_limit.limiter().clone();
-    tokio::spawn(async move {
-        let mut cleanup = tokio::time::interval(Duration::from_secs(60));
-        cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            cleanup.tick().await;
-            rate_limit_limiter.retain_recent();
-        }
-    });
+    if supervise_background {
+        let cleanup_shutdown = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let mut cleanup = tokio::time::interval(Duration::from_secs(60));
+            cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cleanup_shutdown.cancelled() => return,
+                    _ = cleanup.tick() => rate_limit_limiter.retain_recent(),
+                }
+            }
+        });
+        tasks.push(NamedTask::new("rate_limit_cleanup", handle));
+    }
     let cors = cors_layer(&api);
     let request_timeout = Duration::from_millis(api.request_timeout_ms);
     let max_body_bytes = api.max_body_bytes;
 
-    if let Some(preview) = preview.clone() {
-        tokio::spawn(async move {
+    if supervise_background && let Some(preview) = preview.clone() {
+        let cleanup_shutdown = shutdown.clone();
+        let handle = tokio::spawn(async move {
             let mut cleanup = tokio::time::interval(Duration::from_secs(60));
             cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                cleanup.tick().await;
-                match preview.cleanup(now_ms() as i64).await {
-                    Ok(erased) if erased > 0 => {
-                        crate::service_log!("orderbook", "preview cleanup snapshots={erased}");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        crate::service_error!("orderbook", "preview cleanup failed error={error}");
+                tokio::select! {
+                    _ = cleanup_shutdown.cancelled() => return,
+                    _ = cleanup.tick() => {
+                        match preview.cleanup(now_ms() as i64).await {
+                            Ok(erased) if erased > 0 => {
+                                crate::service_log!("orderbook", "preview cleanup snapshots={erased}");
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                crate::service_error!("orderbook", "preview cleanup failed error={error}");
+                            }
+                        }
                     }
                 }
             }
         });
+        tasks.push(NamedTask::new("preview_cleanup", handle));
     }
     let versioned = Router::new()
         .route("/preview", post(create_preview))
@@ -154,7 +250,7 @@ pub(super) fn router_with_components(
         .layer(RequestBodyLimitLayer::new(max_body_bytes))
         .layer(cors);
 
-    Router::new()
+    let router = Router::new()
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness_health))
         .route("/metrics/retention", get(retention_metrics))
@@ -172,7 +268,10 @@ pub(super) fn router_with_components(
             complaint_evidence_cipher,
             allowed_solvers,
             proof_order_settings,
-        })
+            shutdown,
+        });
+
+    ApiRuntime { router, tasks }
 }
 
 async fn retention_metrics(State(state): State<ApiState>) -> impl IntoResponse {

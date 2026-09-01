@@ -22,12 +22,13 @@ pub(super) async fn user_events_ws(
     ensure_allowed_origin(&state.api, &headers)?;
     let events = state.orderbook.subscribe();
     let api = state.api.clone();
+    let shutdown = state.shutdown;
     let max_message_bytes = api.websocket_max_message_bytes;
     let proof_orders = state.proof_orders;
     Ok(ws
         .max_message_size(max_message_bytes)
         .max_frame_size(max_message_bytes)
-        .on_upgrade(move |socket| forward_user_events(socket, events, proof_orders, api)))
+        .on_upgrade(move |socket| forward_user_events(socket, events, proof_orders, api, shutdown)))
 }
 
 pub(super) async fn solver_events_ws(
@@ -84,6 +85,7 @@ async fn forward_user_events(
     mut events: tokio::sync::broadcast::Receiver<OrderEvent>,
     proof_orders: crate::storage::ProofOrderRepository,
     api: ApiSettings,
+    shutdown: crate::Shutdown,
 ) {
     let mut subscriptions = HashSet::new();
     let mut messages = MessageBudget::new();
@@ -95,6 +97,11 @@ async fn forward_user_events(
 
     loop {
         tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                close(&mut socket).await;
+                return;
+            }
             message = socket.recv() => {
                 let Some(Ok(message)) = message else {
                     return;
@@ -210,6 +217,11 @@ async fn forward_service_events(
 
     loop {
         tokio::select! {
+            biased;
+            _ = stream.state.shutdown.cancelled() => {
+                close(&mut socket).await;
+                return;
+            }
             message = socket.recv() => {
                 let Some(Ok(message)) = message else {
                     return;

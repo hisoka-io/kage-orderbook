@@ -50,6 +50,10 @@ impl OrderRepository {
     pub fn proof_orders(&self) -> super::ProofOrderRepository {
         super::ProofOrderRepository::new(self.pool.clone(), self.retention_metrics.clone())
     }
+
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
     pub async fn connect(database_url: &str) -> Result<Self, RepositoryError> {
         Self::connect_with_options(database_url, Duration::from_secs(5), 1).await
     }

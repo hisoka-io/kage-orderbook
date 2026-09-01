@@ -11,7 +11,7 @@ pub use kage_types::api_types::{
     ApiErrorResponse, ComplaintResponse, ComplaintStatus, CreateComplaintRequest,
     CreateOrderResponse, ORDER_ACCESS_TOKEN_HEADER, UserEventClientMessage, UserEventServerMessage,
 };
-pub use router::router;
+pub use router::{ApiRuntime, router, supervised_router};
 
 use state::{ApiState, now_ms};
 

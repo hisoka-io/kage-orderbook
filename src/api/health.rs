@@ -3,8 +3,12 @@ use axum::{Json, extract::State, http::StatusCode};
 use super::ApiState;
 use crate::readiness::ReadinessSnapshot;
 
-pub(super) async fn liveness() -> StatusCode {
-    StatusCode::OK
+pub(super) async fn liveness(State(state): State<ApiState>) -> StatusCode {
+    if state.readiness.is_live() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 pub(super) async fn readiness_health(

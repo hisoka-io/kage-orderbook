@@ -12,7 +12,7 @@ pub(super) fn route_supports_category(
     exact_amount_out: U256,
 ) -> bool {
     category.solvers.contains(&route.route.solver_id)
-        && route.available_amount_out >= exact_amount_out
+        && route.amount_out_total >= exact_amount_out
         && route
             .minimum_margin_bps
             .checked_add(market.movement_allowance_bps)

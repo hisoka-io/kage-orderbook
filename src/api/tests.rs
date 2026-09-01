@@ -395,6 +395,7 @@ async fn spawn_complaint_api_with_block_timestamp(
             complaint_evidence_cipher: Some(ComplaintEvidenceCipher::new([0xb3; 32]).unwrap()),
             allowed_solvers: Arc::new(HashSet::from([solver_id])),
             proof_order_settings: settings,
+            shutdown: crate::Shutdown::new(),
         },
         headers,
         request: CreateComplaintRequest {
@@ -1275,6 +1276,33 @@ async fn readiness_blocks_only_new_proof_order_admission() {
     assert_eq!(
         post_proof_json(&fixture, &fixture.request).await.status(),
         StatusCode::OK
+    );
+    fixture.server.abort();
+}
+
+#[tokio::test]
+async fn fatal_runtime_failure_fails_the_liveness_endpoint() {
+    let fixture = spawn_proof_api().await;
+    let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .get(format!("{}/health/live", fixture.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    fixture.readiness.fail_liveness();
+    assert_eq!(
+        client
+            .get(format!("{}/health/live", fixture.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
     );
     fixture.server.abort();
 }

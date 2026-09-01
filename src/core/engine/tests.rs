@@ -1,5 +1,5 @@
 use super::{maintenance::now_ms, *};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::{
     config::AppConfig,
@@ -102,13 +102,13 @@ async fn capacity_orderbook(
     repository: OrderRepository,
     solver_id: Address,
     key_id: B256,
-    max_in_flight: u16,
+    max_jobs_total: u16,
     amount_out_total: U256,
     now_ms: i64,
 ) -> OrderbookHandle {
     capacity_orderbook_for(
         repository,
-        &[(solver_id, key_id, max_in_flight, amount_out_total)],
+        &[(solver_id, key_id, max_jobs_total, amount_out_total)],
         now_ms,
     )
     .await
@@ -130,12 +130,12 @@ async fn capacity_orderbook_parts(
     now_ms: i64,
 ) -> (OrderbookHandle, SolverSessions) {
     let sessions = SolverSessions::new("kage-orderbook:capacity-test");
-    for (solver_id, key_id, max_in_flight, amount_out_total) in solvers {
+    for (solver_id, key_id, max_jobs_total, amount_out_total) in solvers {
         publish_capacity(
             &sessions,
             *solver_id,
             *key_id,
-            *max_in_flight,
+            *max_jobs_total,
             *amount_out_total,
             25,
             now_ms,
@@ -171,19 +171,43 @@ fn publish_capacity(
     sessions: &SolverSessions,
     solver_id: Address,
     key_id: B256,
-    max_in_flight: u16,
+    max_jobs_total: u16,
     amount_out_total: U256,
     minimum_margin_bps: u16,
     now_ms: i64,
 ) -> String {
-    publish_capacity_with_public_key(
+    publish_capacity_with_runway(
+        sessions,
+        solver_id,
+        key_id,
+        max_jobs_total,
+        amount_out_total,
+        minimum_margin_bps,
+        30,
+        now_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_capacity_with_runway(
+    sessions: &SolverSessions,
+    solver_id: Address,
+    key_id: B256,
+    max_jobs_total: u16,
+    amount_out_total: U256,
+    minimum_margin_bps: u16,
+    required_proof_lifetime_seconds: u64,
+    now_ms: i64,
+) -> String {
+    publish_capacity_with_public_key_and_runway(
         sessions,
         solver_id,
         key_id,
         vec![9; 32],
-        max_in_flight,
+        max_jobs_total,
         amount_out_total,
         minimum_margin_bps,
+        required_proof_lifetime_seconds,
         now_ms,
     )
 }
@@ -194,9 +218,34 @@ fn publish_capacity_with_public_key(
     solver_id: Address,
     key_id: B256,
     encryption_public_key: Vec<u8>,
-    max_in_flight: u16,
+    max_jobs_total: u16,
     amount_out_total: U256,
     minimum_margin_bps: u16,
+    now_ms: i64,
+) -> String {
+    publish_capacity_with_public_key_and_runway(
+        sessions,
+        solver_id,
+        key_id,
+        encryption_public_key,
+        max_jobs_total,
+        amount_out_total,
+        minimum_margin_bps,
+        30,
+        now_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_capacity_with_public_key_and_runway(
+    sessions: &SolverSessions,
+    solver_id: Address,
+    key_id: B256,
+    encryption_public_key: Vec<u8>,
+    max_jobs_total: u16,
+    amount_out_total: U256,
+    minimum_margin_bps: u16,
+    required_proof_lifetime_seconds: u64,
     now_ms: i64,
 ) -> String {
     let now_ms_u64 = u64::try_from(now_ms).unwrap();
@@ -206,17 +255,19 @@ fn publish_capacity_with_public_key(
             &session.token,
             SolverCapabilities {
                 revision: 1,
-                max_in_flight,
+                max_jobs_total,
+                lease_expires_at_ms: now_ms + 60_000,
+                required_proof_lifetime_seconds,
                 encryption_key_id: key_id,
                 encryption_public_key,
-                key_expires_at_ms: now_ms + 70_000,
+                key_expires_at_ms: now_ms + 180_000,
                 markets: vec![SolverMarket {
                     chain_id: 31_337,
                     token_in: Address::repeat_byte(1),
                     token_out: Address::repeat_byte(2),
                     min_amount_in: U256::from(1),
                     max_amount_in: U256::from(100),
-                    available_amount_out: amount_out_total,
+                    amount_out_total,
                     minimum_margin_bps,
                 }],
             },
@@ -313,11 +364,14 @@ fn reservation_evidence(
 }
 
 #[tokio::test]
-async fn single_writer_admits_an_authoritative_proof_order_idempotently() {
+async fn graceful_restart_preserves_exact_retries_at_the_shutdown_boundary() {
     let repository = OrderRepository::connect("sqlite::memory:").await.unwrap();
-    let orderbook = start_orderbook_with_repository(repository.clone(), 16)
-        .await
-        .unwrap();
+    let shutdown = crate::Shutdown::new();
+    let runtime =
+        start_supervised_orderbook_with_repository(repository.clone(), 16, shutdown.clone())
+            .await
+            .unwrap();
+    let orderbook = runtime.handle;
     let order_id = Uuid::new_v4();
     let created_at_ms = now_ms();
     let terms = TradeTerms {
@@ -363,9 +417,42 @@ async fn single_writer_admits_an_authoritative_proof_order_idempotently() {
 
     let created = orderbook.create_proof_order(input.clone()).await.unwrap();
     assert!(created.created);
-    let retried = orderbook.create_proof_order(input).await.unwrap();
+    let mut interrupted = input.clone();
+    interrupted.order_id = Uuid::new_v4();
+    interrupted.access_token_hash = B256::repeat_byte(20);
+    interrupted.preview_id = B256::repeat_byte(21);
+    interrupted.settlement_commitment = B256::repeat_byte(22);
+    shutdown.start();
+    tokio::time::timeout(Duration::from_secs(1), runtime.task.handle)
+        .await
+        .expect("engine must stop within the shutdown grace")
+        .unwrap();
+    assert!(!orderbook.is_available());
+    assert!(matches!(
+        orderbook.create_proof_order(interrupted.clone()).await,
+        Err(ServiceError::Closed)
+    ));
+
+    let restarted = start_orderbook_with_repository(repository.clone(), 16)
+        .await
+        .unwrap();
+    let retried = restarted.create_proof_order(input).await.unwrap();
     assert!(!retried.created);
     assert_eq!(retried.order.state, ProofOrderState::ReservationPending);
+    assert!(
+        restarted
+            .create_proof_order(interrupted.clone())
+            .await
+            .unwrap()
+            .created
+    );
+    assert!(
+        !restarted
+            .create_proof_order(interrupted)
+            .await
+            .unwrap()
+            .created
+    );
     assert_eq!(
         repository.proof_orders().state(order_id).await.unwrap(),
         Some(ProofOrderState::ReservationPending)
@@ -745,6 +832,55 @@ async fn final_admission_rechecks_the_remaining_proof_window() {
 }
 
 #[tokio::test]
+async fn final_admission_reroutes_around_a_solver_requiring_more_runway() {
+    let repository = OrderRepository::connect("sqlite::memory:").await.unwrap();
+    let short_runway_solver = Address::repeat_byte(7);
+    let compatible_solver = Address::repeat_byte(8);
+    let short_runway_key = B256::repeat_byte(17);
+    let compatible_key = B256::repeat_byte(18);
+    let created_at_ms = now_ms();
+    let (orderbook, sessions) = capacity_orderbook_parts(
+        repository.clone(),
+        &[
+            (short_runway_solver, short_runway_key, 1, U256::from(1_000)),
+            (compatible_solver, compatible_key, 1, U256::from(1_000)),
+        ],
+        created_at_ms,
+    )
+    .await;
+    publish_capacity_with_runway(
+        &sessions,
+        short_runway_solver,
+        short_runway_key,
+        1,
+        U256::from(1_000),
+        25,
+        60,
+        created_at_ms + 1,
+    );
+    let mut input = capacity_input(
+        63,
+        short_runway_solver,
+        short_runway_key,
+        created_at_ms,
+        U256::from(10),
+    );
+    add_capacity_candidate(&mut input, compatible_solver, compatible_key, 64);
+    let order_id = input.order_id;
+
+    orderbook.create_proof_order(input).await.unwrap();
+
+    assert!(
+        repository
+            .proof_orders()
+            .pending_reservation(order_id, compatible_solver)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn final_admission_requires_a_live_persisted_preview() {
     let repository = OrderRepository::connect("sqlite::memory:").await.unwrap();
     let solver_id = Address::repeat_byte(7);
@@ -772,17 +908,11 @@ async fn final_admission_requires_a_live_persisted_preview() {
     let orderbook = start_orderbook_with_admission(repository, 16, config.proof_orders, admission)
         .await
         .unwrap();
+    let mut input = capacity_input(67, solver_id, key_id, created_at_ms, U256::from(10));
+    input.terms.expires_at_ms = created_at_ms.div_euclid(1_000) * 1_000 + 120_000;
 
     assert!(matches!(
-        orderbook
-            .create_proof_order(capacity_input(
-                67,
-                solver_id,
-                key_id,
-                created_at_ms,
-                U256::from(10),
-            ))
-            .await,
+        orderbook.create_proof_order(input).await,
         Err(ServiceError::PreviewExpired)
     ));
 }
@@ -846,7 +976,9 @@ async fn same_key_id_with_changed_public_key_cannot_disclose() {
     let solver_id = Address::repeat_byte(7);
     let key_id = B256::repeat_byte(8);
     let created_at_ms = now_ms();
-    let input = capacity_input(70, solver_id, key_id, created_at_ms, U256::from(10));
+    let mut input = capacity_input(70, solver_id, key_id, created_at_ms, U256::from(10));
+    input.terms.expires_at_ms = created_at_ms.div_euclid(1_000) * 1_000 + 120_000;
+    input.candidates[0].key_expires_at_ms = input.terms.expires_at_ms + 10_000;
     let mut snapshot = preview_snapshot(&input, created_at_ms.saturating_add(30_000));
     snapshot.erase_after_ms = snapshot.response.valid_until_ms.saturating_add(1);
     repository.previews().insert(&snapshot).await.unwrap();

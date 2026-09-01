@@ -233,6 +233,12 @@ pub struct DatabaseSettings {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeSettings {
     pub command_capacity: usize,
+    #[serde(default = "default_shutdown_grace_ms")]
+    pub shutdown_grace_ms: u64,
+}
+
+fn default_shutdown_grace_ms() -> u64 {
+    15_000
 }
 
 #[derive(Debug, Clone, Deserialize)]

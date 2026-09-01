@@ -13,10 +13,16 @@ use super::{
     operations::{assign_and_disclose_proof_order, create_proof_order_idempotently},
 };
 use crate::{
+    NamedTask, Shutdown,
     config::ProofOrderSettings,
     core::state::Orderbook,
     storage::{AdvanceOutcome, OrderRepository, RepositoryError},
 };
+
+pub struct OrderbookRuntime {
+    pub handle: OrderbookHandle,
+    pub task: NamedTask,
+}
 
 #[cfg(test)]
 pub(crate) async fn start_orderbook_with_repository(
@@ -28,12 +34,30 @@ pub(crate) async fn start_orderbook_with_repository(
 }
 
 #[cfg(test)]
+pub(crate) async fn start_supervised_orderbook_with_repository(
+    repository: OrderRepository,
+    capacity: usize,
+    shutdown: Shutdown,
+) -> Result<OrderbookRuntime, RepositoryError> {
+    start_orderbook_runtime(
+        repository,
+        capacity,
+        ProofOrderSettings::default(),
+        None,
+        shutdown,
+    )
+    .await
+}
+
+#[cfg(test)]
 pub(crate) async fn start_orderbook_with_repository_and_policy(
     repository: OrderRepository,
     capacity: usize,
     proof_policy: ProofOrderSettings,
 ) -> Result<OrderbookHandle, RepositoryError> {
-    start_orderbook_runtime(repository, capacity, proof_policy, None).await
+    let runtime =
+        start_orderbook_runtime(repository, capacity, proof_policy, None, Shutdown::new()).await?;
+    Ok(runtime.handle)
 }
 
 pub async fn start_orderbook_with_admission(
@@ -42,7 +66,32 @@ pub async fn start_orderbook_with_admission(
     proof_policy: ProofOrderSettings,
     admission: AdmissionGate,
 ) -> Result<OrderbookHandle, RepositoryError> {
-    start_orderbook_runtime(repository, capacity, proof_policy, Some(admission)).await
+    let runtime = start_orderbook_runtime(
+        repository,
+        capacity,
+        proof_policy,
+        Some(admission),
+        Shutdown::new(),
+    )
+    .await?;
+    Ok(runtime.handle)
+}
+
+pub async fn start_supervised_orderbook_with_admission(
+    repository: OrderRepository,
+    capacity: usize,
+    proof_policy: ProofOrderSettings,
+    admission: AdmissionGate,
+    shutdown: Shutdown,
+) -> Result<OrderbookRuntime, RepositoryError> {
+    start_orderbook_runtime(
+        repository,
+        capacity,
+        proof_policy,
+        Some(admission),
+        shutdown,
+    )
+    .await
 }
 
 async fn start_orderbook_runtime(
@@ -50,7 +99,8 @@ async fn start_orderbook_runtime(
     capacity: usize,
     proof_policy: ProofOrderSettings,
     admission: Option<AdmissionGate>,
-) -> Result<OrderbookHandle, RepositoryError> {
+    shutdown: Shutdown,
+) -> Result<OrderbookRuntime, RepositoryError> {
     let restored = repository.load_non_terminal_orders().await?;
     let mut orderbook =
         Orderbook::from_orders(restored.into_iter().map(|persisted| persisted.order));
@@ -59,7 +109,7 @@ async fn start_orderbook_runtime(
     let (event_tx, _) = broadcast::channel(capacity);
     let events = event_tx.clone();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         if restored_count > 0 {
             crate::service_log!("orderbook", "orders restored active={restored_count}");
         } else {
@@ -74,6 +124,8 @@ async fn start_orderbook_runtime(
 
         loop {
             let request = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
                 _ = expiry_interval.tick() => {
                     expire_due_orders(&mut orderbook, &repository, &events).await;
                     continue;
@@ -248,10 +300,14 @@ async fn start_orderbook_runtime(
                 }
             }
         }
+        tracing::debug!(target: "runtime", task = "orderbook_engine", "engine stopped");
     });
 
-    Ok(OrderbookHandle {
-        requests: request_tx,
-        events: event_tx,
+    Ok(OrderbookRuntime {
+        handle: OrderbookHandle {
+            requests: request_tx,
+            events: event_tx,
+        },
+        task: NamedTask::new("orderbook_engine", task),
     })
 }

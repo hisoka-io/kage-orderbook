@@ -3,6 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use alloy_primitives::Address;
 
 use crate::{
+    Shutdown,
     assignment::AssignmentIssuer,
     complaint::{ComplaintEvidenceCipher, ComplaintVerifier},
     config::{ApiSettings, ProofOrderSettings},
@@ -28,6 +29,7 @@ pub(super) struct ApiState {
     pub(super) complaint_evidence_cipher: Option<ComplaintEvidenceCipher>,
     pub(super) allowed_solvers: Arc<HashSet<Address>>,
     pub(super) proof_order_settings: ProofOrderSettings,
+    pub(super) shutdown: Shutdown,
 }
 
 pub(super) fn now_ms() -> u64 {

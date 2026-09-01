@@ -36,7 +36,7 @@ fn market() -> SolverMarket {
         token_out: Address::repeat_byte(2),
         min_amount_in: U256::from(10),
         max_amount_in: U256::from(1_000),
-        available_amount_out: U256::from(2_000),
+        amount_out_total: U256::from(2_000),
         minimum_margin_bps: 35,
     }
 }
@@ -44,7 +44,9 @@ fn market() -> SolverMarket {
 fn solver_capabilities(revision: u64, key_expires_at_ms: i64) -> SolverCapabilities {
     SolverCapabilities {
         revision,
-        max_in_flight: 2,
+        max_jobs_total: 2,
+        lease_expires_at_ms: key_expires_at_ms,
+        required_proof_lifetime_seconds: 30,
         encryption_key_id: B256::repeat_byte(4),
         encryption_public_key: vec![5; 32],
         key_expires_at_ms,
@@ -125,7 +127,9 @@ fn authenticated_capabilities_are_revisioned_and_expire() {
     let session = sessions.open(solver_id, NOW);
     let capabilities = SolverCapabilities {
         revision: 1,
-        max_in_flight: 2,
+        max_jobs_total: 2,
+        lease_expires_at_ms: (NOW + 120_000) as i64,
+        required_proof_lifetime_seconds: 30,
         encryption_key_id: B256::repeat_byte(4),
         encryption_public_key: vec![5; 32],
         key_expires_at_ms: (NOW + 120_000) as i64,
@@ -135,7 +139,7 @@ fn authenticated_capabilities_are_revisioned_and_expire() {
             token_out: Address::repeat_byte(2),
             min_amount_in: U256::from(1),
             max_amount_in: U256::from(1_000),
-            available_amount_out: U256::from(2_000),
+            amount_out_total: U256::from(2_000),
             minimum_margin_bps: 35,
         }],
     };
@@ -168,7 +172,7 @@ fn authenticated_capabilities_are_revisioned_and_expire() {
                 31_337,
                 Address::repeat_byte(1),
                 Address::repeat_byte(2),
-                NOW + 1 + CAPABILITY_TTL_MS,
+                NOW + 1 + CAPABILITY_MAX_TTL_MS,
             )
             .is_empty()
     );
@@ -203,8 +207,9 @@ fn capacity_lookup_returns_live_market_metadata() {
     assert_eq!(capacity.route.encryption_public_key, vec![5; 32]);
     assert_eq!(capacity.route.key_expires_at_ms, (NOW + 120_000) as i64);
     assert_eq!(capacity.minimum_margin_bps, 35);
-    assert_eq!(capacity.max_in_flight, 2);
-    assert_eq!(capacity.available_amount_out, U256::from(2_000));
+    assert_eq!(capacity.max_jobs_total, 2);
+    assert_eq!(capacity.amount_out_total, U256::from(2_000));
+    assert_eq!(capacity.required_proof_lifetime_seconds, 30);
 }
 
 #[test]
@@ -239,7 +244,7 @@ fn capacity_lookup_uses_the_latest_capability_revision() {
 
     let mut replacement = original;
     replacement.revision = 2;
-    replacement.max_in_flight = 4;
+    replacement.max_jobs_total = 4;
     replacement.encryption_key_id = B256::repeat_byte(7);
     replacement.encryption_public_key = vec![8; 32];
     sessions
@@ -254,7 +259,7 @@ fn capacity_lookup_uses_the_latest_capability_revision() {
             NOW + 2,
         )
         .unwrap();
-    assert_eq!(capacity.max_in_flight, 4);
+    assert_eq!(capacity.max_jobs_total, 4);
     assert_eq!(capacity.route.encryption_key_id, B256::repeat_byte(7));
     assert_eq!(capacity.route.encryption_public_key, vec![8; 32]);
 }
@@ -278,11 +283,34 @@ fn capacity_lookup_prunes_an_expired_capability_lease() {
                 31_337,
                 Address::repeat_byte(1),
                 Address::repeat_byte(2),
-                NOW + CAPABILITY_TTL_MS,
+                NOW + CAPABILITY_MAX_TTL_MS,
             )
             .is_none()
     );
     assert!(!sessions.lock().capabilities.contains_key(&SIGNER));
+}
+
+#[test]
+fn published_capability_lease_can_expire_before_the_key() {
+    let sessions = sessions();
+    let session = sessions.open(SIGNER, NOW);
+    let mut capabilities = solver_capabilities(1, (NOW + 120_000) as i64);
+    capabilities.lease_expires_at_ms = (NOW + 1) as i64;
+    sessions
+        .register_capabilities(&session.token, capabilities, NOW)
+        .unwrap();
+
+    assert!(
+        sessions
+            .capacity_for_market(
+                SIGNER,
+                31_337,
+                Address::repeat_byte(1),
+                Address::repeat_byte(2),
+                NOW + 1,
+            )
+            .is_none()
+    );
 }
 
 #[test]
@@ -397,12 +425,14 @@ fn capabilities_reject_duplicate_markets_and_zero_live_liquidity() {
         token_out: Address::repeat_byte(2),
         min_amount_in: U256::from(1),
         max_amount_in: U256::from(1_000),
-        available_amount_out: U256::from(2_000),
+        amount_out_total: U256::from(2_000),
         minimum_margin_bps: 35,
     };
     let mut capabilities = SolverCapabilities {
         revision: 1,
-        max_in_flight: 2,
+        max_jobs_total: 2,
+        lease_expires_at_ms: (NOW + 120_000) as i64,
+        required_proof_lifetime_seconds: 30,
         encryption_key_id: B256::repeat_byte(4),
         encryption_public_key: vec![5; 32],
         key_expires_at_ms: (NOW + 120_000) as i64,
@@ -413,7 +443,19 @@ fn capabilities_reject_duplicate_markets_and_zero_live_liquidity() {
         Err(AuthError::InvalidCapabilities)
     );
     capabilities.markets = vec![market];
-    capabilities.markets[0].available_amount_out = U256::ZERO;
+    capabilities.markets[0].amount_out_total = U256::ZERO;
+    assert_eq!(
+        validate_capabilities(&capabilities, NOW),
+        Err(AuthError::InvalidCapabilities)
+    );
+    capabilities.markets[0].amount_out_total = U256::from(2_000);
+    capabilities.lease_expires_at_ms = NOW as i64;
+    assert_eq!(
+        validate_capabilities(&capabilities, NOW),
+        Err(AuthError::InvalidCapabilities)
+    );
+    capabilities.lease_expires_at_ms = (NOW + 120_000) as i64;
+    capabilities.required_proof_lifetime_seconds = 0;
     assert_eq!(
         validate_capabilities(&capabilities, NOW),
         Err(AuthError::InvalidCapabilities)

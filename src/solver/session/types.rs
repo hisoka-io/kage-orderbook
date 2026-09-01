@@ -47,6 +47,7 @@ pub(crate) struct AuthenticatedSession {
 pub struct CapabilityRoute {
     pub route: PreviewRoute,
     pub minimum_margin_bps: u16,
-    pub max_in_flight: u16,
-    pub available_amount_out: alloy_primitives::U256,
+    pub max_jobs_total: u16,
+    pub amount_out_total: alloy_primitives::U256,
+    pub required_proof_lifetime_seconds: u64,
 }
